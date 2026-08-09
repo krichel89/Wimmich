@@ -1,0 +1,194 @@
+name: Wimmich bauen
+
+# Läuft bei einem Versionstag (v0.3.9) und auf Knopfdruck über
+# "Actions" -> "Wimmich bauen" -> "Run workflow".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      mit_opencv:
+        description: "OpenCV mitpacken (bessere Rissreparatur, +195 MB)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # nötig, um das Ergebnis an einen Release zu hängen
+
+env:
+  # exiftool wird NICHT von PyInstaller gefunden - es ist kein Python-Modul,
+  # sondern ein eigenes Programm. Deshalb wird es hier gezielt geholt und
+  # beigelegt. Die Version bewusst festgenagelt: so baut derselbe Tag in
+  # einem Jahr noch dasselbe Ergebnis.
+  EXIFTOOL_VERSION: "13.30"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Version aus wimmich/__init__.py lesen
+        id: version
+        shell: pwsh
+        run: |
+          $line = Select-String -Path wimmich/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"'
+          $v = $line.Matches[0].Groups[1].Value
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Wimmich $v"
+
+      - name: Abhängigkeiten installieren
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          if ("${{ github.event.inputs.mit_opencv }}" -eq "true") {
+            Write-Host "OpenCV wird mitgepackt"
+            pip install "opencv-python>=4.9,<5"
+          }
+          pip install pyinstaller==6.22.0
+          pip list
+
+      - name: exiftool holen
+        shell: pwsh
+        run: |
+          $v = "${{ env.EXIFTOOL_VERSION }}"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+
+          # Die 64-Bit-Fassung heißt exiftool-<version>_64.zip; ältere
+          # Veröffentlichungen kamen ohne das _64. Beide Namen versuchen.
+          $urls = @(
+            "https://exiftool.org/exiftool-${v}_64.zip",
+            "https://exiftool.org/exiftool-${v}.zip"
+          )
+          $zip = "build/exiftool.zip"
+          $ok = $false
+          foreach ($u in $urls) {
+            Write-Host "Versuche $u"
+            try {
+              Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing
+              $ok = $true
+              break
+            } catch {
+              Write-Host "  nicht erreichbar: $($_.Exception.Message)"
+            }
+          }
+          if (-not $ok) {
+            throw "exiftool $v konnte nicht geladen werden. Version in build.yml prüfen (Liste unter https://exiftool.org/)."
+          }
+
+          Expand-Archive -Path $zip -DestinationPath build/exiftool_raw -Force
+
+          # Im Archiv liegt ein Ordner wie exiftool-13.30_64 mit
+          # "exiftool(-k).exe" und dem Ordner exiftool_files. Das (-k)
+          # bedeutet "auf Tastendruck warten" - für den Aufruf aus einem
+          # Programm heraus wäre das fatal, deshalb wird umbenannt.
+          $inner = Get-ChildItem build/exiftool_raw -Directory | Select-Object -First 1
+          if ($null -eq $inner) { $inner = Get-Item build/exiftool_raw }
+          Write-Host "Archivinhalt: $($inner.FullName)"
+          Get-ChildItem $inner.FullName | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          New-Item -ItemType Directory -Force -Path build/exiftool | Out-Null
+          $exe = Get-ChildItem $inner.FullName -Filter "exiftool*.exe" | Select-Object -First 1
+          if ($null -eq $exe) { throw "Keine exiftool-Programmdatei im Archiv gefunden." }
+          Copy-Item $exe.FullName build/exiftool/exiftool.exe
+
+          # exiftool_files enthält die mitgelieferte Perl-Umgebung und MUSS
+          # neben der Programmdatei liegen - ohne sie startet exiftool nicht.
+          $files = Join-Path $inner.FullName "exiftool_files"
+          if (Test-Path $files) {
+            Copy-Item $files build/exiftool/exiftool_files -Recurse
+          } else {
+            Write-Host "HINWEIS: kein exiftool_files-Ordner - eigenständige Fassung?"
+          }
+
+      - name: exiftool prüfen
+        shell: pwsh
+        run: |
+          # Lieber hier scheitern als beim Nutzer: wenn exiftool nicht
+          # antwortet, ist das Paket wertlos.
+          $out = & build/exiftool/exiftool.exe -ver
+          Write-Host "exiftool meldet: $out"
+          if ($LASTEXITCODE -ne 0) { throw "exiftool laeuft nicht" }
+          if ($out.Trim() -ne "${{ env.EXIFTOOL_VERSION }}") {
+            Write-Host "WARNUNG: erwartet ${{ env.EXIFTOOL_VERSION }}, bekommen $out"
+          }
+
+      - name: Bauen
+        shell: pwsh
+        run: |
+          # --onedir, nicht --onefile: exiftool_files besteht aus tausenden
+          # kleiner Perl-Dateien. Bei --onefile würden die bei JEDEM Start
+          # in ein Temporärverzeichnis entpackt - das kostet Sekunden.
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --windowed `
+            --name Wimmich `
+            --add-data "build/exiftool;exiftool" `
+            --collect-all rawpy `
+            --exclude-module tkinter `
+            --exclude-module matplotlib `
+            --exclude-module pytest `
+            --exclude-module IPython `
+            main.py
+
+      - name: Paket prüfen
+        shell: pwsh
+        run: |
+          $exe = "dist/Wimmich/Wimmich.exe"
+          if (-not (Test-Path $exe)) { throw "Wimmich.exe wurde nicht gebaut" }
+
+          # Das beigelegte exiftool muss im Paket sein. Genau das ist bei
+          # PyInstaller schon oft stillschweigend verlorengegangen, deshalb
+          # wird es hier nachgesehen statt gehofft.
+          $bundled = Get-ChildItem dist/Wimmich -Recurse -Filter "exiftool.exe" `
+                     | Select-Object -First 1
+          if ($null -eq $bundled) { throw "exiftool fehlt im Paket" }
+          Write-Host "exiftool im Paket: $($bundled.FullName)"
+          & $bundled.FullName -ver
+
+          $groesse = [math]::Round((Get-ChildItem dist/Wimmich -Recurse |
+                     Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          Write-Host "Paketgroesse: $groesse MB"
+
+      - name: Zusatzdateien beilegen
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/Wimmich/ -ErrorAction SilentlyContinue
+          if (Test-Path LICENSE) { Copy-Item LICENSE dist/Wimmich/ }
+          # Lizenztext von exiftool gehört mit ins Paket, wenn exiftool
+          # mitgeliefert wird.
+          $lizenz = Get-ChildItem build/exiftool_raw -Recurse `
+                    -Include "README","*.txt" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "README|LICENSE|Artistic|Copying" } |
+                    Select-Object -First 1
+          if ($lizenz) { Copy-Item $lizenz.FullName dist/Wimmich/exiftool_README.txt }
+
+      - name: Zusammenpacken
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          Compress-Archive -Path dist/Wimmich/* `
+                           -DestinationPath "Wimmich_${v}_Windows.zip" -Force
+          Get-Item "Wimmich_${v}_Windows.zip" |
+            ForEach-Object { Write-Host "$($_.Name): $([math]::Round($_.Length/1MB,1)) MB" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wimmich_Windows
+          path: Wimmich_${{ steps.version.outputs.version }}_Windows.zip
+          retention-days: 30
+
+      - name: An den Release hängen
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Wimmich_${{ steps.version.outputs.version }}_Windows.zip

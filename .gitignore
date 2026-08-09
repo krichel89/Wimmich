@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# PyInstaller — entsteht beim Bauen, gehört nicht ins Repo
+build/
+dist/
+*.spec
+
+# Editoren
+.vscode/
+.idea/
+*.swp
+
+# Betriebssystem
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Nichts davon gehört auf GitHub: die config.json enthält den
+# Immich-Schlüssel im Klartext, der Index ist reiner Cache.
+config.json
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
