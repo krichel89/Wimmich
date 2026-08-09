@@ -8,8 +8,10 @@ Fenster läuft, ist es ein eigenes Bauteil.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QBrush, QColor, QCursor, QPainter, QPen, QPixmap, QPolygonF,
+)
 
 from .edits import CROP, RED_EYE, SPOT, STROKE
 from .imageview import ImageView
@@ -42,10 +44,15 @@ class CanvasView(ImageView):
     def set_mode(self, kind: str) -> None:
         self._mode = kind
         self._crop_now = None
-        self.setCursor(
-            Qt.CursorShape.ArrowCursor if kind == NONE
-            else Qt.CursorShape.CrossCursor
-        )
+        if kind == NONE:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif kind == PIPETTE:
+            # Eine Pipette sagt ohne Worte, was der Klick tut. Qt bringt
+            # keine mit, also gezeichnet - die Spitze liegt exakt auf dem
+            # Punkt, der gemessen wird.
+            self.setCursor(_pipette_cursor())
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
         self.viewport().update()
 
     def mode(self) -> str:
@@ -196,3 +203,47 @@ def _outside(full: QRectF, inner: QRectF) -> list[QRectF]:
         QRectF(inner.right(), inner.top(),
                full.right() - inner.right(), inner.height()),
     ]
+
+
+_PIPETTE: QCursor | None = None
+
+
+def _pipette_cursor() -> QCursor:
+    """Zeichnet einen Pipetten-Zeiger. Wird einmal gebaut und behalten."""
+    global _PIPETTE
+    if _PIPETTE is not None:
+        return _PIPETTE
+
+    groesse = 32
+    pixmap = QPixmap(groesse, groesse)
+    pixmap.fill(QColor(0, 0, 0, 0))
+
+    maler = QPainter(pixmap)
+    maler.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    # Spitze unten links, Körper schräg nach oben rechts
+    weiss = QPen(QColor(255, 255, 255), 3.0)
+    weiss.setCapStyle(Qt.PenCapStyle.RoundCap)
+    schwarz = QPen(QColor(20, 20, 20), 1.4)
+    schwarz.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+    for stift in (weiss, schwarz):
+        maler.setPen(stift)
+        maler.drawLine(2, 30, 20, 12)          # Röhrchen
+
+    # Spitze
+    spitze = QPolygonF([
+        QPointF(1.0, 31.0), QPointF(7.0, 27.0), QPointF(5.0, 25.0),
+    ])
+    maler.setPen(QPen(QColor(20, 20, 20), 1.0))
+    maler.setBrush(QBrush(QColor(255, 255, 255)))
+    maler.drawPolygon(spitze)
+
+    # Kolben oben rechts
+    maler.setBrush(QBrush(QColor(120, 170, 255)))
+    maler.drawRoundedRect(QRectF(17.0, 4.0, 12.0, 12.0), 3.0, 3.0)
+    maler.end()
+
+    # Der Punkt, der wirklich gemessen wird: die Spitze
+    _PIPETTE = QCursor(pixmap, 1, 31)
+    return _PIPETTE

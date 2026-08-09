@@ -24,6 +24,7 @@ STROKE = "stroke"
 RED_EYE = "red_eye"
 FADED = "faded"
 TONE = "tone"
+GEOMETRY = "geometry"
 CROP = "crop"
 
 
@@ -51,6 +52,11 @@ class Step:
     # Zuschnitt, als Bruchteile der Bildgröße
     width: float = 1.0
     height: float = 1.0
+    # Geometrie
+    quarters: int = 0        # Vierteldrehungen im Uhrzeigersinn
+    angle: float = 0.0       # feine Drehung in Grad
+    persp_h: float = 0.0     # Entzerrung waagerecht
+    persp_v: float = 0.0     # Entzerrung senkrecht
 
     def label(self) -> str:
         return {
@@ -59,6 +65,7 @@ class Step:
             RED_EYE: "Rote Augen",
             FADED: "Farben aufgefrischt",
             TONE: "Grundeinstellungen",
+            GEOMETRY: "Drehen und Entzerren",
             CROP: "Zuschnitt",
         }.get(self.kind, self.kind)
 
@@ -72,7 +79,7 @@ class EditStack:
     # -- Bearbeiten ----------------------------------------------------
 
     # Diese Schritte gibt es je Bild nur einmal; ein neuer ersetzt den alten.
-    SINGLE = (FADED, TONE, CROP)
+    SINGLE = (FADED, TONE, GEOMETRY, CROP)
 
     def add(self, step: Step) -> None:
         if step.kind in self.SINGLE:
@@ -179,6 +186,14 @@ class EditStack:
                     result, int(step.x * width), int(step.y * height),
                     radius, step.strength)
 
+        # Geometrie NACH den Retuschen: deren Koordinaten beziehen sich
+        # aufs ungedrehte Bild. Vor dem Zuschnitt, weil der Zuschnitt im
+        # gedrehten Rahmen gesetzt wird.
+        geo = self.single(GEOMETRY)
+        if geo is not None:
+            result = retouch.apply_geometry(result, geo.quarters, geo.angle,
+                                            geo.persp_h, geo.persp_v)
+
         crop_step = self.single(CROP) if with_crop else None
         if crop_step:
             result = retouch.crop(result, crop_step.x, crop_step.y,
@@ -226,6 +241,11 @@ def array_to_qimage(array: np.ndarray):
     height, width = data.shape[:2]
     return QImage(data.tobytes(), width, height, width * 3,
                   QImage.Format.Format_RGB888).copy()
+
+
+def geometry_is_neutral(step: Step) -> bool:
+    """True, wenn ein Geometrie-Schritt nichts bewirkt."""
+    return not any((step.quarters % 4, step.angle, step.persp_h, step.persp_v))
 
 
 def tone_is_neutral(step: Step) -> bool:

@@ -33,7 +33,7 @@ from .previews import PreviewLoader
 from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
 from .edits import (
-    CROP, EditStack, FADED, RED_EYE, SPOT, STROKE, Step, TONE,
+    CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
     array_to_qimage, downscale, qimage_to_array,
 )
 from .previews import decode as decode_image
@@ -49,6 +49,7 @@ PREVIEW_EDGE = 800      # Kantenlänge der Fassung, auf der beim Ziehen gerechne
 
 SORT_OPTIONS = [
     ("Aufnahmedatum", "taken_at"),
+    ("Ordner", "folder"),
     ("Dateiname", "filename"),
     ("Bewertung", "rating"),
     ("Zuletzt geändert", "mtime"),
@@ -130,6 +131,7 @@ class MainWindow(QMainWindow):
         self._save_delay.timeout.connect(self._save_edits)
 
         self._chrome_visible = True
+        self._gesamt = 0        # Aufnahmen in der aktuellen Ansicht
         self._scan_worker: ScanWorker | None = None
 
         self._build_ui()
@@ -268,6 +270,8 @@ class MainWindow(QMainWindow):
 
         self.panel = EditPanel(self)
         self.panel.tone_changed.connect(self._tone_changed)
+        self.panel.geometry_changed.connect(self._geometry_changed)
+        self.panel.rotate_quarter.connect(self._rotate_quarter)
         self.panel.fade_changed.connect(self._fade_changed)
         self.panel.suggest_fade.connect(self._suggest_fade)
         self.panel.pipette_toggled.connect(self._set_pipette)
@@ -570,7 +574,7 @@ class MainWindow(QMainWindow):
         else:
             kind, key = self._selection
             if kind == "all":
-                rows = self.db.all_photos(self.config.libraries, **common)
+                rows = []          # wird weiter unten als Cursor geholt
             elif kind == "folder":
                 rows = self.db.photos_in_folder(
                     key, recursive=self.recursive_button.isChecked(),
@@ -587,15 +591,35 @@ class MainWindow(QMainWindow):
                     order=self.sort_box.currentData(), **common,
                 )
 
-        picasa = bool(self._selection and self._selection[0] == "all"
-                      and not self.search_box.text().strip())
-        self.grid.setUniformItemSizes(not picasa)
-        self.model.set_rows(rows, group_by_folder=picasa)
+        # „Alle Fotos" läuft endlos durch: die Zeilen werden stückweise
+        # nachgeholt, wenn die Ansicht sie braucht. Gruppiert wird nach
+        # dem, wonach auch sortiert wird - Ordner oder Monat.
+        alle = bool(self._selection and self._selection[0] == "all")
+        sortierung = self.sort_box.currentData()
+        gruppierung = None
+        if alle and not query:
+            gruppierung = "folder" if sortierung == "folder" else (
+                "date" if sortierung == "taken_at" else None)
+
+        self.grid.setUniformItemSizes(gruppierung is None)
+        if alle and not query:
+            cursor = self.db.all_photos_cursor(
+                self.config.libraries, order=sortierung, **common)
+            self.model.set_cursor(cursor, group_by=gruppierung)
+            gezeigt = self.db.count_photos(
+                self.config.libraries, min_rating=common["min_rating"],
+                stacked=common["stacked"], show_rejects=common["show_rejects"],
+                labels=common["labels"])
+        else:
+            self.model.set_rows(rows)
+            gezeigt = len(rows)
+
         self.model.set_edited(self.db.edited_paths())
+        self._gesamt = gezeigt
         if self.in_loupe:
             # Die Liste hat sich unter der Lupe verändert - zurück ins Raster
             self._show_grid()
-        self._update_status(len(rows))
+        self._update_status(gezeigt)
 
     def _run_search(self) -> None:
         self._refresh_view()
@@ -783,7 +807,7 @@ class MainWindow(QMainWindow):
             index = self.model.index(self._loupe_row, 0)
             self.grid.setCurrentIndex(index)
             self.grid.scrollTo(index)
-        self._update_status(self.model.rowCount())
+        self._update_status(self._gesamt)
 
     def _show_loupe(self, row: int) -> None:
         if row < 0 or row >= self.model.rowCount():
@@ -810,7 +834,8 @@ class MainWindow(QMainWindow):
         self.panel.load(self._stack_edits.single(TONE),
                         self._stack_edits.single(FADED),
                         self._crop_text(),
-                        base_kelvin=item.get("color_temp"))
+                        base_kelvin=item.get("color_temp"),
+                        geo=self._stack_edits.single(GEOMETRY))
 
         image = self.loader.request(self._loupe_path, "screen")
         if image is not None:
@@ -923,6 +948,18 @@ class MainWindow(QMainWindow):
     def _step_loupe(self, delta: int) -> None:
         self._save_edits()
         new_row = self._loupe_row + delta
+        if new_row < 0:
+            return
+        # In der Lupe wird Bild für Bild geblättert; liegt das nächste
+        # jenseits des bisher Geholten, erst nachladen.
+        while new_row >= self.model.rowCount() and self.model.canFetchMore():
+            self.model.fetchMore()
+        if new_row >= self.model.rowCount():
+            return
+        if self.model.is_header(new_row):
+            new_row += 1 if delta > 0 else -1
+            while new_row >= self.model.rowCount() and self.model.canFetchMore():
+                self.model.fetchMore()
         if 0 <= new_row < self.model.rowCount():
             self._load_loupe(new_row)
 
@@ -1051,14 +1088,26 @@ class MainWindow(QMainWindow):
         Zuschnitts.
         """
         size = self.canvas.image_size()
-        if not size:
+        if not size or self._loupe_source is None:
             return 0.0, 0.0
         rx, ry = x / size[0], y / size[1]
 
+        # 1. Zuschnitt herausrechnen
         crop_step = self._stack_edits.single(CROP)
         if crop_step is not None and not self._crop_mode:
             rx = crop_step.x + rx * crop_step.width
             ry = crop_step.y + ry * crop_step.height
+
+        # 2. Drehung und Entzerrung herausrechnen. Die Abbildung, mit der
+        #    das Bild gedreht wird, zeigt schon in die richtige Richtung:
+        #    von der Ausgabe zur Eingabe. Genau die wird hier benutzt.
+        geo = self._stack_edits.single(GEOMETRY)
+        if geo is not None:
+            height, width = self._loupe_source.shape[:2]
+            out_w, out_h, M = retouch.geometry_matrix(
+                width, height, geo.quarters, geo.angle, geo.persp_h, geo.persp_v)
+            ix, iy = retouch.map_point(M, rx * out_w, ry * out_h)
+            rx, ry = ix / max(width, 1), iy / max(height, 1)
         return rx, ry
 
     def _relative_radius(self) -> float:
@@ -1071,6 +1120,17 @@ class MainWindow(QMainWindow):
         if crop_step is not None and not self._crop_mode:
             # Die Anzeige ist kleiner als das Bild - der Radius entsprechend auch
             radius *= min(crop_step.width, crop_step.height)
+
+        # Bei einer Vierteldrehung tauschen Breite und Höhe die Rollen;
+        # der Radius bezieht sich aber auf die kürzere Kante des
+        # ursprünglichen Bildes. Ohne diese Umrechnung wäre der Pinsel
+        # im Hochformat anders groß als im Querformat.
+        geo = self._stack_edits.single(GEOMETRY)
+        if geo is not None and self._loupe_source is not None:
+            height, width = self._loupe_source.shape[:2]
+            out_w, out_h, _M = retouch.geometry_matrix(
+                width, height, geo.quarters, geo.angle, geo.persp_h, geo.persp_v)
+            radius *= min(out_w, out_h) / max(min(width, height), 1)
         return radius
 
     def _canvas_click(self, x: float, y: float) -> None:
@@ -1136,6 +1196,13 @@ class MainWindow(QMainWindow):
             self._set_aspect(self._crop_aspect_key)
 
     def _set_aspect(self, digit: int) -> None:
+        """Seitenverhältnis wählen.
+
+        Wirkt AUCH auf einen bereits gezogenen Rahmen: der wird auf das
+        neue Verhältnis gebracht, statt erst beim nächsten Ziehen zu
+        greifen. Mittelpunkt und Fläche bleiben dabei so weit wie
+        möglich erhalten.
+        """
         if not self._crop_mode:
             self._toggle_crop_mode(True)
         ratio = ASPECT_PRESETS.get(digit)
@@ -1146,21 +1213,70 @@ class MainWindow(QMainWindow):
         self._crop_aspect_key = digit
         if ratio and self._crop_portrait:
             ratio = 1.0 / ratio
+
         self.canvas.set_aspect(ratio)
         for key, button in self._aspect_buttons.items():
             button.setChecked(key == digit)
         self.portrait_button.setEnabled(bool(ratio) and digit != 4)
         self.portrait_button.setText(
             "hoch ✓" if (self._crop_portrait and ratio) else "hoch / quer")
+
+        if ratio:
+            self._reshape_crop(ratio)
+
         self.statusBar().showMessage(
             f"Format: {ASPECT_NAMES[digit]}"
             + (" hoch" if self._crop_portrait and ratio else ""), 3000)
+
+    def _reshape_crop(self, ratio: float) -> None:
+        """Bestehenden Zuschnittrahmen auf ein Seitenverhältnis bringen."""
+        step = self._stack_edits.single(CROP)
+        size = self.canvas.image_size()
+        if step is None or not size:
+            return
+        out_w, out_h = size
+
+        # In Bildpunkten rechnen - das Verhältnis meint Pixel, nicht Anteile
+        w = step.width * out_w
+        h = step.height * out_h
+        cx = (step.x + step.width / 2) * out_w
+        cy = (step.y + step.height / 2) * out_h
+
+        # Fläche beibehalten, damit der Rahmen nicht springt
+        flaeche = max(w * h, 1.0)
+        neu_w = (flaeche * ratio) ** 0.5
+        neu_h = neu_w / ratio
+
+        # Ins Bild hineinpassen, notfalls verkleinern
+        faktor = min(1.0, out_w / neu_w, out_h / neu_h)
+        neu_w *= faktor
+        neu_h *= faktor
+
+        x = min(max(cx - neu_w / 2, 0.0), out_w - neu_w)
+        y = min(max(cy - neu_h / 2, 0.0), out_h - neu_h)
+
+        self._stack_edits.add(Step(kind=CROP, x=x / out_w, y=y / out_h,
+                                   width=neu_w / out_w, height=neu_h / out_h))
+        self._render_loupe(keep_view=True)
+        self._save_delay.start()
 
     def _tone_changed(self, step) -> None:
         self._stack_edits.remove_kind(TONE)
         if step is not None:
             self._stack_edits.add(step)
         self._render_soon()
+
+    def _geometry_changed(self, step) -> None:
+        self._stack_edits.remove_kind(GEOMETRY)
+        if step is not None:
+            self._stack_edits.add(step)
+        # Die Bildgröße ändert sich - deshalb NICHT keep_view
+        self._render_loupe(fast=True)
+        self._render_delay.start()
+        self._save_delay.start()
+
+    def _rotate_quarter(self, richtung: int) -> None:
+        self.panel.set_quarters(self.panel.quarters() + int(richtung))
 
     def _fade_changed(self, strength: float, neutralise: bool) -> None:
         self._stack_edits.remove_kind(FADED)
@@ -1184,7 +1300,8 @@ class MainWindow(QMainWindow):
             item = self.model.row_data(self._loupe_row) or {}
             self.panel.load(self._stack_edits.single(TONE),
                             self._stack_edits.single(FADED), self._crop_text(),
-                            base_kelvin=item.get("color_temp"))
+                            base_kelvin=item.get("color_temp"),
+                        geo=self._stack_edits.single(GEOMETRY))
         self._render_loupe()
         self._save_edits()
 
@@ -1193,7 +1310,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_crop(None)
         item = self.model.row_data(self._loupe_row) or {}
         self.panel.load(None, None, self._crop_text(),
-                        base_kelvin=item.get("color_temp"))
+                        base_kelvin=item.get("color_temp"),
+                        geo=self._stack_edits.single(GEOMETRY))
         self._render_loupe()
         self._save_edits()
 
@@ -1301,6 +1419,10 @@ class MainWindow(QMainWindow):
             if self.in_loupe:
                 self._toggle_crop_mode()
             return True
+        if key == Qt.Key.Key_R and not ctrl:
+            if self.in_loupe:
+                self._rotate_quarter(-1 if shift else 1)
+            return True
         if key == Qt.Key.Key_W and not ctrl:
             if self.in_loupe:
                 self._set_pipette(self.canvas.mode() != PIPETTE)
@@ -1330,6 +1452,7 @@ class MainWindow(QMainWindow):
                 self._undo_edit()
             return True
         if ctrl and key == Qt.Key.Key_A:
+            self.model.alles_laden()
             self.grid.selectAll()
             return True
         if ctrl and key == Qt.Key.Key_D:
@@ -1353,6 +1476,10 @@ class MainWindow(QMainWindow):
             self._go_to(0)
             return True
         if key == Qt.Key.Key_End:
+            # Ans Ende heißt: alles holen. Bei sehr großen Beständen
+            # dauert das einen Moment - dafür stimmt danach auch die
+            # Bildlaufleiste.
+            self.model.alles_laden()
             self._go_to(self.model.rowCount() - 1)
             return True
 
@@ -1440,8 +1567,12 @@ class MainWindow(QMainWindow):
         self._go_to(max(0, min(self.model.rowCount() - 1, current + delta)))
 
     def _go_to(self, row: int) -> None:
+        while row >= self.model.rowCount() and self.model.canFetchMore():
+            self.model.fetchMore()
         if row < 0 or row >= self.model.rowCount():
             return
+        if self.model.is_header(row):
+            row = min(row + 1, self.model.rowCount() - 1)
         if self.in_loupe:
             self._save_edits()
             self._load_loupe(row)
@@ -1704,7 +1835,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("Tastenkürzel")
         box.setTextFormat(Qt.TextFormat.RichText)
-        box.setText(KEY_HELP)
+        box.setText(KEY_HELP.format(version=__version__))
         box.exec()
 
     def _clear_cache(self) -> None:
@@ -1758,6 +1889,7 @@ KEY_HELP = """<b>Belegung wie in Cammello</b><table cellpadding="3">
 <tr><td>Strg + / −</td><td>Zoom stufenweise</td></tr>
 <tr><td>+ / −</td><td>Belichtung</td></tr>
 <tr><td>W</td><td>Pipette (Weißabgleich)</td></tr>
+<tr><td>R</td><td>90° drehen (Umschalt+R andersherum)</td></tr>
 <tr><td>C</td><td>Zuschnitt an/aus</td></tr>
 <tr><td>&nbsp;&nbsp;darin 1–6</td><td>frei, 3:2, 4:3, 1:1, 16:9, 5:4<br>
 gleiche Ziffer nochmal: hoch ⇄ quer</td></tr>
@@ -1772,4 +1904,6 @@ gleiche Ziffer nochmal: hoch ⇄ quer</td></tr>
 <tr><td>Strg+F</td><td>in die Suchleiste; Enter führt zurück</td></tr>
 <tr><td>F5 / F6</td><td>neu einlesen / Immich abgleichen</td></tr>
 <tr><td>Strg+,</td><td>Einstellungen</td></tr>
-</table>"""
+</table>
+<p style="color:#8e8e9c">Wimmich {version} — freie Software unter der
+GNU GPL v3 oder später. Ohne jede Gewährleistung.</p>"""

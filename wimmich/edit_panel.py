@@ -15,7 +15,9 @@ from PyQt6.QtWidgets import (
 
 from . import theme
 from . import retouch
-from .edits import Step, TONE, tone_is_neutral
+from .edits import (
+    GEOMETRY, Step, TONE, geometry_is_neutral, tone_is_neutral,
+)
 
 # (Feld im Step, Beschriftung, kleinster, größter, Einheit, Teiler)
 TONE_SLIDERS = [
@@ -30,6 +32,13 @@ TONE_SLIDERS = [
     ("tint", "Tint", -100, 100, "", 100.0),
 ]
 
+# (Feld, Beschriftung, kleinster, größter, Teiler)
+GEO_SLIDERS = [
+    ("angle", "Drehung", -4500, 4500, 100.0),        # ±45 Grad, 0,01er Schritte
+    ("persp_v", "Perspektive ↕", -100, 100, 100.0),
+    ("persp_h", "Perspektive ↔", -100, 100, 100.0),
+]
+
 EV_STEP = 25        # ein Tastendruck auf + oder - in Reglereinheiten (0,25 EV)
 
 
@@ -37,6 +46,8 @@ class EditPanel(QWidget):
     """Regler für Grundeinstellungen und Auffrischen."""
 
     tone_changed = pyqtSignal(object)      # Step oder None
+    geometry_changed = pyqtSignal(object)  # Step oder None
+    rotate_quarter = pyqtSignal(int)       # +1 rechts, -1 links
     fade_changed = pyqtSignal(float, bool)  # Stärke, Farbstich entfernen
     suggest_fade = pyqtSignal()
     pipette_toggled = pyqtSignal(bool)
@@ -52,6 +63,7 @@ class EditPanel(QWidget):
         # Aufnahmetemperatur des gerade gezeigten Bildes; None heißt:
         # die Datei gibt nichts her, wir rechnen mit Tageslicht.
         self._base_kelvin: int | None = None
+        self._quarters = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 10, 4)
@@ -105,6 +117,47 @@ class EditPanel(QWidget):
         layout.addWidget(self.kelvin_hint)
 
         layout.addWidget(_separator())
+        layout.addWidget(_heading("Drehen und Entzerren"))
+
+        dreh = QHBoxLayout()
+        links = QPushButton("↺ 90°")
+        links.setToolTip("Gegen den Uhrzeigersinn (Umschalt+R)")
+        links.clicked.connect(lambda: self.rotate_quarter.emit(-1))
+        dreh.addWidget(links)
+        rechts = QPushButton("↻ 90°")
+        rechts.setToolTip("Im Uhrzeigersinn (R)")
+        rechts.clicked.connect(lambda: self.rotate_quarter.emit(1))
+        dreh.addWidget(rechts)
+        layout.addLayout(dreh)
+
+        geo_form = QFormLayout()
+        geo_form.setSpacing(6)
+        self.geo_sliders: dict[str, QSlider] = {}
+        self.geo_readouts: dict[str, QLabel] = {}
+        for field, label, low, high, _scale in GEO_SLIDERS:
+            zeile = QWidget()
+            zl = QHBoxLayout(zeile)
+            zl.setContentsMargins(0, 0, 0, 0)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(low, high)
+            slider.valueChanged.connect(self._emit_geometry)
+            zl.addWidget(slider, 1)
+            readout = QLabel("–")
+            readout.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+            readout.setFixedWidth(64)
+            readout.setAlignment(Qt.AlignmentFlag.AlignRight
+                                 | Qt.AlignmentFlag.AlignVCenter)
+            zl.addWidget(readout)
+            self.geo_sliders[field] = slider
+            self.geo_readouts[field] = readout
+            geo_form.addRow(label, zeile)
+        layout.addLayout(geo_form)
+
+        geo_reset = QPushButton("Geometrie zurücksetzen")
+        geo_reset.clicked.connect(self._reset_geometry)
+        layout.addWidget(geo_reset)
+
+        layout.addWidget(_separator())
         layout.addWidget(_heading("Ausgeblichene Farben"))
 
         fade_row = QHBoxLayout()
@@ -153,10 +206,15 @@ class EditPanel(QWidget):
     # -- Von außen befüllen --------------------------------------------
 
     def load(self, tone: Step | None, fade: Step | None,
-             crop_text: str, base_kelvin: int | None = None) -> None:
+             crop_text: str, base_kelvin: int | None = None,
+             geo: Step | None = None) -> None:
         """Regler auf ein Bild setzen, ohne Signale auszulösen."""
         self._base_kelvin = base_kelvin
+        self._quarters = int(getattr(geo, "quarters", 0) or 0) % 4
         self._loading = True
+        for field, _l, _lo, _hi, scale in GEO_SLIDERS:
+            wert = getattr(geo, field, 0.0) if geo else 0.0
+            self.geo_sliders[field].setValue(int(round(wert * scale)))
         for field, _l, _lo, _hi, _u, scale in TONE_SLIDERS:
             value = getattr(tone, field, 0.0) if tone else 0.0
             self.sliders[field].setValue(int(round(value * scale)))
@@ -165,6 +223,7 @@ class EditPanel(QWidget):
             self.neutral_box.setChecked(bool(fade.neutralise))
         self._loading = False
         self._update_readouts()
+        self._update_geo_readouts()
         self._update_fade_label()
         self.crop_label.setText(crop_text)
         self.kelvin_hint.setText(
@@ -190,6 +249,20 @@ class EditPanel(QWidget):
         self.sliders["warmth"].setValue(int(round(warmth * 100)))
         self.sliders["tint"].setValue(int(round(tint * 100)))
 
+    def set_quarters(self, quarters: int) -> None:
+        """Vierteldrehung von außen setzen (Taste R)."""
+        self._quarters = int(quarters) % 4
+        self._emit_geometry()
+
+    def current_geometry(self) -> Step | None:
+        step = Step(kind=GEOMETRY, quarters=self._quarters)
+        for field, _l, _lo, _hi, scale in GEO_SLIDERS:
+            setattr(step, field, self.geo_sliders[field].value() / scale)
+        return None if geometry_is_neutral(step) else step
+
+    def quarters(self) -> int:
+        return self._quarters
+
     def current_tone(self) -> Step | None:
         step = Step(kind=TONE)
         for field, _l, _lo, _hi, _u, scale in TONE_SLIDERS:
@@ -203,6 +276,35 @@ class EditPanel(QWidget):
             return
         self._update_readouts()
         self.tone_changed.emit(self.current_tone())
+
+    def _emit_geometry(self) -> None:
+        if self._loading:
+            return
+        self._update_geo_readouts()
+        self.geometry_changed.emit(self.current_geometry())
+
+    def _update_geo_readouts(self) -> None:
+        for field, _l, _lo, _hi, scale in GEO_SLIDERS:
+            wert = self.geo_sliders[field].value() / scale
+            readout = self.geo_readouts[field]
+            if abs(wert) < 1e-9:
+                readout.setText(f"{self._quarters * 90}°"
+                                if field == "angle" and self._quarters else "–")
+            elif field == "angle":
+                gesamt = self._quarters * 90
+                readout.setText(f"{wert:+.2f}°" if not gesamt
+                                else f"{gesamt}{wert:+.2f}°")
+            else:
+                readout.setText(f"{wert * 100:+.0f}")
+
+    def _reset_geometry(self) -> None:
+        self._loading = True
+        self._quarters = 0
+        for slider in self.geo_sliders.values():
+            slider.setValue(0)
+        self._loading = False
+        self._update_geo_readouts()
+        self.geometry_changed.emit(None)
 
     def _emit_fade(self) -> None:
         if self._loading:

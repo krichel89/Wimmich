@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Wimmich - Startpunkt."""
+"""Wimmich - Startpunkt.
+
+Copyright (C) 2026 Harald Krichel. Freie Software unter der GNU GPL v3
+oder später; siehe LICENSE. Ohne jede Gewährleistung.
+"""
 
 from __future__ import annotations
 

@@ -476,6 +476,168 @@ def to_uint8(image: np.ndarray) -> np.ndarray:
     return (np.clip(image, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
+# -- Geometrie: Drehen und Entzerren -----------------------------------
+
+def geometry_matrix(width: int, height: int, quarters: int = 0,
+                    angle: float = 0.0, persp_h: float = 0.0,
+                    persp_v: float = 0.0):
+    """Baut die Abbildung für Drehung und Entzerrung.
+
+    Rückgabe: (Ausgabebreite, Ausgabehöhe, M) - M bildet AUSGABE-Punkte
+    auf EINGABE-Punkte ab (3x3).
+
+    Warum diese Richtung? Pillow erwartet für eine perspektivische
+    Umformung genau das: zu jedem Zielpunkt den Quellpunkt. Und genau
+    dieselbe Matrix braucht das Hauptfenster, um einen Mausklick in der
+    gedrehten Anzeige auf die ursprüngliche Stelle zurückzurechnen. Eine
+    Abbildung, zwei Verwendungen - ohne sie müsste man invertieren und
+    hätte zwei Fehlerquellen statt einer.
+
+    Alle Teilschritte stecken in EINER Matrix: 90-Grad-Drehung, feine
+    Drehung, Entzerrung und die Vergrößerung, die verhindert, dass
+    leere Ecken entstehen.
+    """
+    quarters = int(quarters) % 4
+    angle = float(angle)
+    persp_h = float(persp_h)
+    persp_v = float(persp_v)
+
+    # 1. Vierteldrehungen (im Uhrzeigersinn)
+    if quarters == 0:
+        K = np.eye(3, dtype=np.float64)
+        w1, h1 = width, height
+    elif quarters == 1:
+        K = np.array([[0, -1, height], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
+        w1, h1 = height, width
+    elif quarters == 2:
+        K = np.array([[-1, 0, width], [0, -1, height], [0, 0, 1]], dtype=np.float64)
+        w1, h1 = width, height
+    else:
+        K = np.array([[0, 1, 0], [-1, 0, width], [0, 0, 1]], dtype=np.float64)
+        w1, h1 = height, width
+
+    if not angle and not persp_h and not persp_v:
+        return w1, h1, np.linalg.inv(K)
+
+    # 2. Eckpunkte im gedrehten Rahmen verschieben
+    cx, cy = w1 / 2.0, h1 / 2.0
+    src = [(0.0, 0.0), (w1, 0.0), (w1, h1), (0.0, h1)]
+
+    # Entzerrung: oben/unten bzw. links/rechts unterschiedlich breit.
+    # persp_v > 0 zieht die Oberkante auseinander - das begradigt
+    # stürzende Linien einer von unten fotografierten Fassade.
+    oben = 1.0 + persp_v * 0.5
+    unten = 1.0 - persp_v * 0.5
+    links = 1.0 + persp_h * 0.5
+    rechts = 1.0 - persp_h * 0.5
+
+    def zieh(x, y):
+        fx = oben if y < cy else unten
+        fy = links if x < cx else rechts
+        return cx + (x - cx) * fx, cy + (y - cy) * fy
+
+    dst = [zieh(x, y) for x, y in src]
+
+    # Feine Drehung um die Mitte
+    rad = np.deg2rad(angle)
+    cos, sin = np.cos(rad), np.sin(rad)
+    dst = [(cx + (x - cx) * cos - (y - cy) * sin,
+            cy + (x - cx) * sin + (y - cy) * cos) for x, y in dst]
+
+    A = _homography(src, dst) @ K
+    M = np.linalg.inv(A)
+
+    # 3. So weit vergrößern, dass keine leeren Ecken bleiben.
+    #    Statt einer Formel: ausprobieren. Die Prüfung kostet vier
+    #    Matrixmultiplikationen, das ist billiger als eine Formel, die
+    #    für Drehung UND Entzerrung gleichzeitig stimmen müsste.
+    faktor = _cover_scale(M, w1, h1, width, height)
+    if faktor > 1.0001:
+        S = np.array([[1 / faktor, 0, cx * (1 - 1 / faktor)],
+                      [0, 1 / faktor, cy * (1 - 1 / faktor)],
+                      [0, 0, 1]], dtype=np.float64)
+        M = M @ S
+
+    return w1, h1, M
+
+
+def _homography(src, dst) -> np.ndarray:
+    """3x3-Abbildung aus vier Punktpaaren."""
+    rows = []
+    ziel = []
+    for (x, y), (u, v) in zip(src, dst):
+        rows.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        ziel.append(u)
+        rows.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        ziel.append(v)
+    loesung, *_ = np.linalg.lstsq(np.array(rows, dtype=np.float64),
+                                  np.array(ziel, dtype=np.float64), rcond=None)
+    return np.append(loesung, 1.0).reshape(3, 3)
+
+
+def _cover_scale(M: np.ndarray, out_w: int, out_h: int,
+                 in_w: int, in_h: int) -> float:
+    """Kleinster Faktor, bei dem alle Ausgabe-Ecken im Bild liegen."""
+    def passt(faktor: float) -> bool:
+        cx, cy = out_w / 2.0, out_h / 2.0
+        S = np.array([[1 / faktor, 0, cx * (1 - 1 / faktor)],
+                      [0, 1 / faktor, cy * (1 - 1 / faktor)],
+                      [0, 0, 1]], dtype=np.float64)
+        T = M @ S
+        for x, y in ((0, 0), (out_w, 0), (out_w, out_h), (0, out_h)):
+            p = T @ np.array([x, y, 1.0])
+            if abs(p[2]) < 1e-9:
+                return False
+            u, v = p[0] / p[2], p[1] / p[2]
+            if u < -0.5 or v < -0.5 or u > in_w + 0.5 or v > in_h + 0.5:
+                return False
+        return True
+
+    if passt(1.0):
+        return 1.0
+    lo, hi = 1.0, 1.2
+    while hi < 8.0 and not passt(hi):
+        hi *= 1.5
+    for _ in range(24):
+        mitte = (lo + hi) / 2
+        if passt(mitte):
+            hi = mitte
+        else:
+            lo = mitte
+    return hi
+
+
+def apply_geometry(rgb: np.ndarray, quarters: int = 0, angle: float = 0.0,
+                   persp_h: float = 0.0, persp_v: float = 0.0) -> np.ndarray:
+    """Dreht und entzerrt ein Bild."""
+    if not quarters and not angle and not persp_h and not persp_v:
+        return rgb
+    height, width = rgb.shape[:2]
+    out_w, out_h, M = geometry_matrix(width, height, quarters, angle,
+                                      persp_h, persp_v)
+
+    # Reine Vierteldrehung ohne alles andere: exakt und schnell über numpy
+    if not angle and not persp_h and not persp_v:
+        return np.ascontiguousarray(np.rot90(rgb, -int(quarters) % 4))
+
+    from PIL import Image
+    coeffs = (M / M[2, 2]).reshape(-1)[:8]
+    bild = Image.fromarray(to_uint8(rgb))
+    gedreht = bild.transform((int(out_w), int(out_h)),
+                             Image.Transform.PERSPECTIVE,
+                             tuple(float(c) for c in coeffs),
+                             resample=Image.Resampling.BICUBIC)
+    return np.asarray(gedreht, dtype=np.float32) / 255.0
+
+
+def map_point(M: np.ndarray, x: float, y: float) -> tuple[float, float]:
+    """Punkt der Ausgabe auf den zugehörigen Punkt der Eingabe abbilden."""
+    p = M @ np.array([float(x), float(y), 1.0])
+    if abs(p[2]) < 1e-9:
+        return 0.0, 0.0
+    return float(p[0] / p[2]), float(p[1] / p[2])
+
+
 # -- Farbtemperatur ----------------------------------------------------
 
 DEFAULT_KELVIN = 5500        # Tageslicht, wenn die Datei nichts hergibt

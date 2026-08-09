@@ -1,4 +1,4 @@
-# Wimmich 0.3.10
+# Wimmich 0.3.13
 
 Lokale Fotoverwaltung als Picasa-Ersatz. Etappe 1: Ordnerbaum, Rasteransicht,
 Vollbild, Bewertungen, Suche über den Index, RAW+JPG als Stapel.
@@ -25,6 +25,47 @@ ausschließbar, Wärme in Kelvin, Regler für Klarheit und Details.
 
 **0.3.10:** exiftool wird von SourceForge bezogen (exiftool.org verweist
 selbst dorthin).
+
+**0.3.11:** „Alle Fotos" scrollt endlos — wahlweise Ordner für Ordner
+oder alle Bilder durchgehend nach Datum.
+
+**0.3.12:** Drehen (fein und in 90-Grad-Schritten) und perspektivisches
+Entzerren.
+
+**0.3.13:** Drehung bis ±45°, Formatumschaltung wirkt auf den
+bestehenden Zuschnittrahmen, Pipetten-Zeiger, Wimmich steht unter der
+GPL v3.
+
+## Lizenz
+
+Wimmich steht unter der **GNU General Public License, Version 3 oder
+später**. Der vollständige Text liegt in `LICENSE`.
+
+Das ist keine willkürliche Wahl: Wimmich baut auf **PyQt6**, und PyQt ist
+auf allen Plattformen nur unter der GPL v3 oder einer kommerziellen
+Lizenz von Riverbank zu haben — anders als Qt selbst gibt es PyQt nicht
+unter der LGPL. Sobald eine gebaute Fassung an Dritte geht, muss das
+Ganze GPL-verträglich sein.
+
+Was sonst noch mitläuft:
+
+| Baustein | Lizenz |
+|---|---|
+| Wimmich | GPL v3 oder später |
+| PyQt6 | GPL v3 oder kommerziell |
+| Qt (in den PyQt-Paketen) | LGPL v3 |
+| Pillow | HPND/MIT-CMU |
+| numpy | BSD-3 |
+| rawpy | MIT, bündelt LibRaw (LGPL-2.1 oder CDDL-1.0) |
+| opencv-python (optional) | Apache 2.0 |
+| exiftool (beigelegt) | Perl Artistic License oder GPL |
+
+exiftool läuft als **eigener Prozess**, wird also nicht eingebunden. Wird
+es dem Paket beigelegt, gehört sein Lizenztext dazu — der Build legt ihn
+mit ab.
+
+Kein fremder Quelltext: die aus Cammello übernommenen Teile stammen aus
+demselben Haus und standen dort unter CC0.
 
 ## Grundsatz
 
@@ -55,6 +96,11 @@ fatal wäre), legt den Ordner `exiftool_files` daneben und gibt beides per
 `--add-data` mit.
 
 ### Bezugsquelle
+
+**Nicht** github.com/exiftool/exiftool — dort liegt der Perl-Quelltext,
+und das Repository hat (Stand August 2026) keine einzige
+Veröffentlichung mit angehängten Dateien. Eine Windows-Programmdatei gibt
+es dort also nicht.
 
 SourceForge — exiftool.org verweist seine Download-Verknüpfungen selbst
 dorthin, um den eigenen Server zu entlasten. Gebraucht wird:
@@ -166,15 +212,47 @@ geladen.
 JPEG-Vorschau benutzt, nicht `rawpy.postprocess()`. Entwickelt wird nur,
 wenn keine eingebettete Vorschau existiert.
 
-## Alle Fotos — die Picasa-Ansicht
+## Alle Fotos — endlos scrollen
 
-Ganz oben im Baum steht **Alle Fotos**. Dort laufen sämtliche Ordner
-untereinander durch, jeder mit einer Kopfzeile aus Ordnername und Pfad,
-statt dass man erst einen Ordner auswählen muss. Die Kopfzeilen nehmen
-eine eigene Reihe ein und lassen sich nicht auswählen.
+Ganz oben im Baum steht **Alle Fotos**. Die Sortierauswahl in der Leiste
+bestimmt, wie durchlaufen wird:
 
-Sobald etwas im Suchfeld steht, entfällt die Gruppierung — Treffer aus
-vielen Ordnern sollen zusammen stehen.
+- **Ordner** — Ordner für Ordner, jeder mit einer Kopfzeile aus Name und
+  Pfad. Die Picasa-Ansicht.
+- **Aufnahmedatum** — alle Bilder durchgehend chronologisch, mit einer
+  Kopfzeile je Monat („Februar 2026"). Ordnergrenzen spielen keine Rolle
+  mehr. Undatierte Aufnahmen stehen am Ende.
+
+Kopfzeilen nehmen eine eigene Reihe ein und lassen sich nicht auswählen;
+beim Blättern werden sie übersprungen. Sobald etwas im Suchfeld steht,
+entfällt die Gruppierung — Treffer aus vielen Ordnern sollen zusammen
+stehen.
+
+### Wirklich endlos
+
+Es wird nur geholt, was die Ansicht braucht: 300 Zeilen je Nachschub,
+über Qts `canFetchMore`/`fetchMore`. Bei einem Bestand von 50.000
+Aufnahmen (66.667 Dateien) steht das erste Stück nach **75 ms** in der
+Ordneransicht und nach **148 ms** nach Datum — vorher hätte das
+vollständige Laden gut zweieinhalb Sekunden gedauert.
+
+Zwei Dinge waren dafür nötig, beide gemessen:
+
+- **Keine Fensterfunktionen für die Stapelbildung.** `ROW_NUMBER() OVER
+  (PARTITION BY …)` zwingt SQLite, erst das ganze Ergebnis aufzubauen:
+  750 ms bis zur ersten Zeile. Dieselbe Auswahl über eine Unterabfrage
+  (`p.id = (SELECT … LIMIT 1)`) plus Index auf `(stack_key, is_raw,
+  filename)` kann dem Index folgen: **11 ms**.
+- **Kein `taken_at IS NULL` in der Sortierung.** Der Ausdruck hebelt den
+  Index aus (124 ms). `ASC NULLS LAST` liefert dieselbe Reihenfolge —
+  undatierte hinten — und benutzt den Index: **2 ms**. Für SQLite älter
+  als 3.30 gibt es einen Rückfall auf die langsame Schreibweise.
+
+Ende-Taste und Strg+A holen den Rest nach; bei 50.000 Aufnahmen dauert
+das rund 1,4 Sekunden. Die Sortierungen „Dateiname" und „Zuletzt
+geändert" haben keinen passenden Index und brauchen rund 300 ms bis zur
+ersten Zeile — für die Ordneransicht belanglos, in „Alle Fotos"
+spürbar.
 
 ## Ordner ausschließen
 
@@ -240,7 +318,9 @@ In der Lupe. Werkzeuge über die Tasten, Regler in der Leiste rechts:
 Belichtung, Kontrast, Tiefen, Lichter, Sättigung, Wärme, Tint — dazu
 „Farben auffrischen" für ausgeblichene Abzüge und Dias.
 
-Die **Pipette** (W) macht den angeklickten Punkt neutral. Sie rechnet
+Die **Pipette** (W) macht den angeklickten Punkt neutral. Der Mauszeiger
+wird dabei zur Pipette, deren Spitze genau auf dem Punkt sitzt, der
+gemessen wird — Qt bringt keinen solchen Zeiger mit, er ist gezeichnet. Sie rechnet
 die nötigen Regler direkt aus, statt zu probieren: Rot und Blau werden
 in `apply_tone` um 0,30 gegeneinander verschoben, Grün um 0,18 — daraus
 lässt sich auflösen. Ein Blaustich von R/G/B 0,410/0,500/0,575 wird zu
@@ -249,9 +329,56 @@ lässt sich auflösen. Ein Blaustich von R/G/B 0,410/0,500/0,575 wird zu
 Retusche-Werkzeuge (Fleck, Riss, Rote Augen) liegen auf der Leiste und
 werden mit dem Pinselregler bedient.
 
+### Drehen und Entzerren
+
+In der Bearbeitungsleiste:
+
+- **↺ 90° / ↻ 90°** oder Taste **R** (Umschalt+R andersherum)
+- **Drehung** — feiner Regler, ±45° in Hundertstelschritten. Für schiefe
+  Horizonte reichen wenige Grad; die großen Winkel sind für Aufnahmen
+  gedacht, die schräg gehalten wurden. Bei 45° muss das Bild auf das
+  2,5-Fache vergrößert werden, damit keine leeren Ecken bleiben — was
+  außerhalb liegt, ist weg.
+- **Perspektive ↕** — stürzende Linien. Positiv zieht die Oberkante
+  auseinander, begradigt also eine von unten fotografierte Fassade.
+- **Perspektive ↔** — dasselbe für seitliche Verzerrung.
+
+**Es entstehen keine leeren Ecken.** Das Bild wird so weit vergrößert,
+dass der Rahmen gefüllt bleibt. Der nötige Faktor wird nicht über eine
+Formel bestimmt, sondern durch Ausprobieren: eine Formel müsste für
+Drehung *und* Entzerrung gleichzeitig stimmen, die Prüfung kostet
+dagegen nur vier Matrixmultiplikationen. Gemessen über Winkel von 0,5°
+bis 45° und Entzerrung bis ±0,4: schwarze Fläche jeweils 0,00 %. Die
+nötige Vergrößerung wächst mit dem Winkel: 1,4× bei 15°, 1,9× bei 30°,
+2,5× bei 45° (bei einem quadratischen Bild 2,0×).
+
+Eine reine Vierteldrehung ohne alles andere läuft über `numpy.rot90` —
+exakt und ohne Neuberechnung der Bildpunkte.
+
+### Warum Klicks trotzdem sitzen
+
+Drehung, 90-Grad-Schritte, Entzerrung und die Vergrößerung stecken in
+**einer** Abbildung, die von der *Ausgabe* zur *Eingabe* zeigt. Pillow
+braucht für eine perspektivische Umformung genau diese Richtung — und
+das Hauptfenster braucht sie, um einen Mausklick in der gedrehten
+Ansicht auf die ursprüngliche Stelle zurückzurechnen. Eine Abbildung,
+zwei Verwendungen, keine Invertierung.
+
+Geprüft mit einem Bild, dessen vier Ecken verschieden gefärbt sind: nach
+einer 90-Grad-Drehung landet ein Klick oben links exakt auf der Farbe,
+die vorher unten links lag — und ebenso für die drei übrigen Ecken.
+
+Die Reihenfolge dahinter: Retuschen liegen im **ungedrehten** Bild, dann
+kommt die Geometrie, zuletzt der Zuschnitt. So wandert ein Fleck nicht,
+wenn später gedreht wird.
+
 ### Zuschnitt
 
-**C** schaltet den Modus an, **Enter** übernimmt. Solange der Modus läuft,
+**C** schaltet den Modus an, **Enter** übernimmt. Ein Format aus der
+Leiste oder über die Zifferntasten wirkt **auch auf einen bereits
+gezogenen Rahmen**: der wird auf das neue Verhältnis gebracht, wobei
+Mittelpunkt und Fläche so weit wie möglich erhalten bleiben und der
+Rahmen im Bild bleibt. Solange der Modus läuft,
 bleibt das ganze Bild sichtbar und der Rahmen liegt darüber; sobald er
 aus ist, zeigt die Lupe den Zuschnitt. Darüber erscheint eine Leiste mit den
 Formaten zum Anklicken — frei, 3:2, 4:3, 1:1, 16:9, 5:4 — plus einem
@@ -319,10 +446,12 @@ Gerechnet wird immer in dieser Folge, egal wie gesetzt wurde:
 
 1. Farben auffrischen — sonst passte ein Fleck zum verblassten Bild
 2. Grundeinstellungen
-3. Flecken, Risse, rote Augen
-4. Zuschnitt — zuletzt, damit alle Koordinaten sich aufs ganze Bild beziehen
+3. Flecken, Risse, rote Augen — im ungedrehten Bild
+4. Drehen und Entzerren
+5. Zuschnitt — zuletzt, im gedrehten Rahmen
 
-Zuschnitt, Grundeinstellungen und Auffrischen gibt es je Bild nur einmal;
+Zuschnitt, Geometrie, Grundeinstellungen und Auffrischen gibt es je Bild
+nur einmal;
 ein neuer Wert ersetzt den alten. Stehen alle Regler auf null, wird gar
 kein Schritt gespeichert.
 
@@ -463,6 +592,14 @@ Getestet mit echten Dateien und exiftool 12.76:
   (Zahlen oben); Klarheit 20 ms, Details 10 ms auf der Vorschaugröße
 - Kelvin-Anzeige gegen mehrere Aufnahmetemperaturen geprüft, Hin- und
   Rückrechnung stimmt auf vier Stellen
+- Drehung und Entzerrung: 90-Grad-Schritte tauschen die Kanten richtig
+  (an vier verschieden gefärbten Ecken nachgewiesen), feine Drehung und
+  Entzerrung hinterlassen 0,00 % leere Fläche, ein Klick landet nach
+  einer 90-Grad-Drehung an allen vier Ecken exakt richtig, und ein Fleck
+  behält bei 90° + 2° + Zuschnitt seine Koordinaten im Originalbild
+- Formatumschaltung auf einen bestehenden Rahmen: 3:2, 4:3, 1:1, 16:9
+  und 5:4 ergeben Verhältnisse von 1,500 / 1,333 / 1,000 / 1,778 / 1,250,
+  das Kippen auf hoch ergibt 0,750, und der Rahmen bleibt im Bild
 - Pipette rechnerisch geprüft: Blaustich 0,410/0,500/0,575 wird zu
   0,479/0,479/0,479 (Abweichung max−min: 0,0000)
 - Die drei Fehler aus 0.3.7 gegen die Behebung nachgemessen:

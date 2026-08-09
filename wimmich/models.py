@@ -22,6 +22,12 @@ ROLE_LABEL = Qt.ItemDataRole.UserRole + 6
 ROLE_EDITED = Qt.ItemDataRole.UserRole + 7
 ROLE_HEADER = Qt.ItemDataRole.UserRole + 8
 
+MONATE = {
+    "01": "Januar", "02": "Februar", "03": "März", "04": "April",
+    "05": "Mai", "06": "Juni", "07": "Juli", "08": "August",
+    "09": "September", "10": "Oktober", "11": "November", "12": "Dezember",
+}
+
 
 class _ThumbSignals(QObject):
     done = pyqtSignal(int, str)   # Zeilennummer, Cache-Pfad
@@ -63,32 +69,96 @@ class PhotoModel(QAbstractListModel):
 
         self._placeholder = QPixmap()   # leer = Delegate zeichnet Platzhalter
         self._edited: set[str] = set()
+        self._source = None
+        self._group_by: str | None = None
+        self._streaming = False
+        self._last_group = None
+        self._erschoepft = True
 
     # -- Daten ---------------------------------------------------------
 
-    def set_rows(self, rows, group_by_folder: bool = False) -> None:
-        """Bilder anzeigen.
+    CHUNK = 300      # so viele Zeilen je Nachschub
 
-        group_by_folder=True fügt vor jedem Ordnerwechsel eine Kopfzeile
-        ein - die Picasa-Ansicht, in der alle Ordner untereinander
-        stehen. Kopfzeilen sind ganz normale Zeilen mit dem Schlüssel
-        "_header"; die Zeichenroutine erkennt sie daran.
+    def set_rows(self, rows, group_by: str | None = None) -> None:
+        """Eine fertige Liste anzeigen - für Suche, Alben, Personen."""
+        self._start(iter(rows), group_by, streaming=False)
+
+    def set_cursor(self, cursor, group_by: str | None = None) -> None:
+        """Aus einem Datenbank-Cursor stückweise nachladen.
+
+        Das ist das endlose Scrollen: es wird nur geholt, was die Ansicht
+        gerade braucht. Bei 50.000 Bildern steht das erste Stück nach
+        wenigen Millisekunden, statt dass die Oberfläche zwei Sekunden
+        steht.
         """
-        prepared: list[dict] = []
-        letzter = None
-        for row in rows:
-            item = dict(row)
-            if group_by_folder and item.get("folder") != letzter:
-                letzter = item.get("folder")
-                prepared.append({"_header": letzter, "filename": "",
-                                 "path": "", "id": -1})
-            prepared.append(item)
+        self._start(cursor, group_by, streaming=True)
 
+    def _start(self, quelle, group_by: str | None, streaming: bool) -> None:
         self.beginResetModel()
-        self._rows = prepared
+        self._rows = []
         self._pixmaps.clear()
         self._requested.clear()
+        self._source = quelle
+        self._group_by = group_by
+        self._streaming = streaming
+        self._last_group = None
+        self._erschoepft = False
         self.endResetModel()
+        # Ein erstes Stück sofort, damit die Ansicht nicht leer bleibt
+        self._nachladen(self.CHUNK if streaming else None)
+
+    # -- Nachschub ------------------------------------------------------
+
+    def canFetchMore(self, parent=QModelIndex()) -> bool:  # noqa: N802
+        return not parent.isValid() and not self._erschoepft
+
+    def fetchMore(self, parent=QModelIndex()) -> None:  # noqa: N802
+        if not parent.isValid():
+            self._nachladen(self.CHUNK)
+
+    def _nachladen(self, anzahl: int | None) -> None:
+        """Holt das nächste Stück und setzt Kopfzeilen bei Gruppenwechsel."""
+        if self._erschoepft or self._source is None:
+            return
+
+        if self._streaming:
+            roh = (self._source.fetchall() if anzahl is None
+                   else self._source.fetchmany(anzahl))
+        else:
+            import itertools
+            roh = (list(self._source) if anzahl is None
+                   else list(itertools.islice(self._source, anzahl)))
+        if not roh or (anzahl is not None and len(roh) < anzahl):
+            self._erschoepft = True
+        if not roh:
+            return
+
+        neue: list[dict] = []
+        for zeile in roh:
+            item = dict(zeile)
+            titel, zusatz = self._gruppe(item)
+            if self._group_by and titel != self._last_group:
+                self._last_group = titel
+                neue.append({"_header": titel, "_header_detail": zusatz,
+                             "filename": "", "path": "", "id": -1})
+            neue.append(item)
+
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(neue) - 1)
+        self._rows.extend(neue)
+        self.endInsertRows()
+
+    def _gruppe(self, item: dict) -> tuple[str, str]:
+        """Überschrift und Zusatz, unter denen eine Aufnahme einsortiert wird."""
+        if self._group_by == "folder":
+            pfad = item.get("folder") or ""
+            return (Path(pfad).name or pfad), pfad
+        if self._group_by == "date":
+            taken = item.get("taken_at") or ""
+            if len(taken) >= 7:
+                return f"{MONATE.get(taken[5:7], taken[5:7])} {taken[:4]}", ""
+            return "ohne Aufnahmedatum", ""
+        return "", ""
 
     def photo_rows(self) -> list[int]:
         """Zeilennummern, die wirklich Bilder sind (ohne Kopfzeilen)."""
@@ -97,6 +167,11 @@ class PhotoModel(QAbstractListModel):
     def is_header(self, row: int) -> bool:
         item = self.row_data(row)
         return bool(item and "_header" in item)
+
+    def alles_laden(self) -> None:
+        """Rest nachziehen - nötig, wenn über das Ende hinaus geblättert wird."""
+        while not self._erschoepft:
+            self._nachladen(self.CHUNK * 4)
 
     def row_data(self, row: int) -> dict | None:
         if 0 <= row < len(self._rows):
@@ -117,6 +192,8 @@ class PhotoModel(QAbstractListModel):
         if "_header" in item:
             if role == ROLE_HEADER:
                 return item["_header"]
+            if role == ROLE_ROW:
+                return item
             if role == Qt.ItemDataRole.DisplayRole:
                 return item["_header"]
             return None
@@ -232,9 +309,8 @@ class PhotoDelegate(QStyledItemDelegate):
         return 900
 
     def paint(self, painter: QPainter, option, index) -> None:
-        header = index.data(ROLE_HEADER)
-        if header:
-            self._paint_header(painter, option, header)
+        if index.data(ROLE_HEADER) is not None:
+            self._paint_header(painter, option, index)
             return
 
         painter.save()
@@ -292,35 +368,38 @@ class PhotoDelegate(QStyledItemDelegate):
             )
         painter.restore()
 
-    def _paint_header(self, painter: QPainter, option, text: str) -> None:
-        """Ordnername als Trennzeile zwischen den Kacheln."""
+    def _paint_header(self, painter: QPainter, option, index) -> None:
+        """Trennzeile zwischen den Gruppen - Ordnername oder Monat."""
         painter.save()
         rect = option.rect
+        item = index.data(ROLE_ROW) or {}
+        titel = str(index.data(ROLE_HEADER) or "")
+        zusatz = str(item.get("_header_detail") or "")
+
         font = QFont(option.font)
         font.setBold(True)
         painter.setFont(font)
-
         painter.setPen(QPen(QColor(theme.TEXT)))
-        name = Path(text).name or text
         painter.drawText(
             rect.adjusted(8, 8, -8, 0),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            name,
+            titel,
         )
 
-        metrics = painter.fontMetrics()
-        start = rect.x() + 16 + metrics.horizontalAdvance(name)
-        font.setBold(False)
-        painter.setFont(font)
-        painter.setPen(QPen(QColor(theme.TEXT_MUTED)))
-        painter.drawText(
-            QRect(start, rect.y() + 8, max(0, rect.width() - start), rect.height() - 8),
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            str(text),
-        )
+        if zusatz and zusatz != titel:
+            metrics = painter.fontMetrics()
+            start = rect.x() + 16 + metrics.horizontalAdvance(titel)
+            font.setBold(False)
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(theme.TEXT_MUTED)))
+            painter.drawText(
+                QRect(start, rect.y() + 8,
+                      max(0, rect.width() - start), rect.height() - 8),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                zusatz,
+            )
 
-        pen = QPen(QColor(theme.BORDER))
-        painter.setPen(pen)
+        painter.setPen(QPen(QColor(theme.BORDER)))
         line_y = rect.bottom() - 3
         painter.drawLine(rect.x() + 8, line_y, rect.right() - 8, line_y)
         painter.restore()
