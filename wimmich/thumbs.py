@@ -64,7 +64,16 @@ def get_thumbnail(path: str, mtime: float, filesize: int, edge: int = 256,
 
 def _load_for_thumb(path: str, edge: int, exiftool) -> Image.Image | None:
     if not is_raw(path):
-        return Image.open(path)
+        bild = Image.open(path)
+        # draft() lässt den JPEG-Dekoder gleich verkleinert arbeiten,
+        # statt erst das ganze Bild aufzubauen und dann zu schrumpfen.
+        # Bei einer 45-MP-Datei ist das der Unterschied zwischen einem
+        # Wimpernschlag und einer Sekunde.
+        try:
+            bild.draft("RGB", (edge * 2, edge * 2))
+        except Exception:
+            pass
+        return bild
 
     embedded = _embedded_preview(path, edge, exiftool)
     if embedded is not None:
@@ -90,18 +99,66 @@ def _embedded_preview(path: str, edge: int, exiftool) -> Image.Image | None:
         except Exception:
             pass
 
-    if exiftool is not None and getattr(exiftool, "available", False):
-        tmp = THUMB_DIR / "_extract" / (Path(path).stem + ".jpg")
-        tmp.parent.mkdir(parents=True, exist_ok=True)
+    # Ohne rawpy: die eingebettete Vorschau selbst aus der Datei holen.
+    #
+    # Der frühere Weg rief exiftool auf - EIN PROZESS JE DATEI. Das kostet
+    # unter Linux 85 ms, unter Windows mit der mitgelieferten
+    # Perl-Umgebung ein Vielfaches. Bei einem Ordner mit 300 RAW-Dateien
+    # sind das Minuten, in denen nichts erscheint.
+    daten = embedded_jpeg(path)
+    if daten:
         try:
-            if exiftool.extract_preview(path, str(tmp)):
-                image = Image.open(tmp)
-                image.load()
-                tmp.unlink(missing_ok=True)
-                return image
+            import io
+            image = Image.open(io.BytesIO(daten))
+            image.load()
+            return image
         except Exception:
             pass
     return None
+
+
+def embedded_jpeg(path: str) -> bytes | None:
+    """Größtes eingebettetes JPEG einer RAW-Datei, ohne fremde Hilfe.
+
+    RAW-Dateien tragen ihre Vorschauen als vollständige JPEG-Blöcke in
+    sich. Die lassen sich an ihren Markierungen erkennen: FF D8 beginnt,
+    FF D9 beendet einen Block. Von allen gefundenen wird der größte
+    genommen - das ist die Vorschau in voller Größe.
+
+    Gelesen wird höchstens der Anfang der Datei; die Vorschauen liegen
+    dort. Ein 45-MB-NEF komplett einzulesen wäre teurer als der Gewinn.
+    """
+    # Stufenweise lesen: die große Vorschau liegt bei den meisten
+    # Herstellern im vorderen Teil der Datei. Ein 45-MB-NEF komplett
+    # einzulesen, nur um eine Kachel zu zeichnen, wäre verschwendet.
+    roh = b""
+    for grenze in (4 * 1024 * 1024, 24 * 1024 * 1024, 64 * 1024 * 1024):
+        try:
+            with open(path, "rb") as datei:
+                roh = datei.read(grenze)
+        except OSError:
+            return None
+        if _finde_groesstes_jpeg(roh, mindestens = 120 * 1024) is not None:
+            break
+        if len(roh) < grenze:
+            break        # Datei ist kürzer als die Schranke
+    # Zuletzt auch eine kleinere Vorschau nehmen - eine grobe Kachel ist
+    # besser als eine graue Fläche.
+    return _finde_groesstes_jpeg(roh, mindestens=2000)
+
+
+def _finde_groesstes_jpeg(roh: bytes, mindestens: int) -> bytes | None:
+    bester = None
+    start = roh.find(b"\xff\xd8\xff")
+    while start != -1:
+        ende = roh.find(b"\xff\xd9", start + 2)
+        if ende == -1:
+            break
+        block = roh[start:ende + 2]
+        if len(block) >= mindestens and (bester is None or len(block) > len(bester)):
+            bester = block
+        start = roh.find(b"\xff\xd8\xff", ende + 2)
+    return bester
 
 
 def load_raw_full(path: str, half_size: bool = False) -> Image.Image | None:

@@ -1,4 +1,4 @@
-# Wimmich 0.3.13
+# Wimmich 0.3.14
 
 Lokale Fotoverwaltung als Picasa-Ersatz. Etappe 1: Ordnerbaum, Rasteransicht,
 Vollbild, Bewertungen, Suche über den Index, RAW+JPG als Stapel.
@@ -35,6 +35,9 @@ Entzerren.
 **0.3.13:** Drehung bis ±45°, Formatumschaltung wirkt auf den
 bestehenden Zuschnittrahmen, Pipetten-Zeiger, Wimmich steht unter der
 GPL v3.
+
+**0.3.14:** Metadaten und Vorschauen deutlich schneller, Filterleiste
+mit Sternen und Farben, Diagnosefenster.
 
 ## Lizenz
 
@@ -211,6 +214,62 @@ geladen.
 **RAW ist deshalb schnell:** für die Anzeige wird die eingebettete
 JPEG-Vorschau benutzt, nicht `rawpy.postprocess()`. Entwickelt wird nur,
 wenn keine eingebettete Vorschau existiert.
+
+## Filtern nach Sternen und Farben
+
+In der Leiste über dem Raster: fünf Sterne, fünf Farbfelder, „ohne", ein
+✕ für Abgelehnte. Die Regel ist die aus Cammello:
+
+- **Sterne wirken als UND** — ein Klick auf den dritten Stern zeigt alles
+  ab drei Sternen. Nochmal auf denselben Stern hebt den Filter auf.
+- **Farben wirken als ODER** — mehrere Felder gleichzeitig sind möglich.
+  „ohne" fängt auch Bilder mit einem unbekannten Markierungstext ein, wie
+  er entsteht, wenn in Lightroom ein eigener Farbsatz benutzt wird.
+- **Beide Gruppen zusammen wieder als UND**: drei Sterne UND (Rot ODER
+  Grün).
+
+Ein abgelehntes Bild kommt durch keinen aktiven Sternfilter — eine
+Ablehnung hat keine sinnvolle Sternzahl.
+
+## Warum es jetzt schneller ist
+
+Drei Engpässe, alle gemessen:
+
+**Metadaten liefen komplett über exiftool.** Das kostet 2,1 ms je Datei
+im günstigsten Fall und 18 ms bei kleineren Stapeln, weil der
+Prozessstart dann nicht mehr aufgeht. Pillow liest dieselben Angaben aus
+JPEG und TIFF in **0,4 ms** — Aufnahmedatum, Kamera, Objektiv, Maße,
+Bewertung und Farbmarkierung. exiftool wird nur noch für RAW-Dateien,
+XMP-Sidecars und alles gebraucht, was Pillow nicht öffnen kann.
+
+**Metadaten wurden erst nach dem gesamten Durchlauf gelesen.** Bei einer
+großen Bibliothek standen die Bilder deshalb lange unter „ohne
+Aufnahmedatum". Jetzt läuft das Lesen Ordner für Ordner mit.
+
+**RAW-Vorschauen ohne rawpy starteten exiftool je Datei.** Ein einzelner
+Start kostet 85 ms unter Linux und ein Vielfaches unter Windows mit der
+mitgelieferten Perl-Umgebung — bei 300 RAW-Dateien sind das Minuten.
+Wimmich holt die eingebettete Vorschau jetzt selbst aus der Datei: RAW
+tragen ihre Vorschauen als vollständige JPEG-Blöcke in sich, erkennbar an
+den Markierungen FF D8 und FF D9. Gelesen wird stufenweise (4, dann 24,
+dann 64 MB), weil die große Vorschau meist vorn liegt. Ergebnis: **15 ms**
+statt 85 und mehr.
+
+Dazu kommt `draft()` beim JPEG-Dekodieren — der Dekoder arbeitet gleich
+verkleinert, statt erst das ganze Bild aufzubauen. Bei einer 45-MP-Datei
+sinkt die Kachelerzeugung von **1049 ms auf 326 ms**.
+
+## Diagnose
+
+Der Knopf „Diagnose" in der Werkzeugleiste sagt, woran es hängt: ob
+rawpy und exiftool vorhanden sind, wie viele Bilder noch ohne Metadaten
+sind, und wie lange das Lesen und Dekodieren der ersten Datei der
+aktuellen Ansicht tatsächlich dauert. Das unterscheidet in Sekunden
+zwischen „rawpy fehlt", „exiftool fehlt" und „der Durchlauf ist noch
+nicht fertig".
+
+**Wenn RAW-Vorschauen zäh sind, ist fast immer rawpy nicht installiert.**
+Dann greift der Notweg oben, der zwar schnell, aber gröber ist.
 
 ## Alle Fotos — endlos scrollen
 

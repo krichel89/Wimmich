@@ -359,7 +359,8 @@ class Database:
                          min_rating: int = 0, order: str = "taken_at",
                          stacked: bool = True, prefer_raw: bool = True,
                          show_rejects: bool = True,
-                         labels: list[str] | None = None) -> list[sqlite3.Row]:
+                         labels: list[str] | None = None,
+                         unlabeled: bool = False) -> list[sqlite3.Row]:
         if recursive:
             # Trennzeichen im Präfix, damit /Fotos/a nicht auch /Fotos/ab trifft
             prefix = folder.rstrip("/\\") + os.sep
@@ -370,12 +371,12 @@ class Database:
             params = [folder]
 
         where, params = _add_filters(where, params, min_rating,
-                                     show_rejects, labels)
+                                     show_rejects, labels, unlabeled)
         return self._select(where, params, order, stacked, prefer_raw)
 
     def search(self, query: str, min_rating: int = 0, stacked: bool = True,
                prefer_raw: bool = True, show_rejects: bool = True,
-               labels: list[str] | None = None,
+               labels: list[str] | None = None, unlabeled: bool = False,
                limit: int = 5000) -> list[sqlite3.Row]:
         query = query.strip()
         if not query:
@@ -387,7 +388,7 @@ class Database:
                          "WHERE photos_fts MATCH ?)")
                 params: list = [_fts_query(query)]
                 where, params = _add_filters(where, params, min_rating,
-                                             show_rejects, labels)
+                                             show_rejects, labels, unlabeled)
                 return self._select(where, params, "taken_at", stacked,
                                     prefer_raw, limit)
             except sqlite3.OperationalError:
@@ -399,7 +400,7 @@ class Database:
                  " OR p.caption LIKE ? ESCAPE '\\' OR p.keywords LIKE ? ESCAPE '\\')")
         params = [like] * 6
         where, params = _add_filters(where, params, min_rating,
-                                     show_rejects, labels)
+                                     show_rejects, labels, unlabeled)
         return self._select(where, params, "taken_at", stacked, prefer_raw, limit)
 
     def _select(self, where: str, params: list, order: str, stacked: bool,
@@ -478,24 +479,26 @@ class Database:
                           stacked: bool = True, prefer_raw: bool = True,
                           show_rejects: bool = True,
                           labels: list[str] | None = None,
+                          unlabeled: bool = False,
                           order: str = "folder"):
         """Wie all_photos, liefert aber einen Cursor zum stückweisen Holen."""
         if not roots:
             return None
         where, params = _roots_where(roots)
         where, params = _add_filters(where, params, min_rating,
-                                     show_rejects, labels)
+                                     show_rejects, labels, unlabeled)
         return self._cursor(where, params, order, stacked, prefer_raw)
 
     def count_photos(self, roots: list[str], min_rating: int = 0,
                      stacked: bool = True, show_rejects: bool = True,
-                     labels: list[str] | None = None) -> int:
+                     labels: list[str] | None = None,
+                     unlabeled: bool = False) -> int:
         """Anzahl vorab - für die Statuszeile, ohne alles zu laden."""
         if not roots:
             return 0
         where, params = _roots_where(roots)
         where, params = _add_filters(where, params, min_rating,
-                                     show_rejects, labels)
+                                     show_rejects, labels, unlabeled)
         spalte = "DISTINCT p.stack_key" if stacked else "*"
         row = self.conn.execute(
             f"SELECT COUNT({spalte}) FROM photos p WHERE {where}", params
@@ -587,7 +590,8 @@ class Database:
                          min_rating: int = 0, order: str = "taken_at",
                          stacked: bool = True, prefer_raw: bool = True,
                          show_rejects: bool = True,
-                         labels: list[str] | None = None) -> list[sqlite3.Row]:
+                         labels: list[str] | None = None,
+                         unlabeled: bool = False) -> list[sqlite3.Row]:
         """Lokale Bilder, die zu einem Album oder einer Person gehören.
 
         Die Verbindung läuft über immich_id: nur was schon abgeglichen
@@ -600,20 +604,21 @@ class Database:
                  f"WHERE {key_column} = ?)")
         params: list = [key]
         where, params = _add_filters(where, params, min_rating,
-                                     show_rejects, labels)
+                                     show_rejects, labels, unlabeled)
         return self._select(where, params, order, stacked, prefer_raw)
 
     def all_photos(self, roots: list[str], min_rating: int = 0,
                    stacked: bool = True, prefer_raw: bool = True,
                    show_rejects: bool = True,
                    labels: list[str] | None = None,
+                   unlabeled: bool = False,
                    order: str = "folder") -> list[sqlite3.Row]:
         """Alle Bilder aller Bibliotheken, auf einmal.
 
         Für große Bestände besser all_photos_cursor() nehmen.
         """
         cursor = self.all_photos_cursor(roots, min_rating, stacked, prefer_raw,
-                                        show_rejects, labels, order)
+                                        show_rejects, labels, unlabeled, order)
         return cursor.fetchall() if cursor is not None else []
 
     def unsynced(self, limit: int = 500) -> list[sqlite3.Row]:
@@ -663,7 +668,8 @@ def stack_key_for(folder: str, filename: str) -> str:
 
 
 def _add_filters(where: str, params: list, min_rating: int,
-                 show_rejects: bool, labels: list[str] | None) -> tuple[str, list]:
+                 show_rejects: bool, labels: list[str] | None,
+                 unlabeled: bool = False) -> tuple[str, list]:
     """Ergänzt Bewertungs-, Ablehnungs- und Farbfilter.
 
     Eine Ablehnung hat keine sinnvolle Sternzahl. Sobald ein Sternfilter
@@ -677,11 +683,30 @@ def _add_filters(where: str, params: list, min_rating: int,
         where += " AND p.rating <> ?"
         params.append(REJECT)
 
+    # Farben wirken als ODER, auch zusammen mit „ohne Farbe". Ein
+    # unbekannter Markierungstext (eigener Satz in Lightroom) zählt als
+    # ohne Farbe - sonst wäre er über die Leiste nicht erreichbar.
+    teile = []
     if labels:
-        placeholders = ", ".join("?" for _ in labels)
-        where += f" AND p.label IN ({placeholders})"
+        teile.append("p.label IN (" + ", ".join("?" for _ in labels) + ")")
         params.extend(labels)
+    if unlabeled:
+        bekannt = _alle_label_texte()
+        teile.append(
+            "(p.label IS NULL OR p.label = '' OR p.label NOT IN ("
+            + ", ".join("?" for _ in bekannt) + "))")
+        params.extend(bekannt)
+    if teile:
+        where += " AND (" + " OR ".join(teile) + ")"
     return where, params
+
+
+def _alle_label_texte() -> list[str]:
+    from .marks import LABEL_SETS
+    texte = []
+    for satz in LABEL_SETS.values():
+        texte.extend(satz)
+    return texte
 
 
 def _prune(conn, table: str, link_table: str, column: str, keep: set) -> None:

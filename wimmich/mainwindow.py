@@ -32,6 +32,7 @@ from .models import PhotoDelegate, PhotoModel, ROLE_ID, ROLE_PATH
 from .previews import PreviewLoader
 from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
+from .filterbar import FilterBar
 from .edits import (
     CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
     array_to_qimage, downscale, qimage_to_array,
@@ -168,12 +169,9 @@ class MainWindow(QMainWindow):
         self.search_box.returnPressed.connect(self._search_entered)
         bar_layout.addWidget(self.search_box, 1)
 
-        self.rating_filter = QComboBox()
-        self.rating_filter.addItem("Alle Bewertungen", 0)
-        for stars in range(1, 6):
-            self.rating_filter.addItem("\u2605" * stars + " und besser", stars)
-        self.rating_filter.currentIndexChanged.connect(self._refresh_view)
-        bar_layout.addWidget(self.rating_filter)
+        self.filters = FilterBar(self._label_set(), self)
+        self.filters.changed.connect(self._refresh_view)
+        bar_layout.addWidget(self.filters)
 
         self.sort_box = QComboBox()
         for label, key in SORT_OPTIONS:
@@ -186,23 +184,6 @@ class MainWindow(QMainWindow):
         self.recursive_button.setToolTip("Bilder aus allen Unterordnern mitzeigen")
         self.recursive_button.toggled.connect(self._refresh_view)
         bar_layout.addWidget(self.recursive_button)
-
-        self.reject_button = QPushButton("Abgelehnte")
-        self.reject_button.setCheckable(True)
-        self.reject_button.setChecked(True)
-        self.reject_button.setToolTip(
-            "Abgelehnte Bilder (Taste X) mitzeigen.\n"
-            "Bei aktivem Sternfilter fallen sie immer heraus."
-        )
-        self.reject_button.toggled.connect(self._refresh_view)
-        bar_layout.addWidget(self.reject_button)
-
-        self.label_filter = QComboBox()
-        self.label_filter.addItem("Alle Farben", None)
-        for i, colour in enumerate(marks.LABEL_COLORS):
-            self.label_filter.addItem(marks.label_text(i, self._label_set()), i)
-        self.label_filter.currentIndexChanged.connect(self._refresh_view)
-        bar_layout.addWidget(self.label_filter)
 
         self.stack_button = QPushButton("RAW+JPG stapeln")
         self.stack_button.setCheckable(True)
@@ -348,6 +329,11 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.loupe_action)
 
         toolbar.addSeparator()
+
+        diag_action = QAction("Diagnose", self)
+        diag_action.setToolTip("Prüft, warum etwas langsam ist")
+        diag_action.triggered.connect(self._show_diagnose)
+        toolbar.addAction(diag_action)
 
         keys_action = QAction("Tastenkürzel", self)
         keys_action.setShortcut(QKeySequence("F1"))
@@ -540,22 +526,13 @@ class MainWindow(QMainWindow):
     # -- Anzeige -------------------------------------------------------
 
     def _current_min_rating(self) -> int:
-        return int(self.rating_filter.currentData() or 0)
+        return self.filters.min_rating()
 
     def _label_set(self) -> str:
         return str(self.config["label_set"] or "de")
 
     def _current_labels(self) -> list[str] | None:
-        """Gefilterte Markierungstexte - ALLE Sätze, nicht nur der aktive.
-
-        Sonst findet ein Filter auf "Rot" die Bilder nicht, die Lightroom
-        auf Englisch als "Red" markiert hat.
-        """
-        index = self.label_filter.currentData()
-        if index is None:
-            return None
-        return [texts[index] for texts in marks.LABEL_SETS.values()
-                if index < len(texts)]
+        return self.filters.label_texts()
 
     def _refresh_view(self) -> None:
         query = self.search_box.text().strip()
@@ -563,8 +540,9 @@ class MainWindow(QMainWindow):
             min_rating=self._current_min_rating(),
             stacked=self.stack_button.isChecked(),
             prefer_raw=bool(self.config["prefer_raw"]),
-            show_rejects=self.reject_button.isChecked(),
+            show_rejects=self.filters.show_rejects(),
             labels=self._current_labels(),
+            unlabeled=self.filters.include_unlabeled(),
         )
 
         if query:
@@ -609,7 +587,7 @@ class MainWindow(QMainWindow):
             gezeigt = self.db.count_photos(
                 self.config.libraries, min_rating=common["min_rating"],
                 stacked=common["stacked"], show_rejects=common["show_rejects"],
-                labels=common["labels"])
+                labels=common["labels"], unlabeled=common["unlabeled"])
         else:
             self.model.set_rows(rows)
             gezeigt = len(rows)
@@ -1830,6 +1808,66 @@ class MainWindow(QMainWindow):
             self._sync_thread.wait(5000)
         self._sync_thread = None
         self._sync_worker = None
+
+    def _show_diagnose(self) -> None:
+        """Sagt, woran es hängt, statt raten zu lassen.
+
+        Die drei häufigsten Ursachen für Zähigkeit lassen sich hier in
+        Sekunden auseinanderhalten: fehlendes rawpy, fehlendes exiftool,
+        oder schlicht ein noch nicht durchgelaufener Metadatenlauf.
+        """
+        import time
+        from . import previews, retouch as _r
+        from .exif import read_fast
+
+        zeilen = [f"<b>Wimmich {__version__}</b><table cellpadding='4'>"]
+
+        def zeile(name, wert, hinweis=""):
+            zeilen.append(f"<tr><td>{name}</td><td><b>{wert}</b></td>"
+                          f"<td style='color:#8e8e9c'>{hinweis}</td></tr>")
+
+        zeile("rawpy", "vorhanden" if previews.HAVE_RAWPY else "FEHLT",
+              "" if previews.HAVE_RAWPY else
+              "RAW-Vorschauen laufen über den Notweg. "
+              "pip install rawpy")
+        zeile("exiftool", self.exiftool.executable or "FEHLT",
+              "" if self.exiftool.available else
+              "RAW-Dateien bleiben ohne Aufnahmedatum")
+        zeile("OpenCV", "vorhanden" if _r.HAVE_CV2 else "nicht vorhanden",
+              "nur für die Rissreparatur")
+
+        gesamt, offen = self.db.counts()
+        zeile("Bilder im Index", f"{gesamt}")
+        zeile("ohne Metadaten", f"{offen}",
+              "F5 lässt den Rest nachlaufen" if offen else "")
+
+        # Ein echter Messwert statt Vermutung
+        zeitmessung = "keine Datei zum Messen"
+        item = self.model.row_data(0)
+        if item:
+            pfad = item.get("thumb_path") or item["path"]
+            t = time.perf_counter()
+            try:
+                read_fast([pfad])
+            except Exception:
+                pass
+            lesen = (time.perf_counter() - t) * 1000
+
+            t = time.perf_counter()
+            bild = previews.decode(pfad, 1200)
+            dekodieren = (time.perf_counter() - t) * 1000
+            zeitmessung = (f"Metadaten {lesen:.0f} ms, "
+                           f"Vorschau {dekodieren:.0f} ms"
+                           + ("" if bild is not None and not bild.isNull()
+                              else " (Vorschau FEHLGESCHLAGEN)"))
+        zeile("erste Datei der Ansicht", zeitmessung)
+
+        zeilen.append("</table>")
+        box = QMessageBox(self)
+        box.setWindowTitle("Diagnose")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText("".join(zeilen))
+        box.exec()
 
     def _show_keys(self) -> None:
         box = QMessageBox(self)
