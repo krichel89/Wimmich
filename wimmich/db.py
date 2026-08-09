@@ -7,6 +7,7 @@ der Platte. Der Index darf jederzeit gelöscht und neu aufgebaut werden.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -15,7 +16,7 @@ from pathlib import Path
 from .config import DB_PATH, CONFIG_DIR
 from .marks import REJECT, clamp_rating
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -34,6 +35,10 @@ CREATE TABLE IF NOT EXISTS photos (
     camera        TEXT,
     lens          TEXT,
     color_temp    INTEGER,
+    aperture      REAL,
+    iso           INTEGER,
+    focal_length  REAL,
+    exposure_time TEXT,
     rating        INTEGER NOT NULL DEFAULT 0,
     label         TEXT,
     title         TEXT,
@@ -177,6 +182,14 @@ class Database:
             conn.execute("ALTER TABLE photos ADD COLUMN checksum TEXT")
         if "color_temp" not in columns:
             conn.execute("ALTER TABLE photos ADD COLUMN color_temp INTEGER")
+        if "aperture" not in columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN aperture REAL")
+        if "iso" not in columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN iso INTEGER")
+        if "focal_length" not in columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN focal_length REAL")
+        if "exposure_time" not in columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN exposure_time TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_immich ON photos(immich_id)"
         )
@@ -240,12 +253,15 @@ class Database:
         """Schreibt ausgelesene Metadaten in den Index."""
         self.conn.execute(
             """UPDATE photos SET width=?, height=?, taken_at=?, camera=?, lens=?,
-                                 color_temp=?, rating=?, label=?, title=?,
+                                 color_temp=?, aperture=?, iso=?, focal_length=?,
+                                 exposure_time=?, rating=?, label=?, title=?,
                                  caption=?, keywords=?, meta_read=1
                WHERE id=?""",
             (
                 meta.get("width"), meta.get("height"), meta.get("taken_at"),
                 meta.get("camera"), meta.get("lens"), meta.get("color_temp"),
+                meta.get("aperture"), meta.get("iso"), meta.get("focal_length"),
+                meta.get("exposure_time"),
                 clamp_rating(meta.get("rating") or 0), meta.get("label"),
                 meta.get("title"), meta.get("caption"), meta.get("keywords"),
                 photo_id,
@@ -357,6 +373,7 @@ class Database:
 
     def photos_in_folder(self, folder: str, recursive: bool = False,
                          min_rating: int = 0, order: str = "taken_at",
+                         desc: bool = False,
                          stacked: bool = True, prefer_raw: bool = True,
                          show_rejects: bool = True,
                          labels: list[str] | None = None,
@@ -372,7 +389,7 @@ class Database:
 
         where, params = _add_filters(where, params, min_rating,
                                      show_rejects, labels, unlabeled)
-        return self._select(where, params, order, stacked, prefer_raw)
+        return self._select(where, params, order, stacked, prefer_raw, desc=desc)
 
     def search(self, query: str, min_rating: int = 0, stacked: bool = True,
                prefer_raw: bool = True, show_rejects: bool = True,
@@ -404,13 +421,14 @@ class Database:
         return self._select(where, params, "taken_at", stacked, prefer_raw, limit)
 
     def _select(self, where: str, params: list, order: str, stacked: bool,
-                prefer_raw: bool, limit: int = 0) -> list[sqlite3.Row]:
+                prefer_raw: bool, limit: int = 0,
+                desc: bool = False) -> list[sqlite3.Row]:
         """Alles auf einmal - für kurze Listen (Suche, Alben, Personen)."""
         return self._cursor(where, params, order, stacked, prefer_raw,
-                            limit).fetchall()
+                            limit, desc=desc).fetchall()
 
     def _cursor(self, where: str, params: list, order: str, stacked: bool,
-                prefer_raw: bool, limit: int = 0):
+                prefer_raw: bool, limit: int = 0, desc: bool = False):
         """Gemeinsamer Abfragebau. Liefert einen CURSOR, keine Liste.
 
         Damit kann der Aufrufer stückweise holen - das ist der Kern des
@@ -422,6 +440,10 @@ class Database:
         das ganze Ergebnis aufzubauen; die Unterabfrage kann dem Index
         folgen und sofort die ersten Zeilen liefern. Gemessen: 750 ms
         gegen 11 ms bis zur ersten Zeile.
+
+        desc dreht die gesamte Sortierung um (echte Sortierrichtung, per
+        Klick auf den Richtungsknopf) - unabhängig davon, welche Spalte
+        gewählt ist.
         """
         # Undatierte Aufnahmen ans Ende, ohne den Index auszuhebeln
         nach_datum = ("p.taken_at ASC NULLS LAST" if self.has_nulls_last
@@ -434,6 +456,8 @@ class Database:
             # Für die Ordneransicht: Ordner für Ordner, darin nach Datum
             "folder": f"p.folder ASC, {nach_datum}, p.filename ASC",
         }.get(order, f"{nach_datum}, p.filename ASC")
+        if desc:
+            order_sql = _reverse_order(order_sql)
         limit_sql = f" LIMIT {int(limit)}" if limit else ""
 
         if not stacked:
@@ -480,14 +504,15 @@ class Database:
                           show_rejects: bool = True,
                           labels: list[str] | None = None,
                           unlabeled: bool = False,
-                          order: str = "folder"):
+                          order: str = "folder",
+                          desc: bool = False):
         """Wie all_photos, liefert aber einen Cursor zum stückweisen Holen."""
         if not roots:
             return None
         where, params = _roots_where(roots)
         where, params = _add_filters(where, params, min_rating,
                                      show_rejects, labels, unlabeled)
-        return self._cursor(where, params, order, stacked, prefer_raw)
+        return self._cursor(where, params, order, stacked, prefer_raw, desc=desc)
 
     def count_photos(self, roots: list[str], min_rating: int = 0,
                      stacked: bool = True, show_rejects: bool = True,
@@ -588,6 +613,7 @@ class Database:
 
     def photos_by_immich(self, table: str, key_column: str, key: str,
                          min_rating: int = 0, order: str = "taken_at",
+                         desc: bool = False,
                          stacked: bool = True, prefer_raw: bool = True,
                          show_rejects: bool = True,
                          labels: list[str] | None = None,
@@ -605,20 +631,22 @@ class Database:
         params: list = [key]
         where, params = _add_filters(where, params, min_rating,
                                      show_rejects, labels, unlabeled)
-        return self._select(where, params, order, stacked, prefer_raw)
+        return self._select(where, params, order, stacked, prefer_raw, desc=desc)
 
     def all_photos(self, roots: list[str], min_rating: int = 0,
                    stacked: bool = True, prefer_raw: bool = True,
                    show_rejects: bool = True,
                    labels: list[str] | None = None,
                    unlabeled: bool = False,
-                   order: str = "folder") -> list[sqlite3.Row]:
+                   order: str = "folder",
+                   desc: bool = False) -> list[sqlite3.Row]:
         """Alle Bilder aller Bibliotheken, auf einmal.
 
         Für große Bestände besser all_photos_cursor() nehmen.
         """
         cursor = self.all_photos_cursor(roots, min_rating, stacked, prefer_raw,
-                                        show_rejects, labels, unlabeled, order)
+                                        show_rejects, labels, unlabeled, order,
+                                        desc=desc)
         return cursor.fetchall() if cursor is not None else []
 
     def unsynced(self, limit: int = 500) -> list[sqlite3.Row]:
@@ -645,6 +673,20 @@ class Database:
             "SELECT COUNT(*) AS total, SUM(meta_read = 0) AS pending FROM photos"
         ).fetchone()
         return int(row["total"] or 0), int(row["pending"] or 0)
+
+
+_ASC_DESC = re.compile(r"\b(ASC|DESC)\b")
+
+
+def _reverse_order(order_sql: str) -> str:
+    """Dreht eine fertige ORDER-BY-Klausel um, spaltenunabhängig.
+
+    Ein einfacher Wortaustausch ASC<->DESC statt eigener Regeln je
+    Sortierschlüssel - so wirkt der Richtungsknopf auf jede Spalte
+    gleich, auch auf zusammengesetzte Klauseln wie die Ordneransicht.
+    """
+    return _ASC_DESC.sub(lambda m: "DESC" if m.group(1) == "ASC" else "ASC",
+                         order_sql)
 
 
 def _escape_like(text: str) -> str:

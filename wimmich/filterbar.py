@@ -92,7 +92,7 @@ class FilterBar(QWidget):
 
         self._summary = QLabel("")
         self._summary.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+            f"color: {theme.TEXT_MUTED}; font-size: 13px;")
         layout.addWidget(self._summary)
 
         self._update_stars()
@@ -198,7 +198,7 @@ QPushButton {{
     background: transparent;
     border: none;
     color: {theme.TEXT_MUTED};
-    font-size: 17px;
+    font-size: 20px;
     padding: 0;
 }}
 QPushButton:hover {{ color: {theme.STAR}; }}

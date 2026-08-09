@@ -56,6 +56,9 @@ DEFAULTS = {
     "stack_raw_jpeg": True,   # RAW und JPEG derselben Aufnahme als eine Kachel
     "prefer_raw": True,       # welche Datei den Stapel vertritt
     "label_set": "de",        # Sprache der Lightroom-Farbmarkierungen
+    "sort_desc": False,       # Sortierrichtung merken (↓ absteigend)
+    "show_subfolders": True,  # Ordneransicht zeigt Unterordner mit an
+    "theme": "dunkel",        # "dunkel" oder "hell"
     # Immich. Der Schlüssel liegt im Klartext in dieser Datei - sie steht
     # im Benutzerprofil und ist nur für den angemeldeten Benutzer lesbar,
     # aber sie ist keine Schlüsselverwaltung. Wer mehr will, vergibt in

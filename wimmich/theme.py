@@ -1,39 +1,62 @@
 """Farben und Stylesheet.
 
-Angelehnt an die Anmutung von RapidRAW: dunkel, ruhig, wenig Rahmen,
-abgerundete Flächen, ein einziger Akzentton. Fotos sollen wirken, nicht
-die Oberflaeche.
+Angelehnt an die Anmutung von RapidRAW: ruhig, wenig Rahmen, abgerundete
+Flaechen, ein einziger Akzentton. Fotos sollen wirken, nicht die
+Oberflaeche.
+
+Zwei Paletten - dunkel (Vorgabe) und hell. set_theme() schreibt die
+Werte auf die Modulnamen um; jeder Aufrufer verwendet `theme.BG` &Co.
+als normalen Attributzugriff (`from . import theme`), der bei jedem
+Zugriff neu ausgewertet wird - eine Umschaltung zur Laufzeit wirkt also
+sofort, auch im selbst gezeichneten Code (models.py, canvas.py, ...),
+ohne dass jede Stelle einzeln Bescheid wissen muss.
 """
 
 from __future__ import annotations
 
-# -- Palette ----------------------------------------------------------
+RADIUS = 8
 
-BG          = "#141417"   # Fensterhintergrund
-PANEL       = "#1b1b20"   # Seitenleiste, Leisten
-ELEVATED    = "#23232a"   # Eingabefelder, Knöpfe
-HOVER       = "#2c2c35"
-BORDER      = "#2e2e37"
+# Schrift insgesamt 20% groesser als der urspruengliche Ausgangswert (13px)
+FONT_SIZE = 16
+FONT_SIZE_SMALL = 14      # Hinweistexte, Kachel-Bildunterschrift (vorher 12/11px)
 
-TEXT        = "#e6e6ea"
-TEXT_MUTED  = "#8e8e9c"
+_DARK = dict(
+    BG="#141417", PANEL="#1b1b20", ELEVATED="#23232a", HOVER="#2c2c35",
+    BORDER="#2e2e37", TEXT="#e6e6ea", TEXT_MUTED="#8e8e9c",
+    ACCENT="#6f8cf5", ACCENT_DIM="#3d4a80", STAR="#f0b429",
+    BADGE_BG="#000000", TILE_BG="#000000", VIEWER_BG="#0d0d10",
+    SCROLLBAR="#55555f", SCROLLBAR_HOVER="#7a7a86",
+)
 
-ACCENT      = "#6f8cf5"   # Auswahl, Fokus
-ACCENT_DIM  = "#3d4a80"
-STAR        = "#f0b429"   # Bewertungen
-BADGE_BG    = "#000000"   # halbtransparent gezeichnet, siehe models.py
+_LIGHT = dict(
+    BG="#f4f4f6", PANEL="#ffffff", ELEVATED="#ffffff", HOVER="#e9e9ee",
+    BORDER="#d6d6dc", TEXT="#1c1c22", TEXT_MUTED="#6b6b76",
+    ACCENT="#3d5fd0", ACCENT_DIM="#c4d0f7", STAR="#b8790a",
+    BADGE_BG="#000000", TILE_BG="#e2e2e6", VIEWER_BG="#e7e7eb",
+    SCROLLBAR="#b9b9c2", SCROLLBAR_HOVER="#8f8f9c",
+)
 
-TILE_BG     = "#000000"   # hinter dem Bild in der Kachel
-VIEWER_BG   = "#0d0d10"
+PALETTES = {"dunkel": _DARK, "hell": _LIGHT}
 
-RADIUS      = 8
+_current_name = "dunkel"
 
 
-STYLESHEET = f"""
+def current_theme() -> str:
+    return _current_name
+
+
+def _apply(values: dict) -> None:
+    module = globals()
+    for key, value in values.items():
+        module[key] = value
+
+
+def _build_stylesheet() -> str:
+    return f"""
 QWidget {{
     background: {BG};
     color: {TEXT};
-    font-size: 13px;
+    font-size: {FONT_SIZE}px;
 }}
 
 QMainWindow, QDialog {{ background: {BG}; }}
@@ -124,6 +147,7 @@ QTreeWidget::item:selected {{
     background: {ACCENT_DIM};
     color: #ffffff;
 }}
+QTreeWidget::branch {{ background: transparent; }}
 
 /* Raster */
 QListView {{
@@ -132,26 +156,27 @@ QListView {{
     outline: none;
 }}
 
-/* Bildlaufleisten */
+/* Bildlaufleisten - deutlich sichtbarer Griff, nicht nur bei Hover */
 QScrollBar:vertical {{
     background: transparent;
-    width: 10px;
+    width: 12px;
     margin: 2px;
 }}
 QScrollBar::handle:vertical {{
-    background: {BORDER};
+    background: {SCROLLBAR};
     border-radius: 5px;
     min-height: 40px;
 }}
-QScrollBar::handle:vertical:hover {{ background: {TEXT_MUTED}; }}
+QScrollBar::handle:vertical:hover {{ background: {SCROLLBAR_HOVER}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 2px; }}
 QScrollBar::handle:horizontal {{
-    background: {BORDER};
+    background: {SCROLLBAR};
     border-radius: 5px;
     min-width: 40px;
 }}
+QScrollBar::handle:horizontal:hover {{ background: {SCROLLBAR_HOVER}; }}
 
 /* Statuszeile */
 QStatusBar {{
@@ -230,3 +255,21 @@ QToolTip {{
 
 QMessageBox {{ background: {PANEL}; }}
 """
+
+
+def set_theme(name: str) -> str:
+    """Wechselt die Palette ('dunkel' oder 'hell') und baut STYLESHEET neu.
+
+    Gibt das neue Stylesheet zurueck; main.py und die Einstellungen
+    setzen es zusaetzlich auf die laufende QApplication.
+    """
+    global _current_name, STYLESHEET
+    palette = PALETTES.get(name, _DARK)
+    _current_name = "hell" if palette is _LIGHT else "dunkel"
+    _apply(palette)
+    STYLESHEET = _build_stylesheet()
+    return STYLESHEET
+
+
+# Einmal beim Import mit der Vorgabe (dunkel) fuellen
+STYLESHEET = set_theme("dunkel")

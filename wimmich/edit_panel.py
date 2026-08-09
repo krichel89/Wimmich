@@ -105,7 +105,7 @@ class EditPanel(QWidget):
         )
         self.kelvin_hint = QLabel("")
         self.kelvin_hint.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+            f"color: {theme.TEXT_MUTED}; font-size: 13px;")
         self.kelvin_hint.setWordWrap(True)
         self.pipette_button.toggled.connect(self.pipette_toggled)
         row.addWidget(self.pipette_button)

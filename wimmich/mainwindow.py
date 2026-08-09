@@ -9,13 +9,15 @@ Die Tastenbelegung ist die von Cammello - siehe _handle_key().
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import (
     QEvent, QFileSystemWatcher, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QColor, QIcon, QKeySequence, QPixmap, QShortcut,
+    QAction, QBrush, QColor, QIcon, QKeySequence, QPainter, QPainterPath,
+    QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
@@ -55,6 +57,42 @@ SORT_OPTIONS = [
     ("Bewertung", "rating"),
     ("Zuletzt geändert", "mtime"),
 ]
+
+
+class FolderTree(QTreeWidget):
+    """Baum mit eigenen, duennen Aufklapp-Pfeilen im RapidRAW-Stil.
+
+    Qt zeichnet sonst den nativen Systempfeil (auf Windows ein fetter
+    Rahmen-Winkel) - hier stattdessen ein schlankes, gefuelltes Dreieck,
+    das sich beim Aufklappen um 90 Grad dreht. Es erscheint nur dort, wo
+    das Element tatsaechlich Kinder hat (siehe _add_children).
+    """
+
+    def drawBranches(self, painter, rect, index) -> None:  # noqa: N802
+        item = self.itemFromIndex(index)
+        if item is None or item.childCount() == 0:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(theme.TEXT_MUTED)))
+
+        cx, cy = rect.center().x(), rect.center().y()
+        size = 3.6
+        path = QPainterPath()
+        if item.isExpanded():
+            # Spitze nach unten
+            path.moveTo(cx - size, cy - size * 0.6)
+            path.lineTo(cx + size, cy - size * 0.6)
+            path.lineTo(cx, cy + size * 0.75)
+        else:
+            # Spitze nach rechts
+            path.moveTo(cx - size * 0.6, cy - size)
+            path.lineTo(cx + size * 0.75, cy)
+            path.lineTo(cx - size * 0.6, cy + size)
+        path.closeSubpath()
+        painter.fillPath(path, QBrush(QColor(theme.TEXT_MUTED)))
+        painter.restore()
 
 
 class MainWindow(QMainWindow):
@@ -132,12 +170,14 @@ class MainWindow(QMainWindow):
         self._save_delay.timeout.connect(self._save_edits)
 
         self._chrome_visible = True
+        self._panel_hidden = False
         self._gesamt = 0        # Aufnahmen in der aktuellen Ansicht
         self._scan_worker: ScanWorker | None = None
 
         self._build_ui()
         self._build_actions()
         self.panel.setVisible(False)
+        self.loupe_header.setVisible(False)
         self.loader.ready.connect(self._image_arrived)
         self._reload_folder_tree()
         self._update_status()
@@ -179,10 +219,23 @@ class MainWindow(QMainWindow):
         self.sort_box.currentIndexChanged.connect(self._refresh_view)
         bar_layout.addWidget(self.sort_box)
 
+        self.sort_desc_button = QPushButton("↓")
+        self.sort_desc_button.setCheckable(True)
+        self.sort_desc_button.setChecked(bool(self.config["sort_desc"]))
+        self.sort_desc_button.setFixedWidth(34)
+        self.sort_desc_button.setToolTip(
+            "Sortierrichtung umkehren\n"
+            "↓ absteigend (z. B. neueste zuerst) · ↑ aufsteigend"
+        )
+        self.sort_desc_button.toggled.connect(self._toggle_sort_direction)
+        bar_layout.addWidget(self.sort_desc_button)
+        self._update_sort_direction_label()
+
         self.recursive_button = QPushButton("Unterordner")
         self.recursive_button.setCheckable(True)
+        self.recursive_button.setChecked(bool(self.config["show_subfolders"]))
         self.recursive_button.setToolTip("Bilder aus allen Unterordnern mitzeigen")
-        self.recursive_button.toggled.connect(self._refresh_view)
+        self.recursive_button.toggled.connect(self._toggle_subfolders)
         bar_layout.addWidget(self.recursive_button)
 
         self.stack_button = QPushButton("RAW+JPG stapeln")
@@ -201,7 +254,7 @@ class MainWindow(QMainWindow):
         # Ordnerbaum und Raster
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.tree = QTreeWidget()
+        self.tree = FolderTree()
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(14)
         self.tree.setAnimated(True)
@@ -283,10 +336,35 @@ class MainWindow(QMainWindow):
         crop_layout.addWidget(QLabel("Enter übernimmt · Esc bricht ab · Shift+C hebt auf"))
         self.crop_bar.setVisible(False)
 
+        # Kopfzeile der Lupe: zurück ins Raster, Dateiname + Verzeichnis,
+        # rechts ein Schalter nur für die Bearbeitungsspalte (unabhängig
+        # von Tab/F, die die ganze Oberfläche ausblenden).
+        self.loupe_header = QWidget()
+        header_layout = QHBoxLayout(self.loupe_header)
+        header_layout.setContentsMargins(10, 6, 10, 6)
+        header_layout.setSpacing(10)
+
+        back_button = QPushButton("←  Raster")
+        back_button.setToolTip("Zurück zur Rasteransicht (G)")
+        back_button.clicked.connect(self._show_grid)
+        header_layout.addWidget(back_button)
+
+        self.loupe_title = QLabel("")
+        self.loupe_title.setTextFormat(Qt.TextFormat.RichText)
+        header_layout.addWidget(self.loupe_title, 1)
+
+        self.panel_toggle = QPushButton("Bearbeitungsspalte")
+        self.panel_toggle.setCheckable(True)
+        self.panel_toggle.setChecked(True)
+        self.panel_toggle.setToolTip("Nur die Bearbeitungsspalte ein-/ausblenden")
+        self.panel_toggle.toggled.connect(self._toggle_panel_column)
+        header_layout.addWidget(self.panel_toggle)
+
         loupe_column = QWidget()
         column_layout = QVBoxLayout(loupe_column)
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(4)
+        column_layout.addWidget(self.loupe_header)
         column_layout.addWidget(self.crop_bar)
         column_layout.addWidget(loupe, 1)
 
@@ -446,8 +524,11 @@ class MainWindow(QMainWindow):
             child.setToolTip(0, str(entry))
             if ausgeschlossen:
                 child.setForeground(0, QColor(theme.TEXT_MUTED))
-            # Platzhalter, damit der Aufklapppfeil erscheint
-            child.addChild(QTreeWidgetItem(["..."]))
+            # Platzhalter fuer den Aufklapppfeil - aber nur, wenn es
+            # wirklich Unterordner gibt, sonst zeigt Qt einen Pfeil ins
+            # Leere.
+            if _has_subfolders(entry):
+                child.addChild(QTreeWidgetItem(["..."]))
             parent.addChild(child)
 
     def _expand_item(self, item: QTreeWidgetItem) -> None:
@@ -457,23 +538,48 @@ class MainWindow(QMainWindow):
         if item.childCount() == 1 and item.child(0).text(0) == "...":
             self._add_children(item, data[1])
 
-    def _tree_menu(self, position) -> None:
-        """Rechtsklick im Baum: Ordner ausschließen oder wieder aufnehmen."""
-        item = self.tree.itemAt(position)
-        if item is None:
-            return
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not data or data[0] != "folder":
-            return
-        folder = data[1]
+    def _expand_all_folders(self) -> None:
+        """Klappt den ganzen Ordnerbaum auf - laedt fehlende Ebenen nach."""
+        def rekursiv(item: QTreeWidgetItem) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "folder" and item.childCount() == 1 \
+                    and item.child(0).text(0) == "...":
+                self._add_children(item, data[1])
+            if item.childCount():
+                item.setExpanded(True)
+            for i in range(item.childCount()):
+                rekursiv(item.child(i))
 
+        rekursiv(self._folders_root)
+        self._folders_root.setExpanded(True)
+
+    def _collapse_all_folders(self) -> None:
+        def rekursiv(item: QTreeWidgetItem) -> None:
+            for i in range(item.childCount()):
+                rekursiv(item.child(i))
+            item.setExpanded(False)
+
+        for i in range(self._folders_root.childCount()):
+            rekursiv(self._folders_root.child(i))
+        self._folders_root.setExpanded(True)
+
+    def _tree_menu(self, position) -> None:
+        """Rechtsklick im Baum: aufklappen/zuklappen, Ordner aus-/einschließen."""
         menu = QMenu(self)
-        if self.config.is_excluded(folder):
-            menu.addAction("Wieder aufnehmen",
-                           lambda: self._include_folder(folder))
-        else:
-            menu.addAction("Ordner ausschließen",
-                           lambda: self._exclude_folder(folder))
+        menu.addAction("Baum ganz aufklappen", self._expand_all_folders)
+        menu.addAction("Baum wieder zuklappen", self._collapse_all_folders)
+
+        item = self.tree.itemAt(position)
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if data and data[0] == "folder":
+            folder = data[1]
+            menu.addSeparator()
+            if self.config.is_excluded(folder):
+                menu.addAction("Wieder aufnehmen",
+                               lambda: self._include_folder(folder))
+            else:
+                menu.addAction("Ordner ausschließen",
+                               lambda: self._exclude_folder(folder))
         menu.exec(self.tree.viewport().mapToGlobal(position))
 
     def _exclude_folder(self, folder: str) -> None:
@@ -523,6 +629,19 @@ class MainWindow(QMainWindow):
         self.recursive_button.setEnabled(data[0] == "folder")
         self._refresh_view()
 
+    def _toggle_subfolders(self, checked: bool) -> None:
+        self.config["show_subfolders"] = checked
+        self._refresh_view()
+
+    def _toggle_sort_direction(self, checked: bool) -> None:
+        self.config["sort_desc"] = checked
+        self._update_sort_direction_label()
+        self._refresh_view()
+
+    def _update_sort_direction_label(self) -> None:
+        absteigend = self.sort_desc_button.isChecked()
+        self.sort_desc_button.setText("↓" if absteigend else "↑")
+
     # -- Anzeige -------------------------------------------------------
 
     def _current_min_rating(self) -> int:
@@ -544,6 +663,7 @@ class MainWindow(QMainWindow):
             labels=self._current_labels(),
             unlabeled=self.filters.include_unlabeled(),
         )
+        richtung = dict(desc=self.sort_desc_button.isChecked())
 
         if query:
             rows = self.db.search(query, **common)
@@ -556,17 +676,17 @@ class MainWindow(QMainWindow):
             elif kind == "folder":
                 rows = self.db.photos_in_folder(
                     key, recursive=self.recursive_button.isChecked(),
-                    order=self.sort_box.currentData(), **common,
+                    order=self.sort_box.currentData(), **richtung, **common,
                 )
             elif kind == "album":
                 rows = self.db.photos_by_immich(
                     "album_assets", "album_id", key,
-                    order=self.sort_box.currentData(), **common,
+                    order=self.sort_box.currentData(), **richtung, **common,
                 )
             else:
                 rows = self.db.photos_by_immich(
                     "person_assets", "person_id", key,
-                    order=self.sort_box.currentData(), **common,
+                    order=self.sort_box.currentData(), **richtung, **common,
                 )
 
         # „Alle Fotos" läuft endlos durch: die Zeilen werden stückweise
@@ -582,7 +702,7 @@ class MainWindow(QMainWindow):
         self.grid.setUniformItemSizes(gruppierung is None)
         if alle and not query:
             cursor = self.db.all_photos_cursor(
-                self.config.libraries, order=sortierung, **common)
+                self.config.libraries, order=sortierung, **richtung, **common)
             self.model.set_cursor(cursor, group_by=gruppierung)
             gezeigt = self.db.count_photos(
                 self.config.libraries, min_rating=common["min_rating"],
@@ -779,6 +899,7 @@ class MainWindow(QMainWindow):
         self._crop_mode = False
         self.pages.setCurrentIndex(0)
         self.panel.setVisible(False)
+        self.loupe_header.setVisible(False)
         self.crop_bar.setVisible(False)
         self.grid.setFocus()
         if 0 <= self._loupe_row < self.model.rowCount():
@@ -791,9 +912,15 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= self.model.rowCount():
             return
         self.pages.setCurrentIndex(1)
-        self.panel.setVisible(self._chrome_visible)
+        self.panel.setVisible(self._chrome_visible and not self._panel_hidden)
+        self.loupe_header.setVisible(self._chrome_visible)
         self._load_loupe(row)
         self.canvas.setFocus()
+
+    def _toggle_panel_column(self, checked: bool) -> None:
+        """Blendet NUR die Bearbeitungsspalte aus - Bild und Kopfzeile bleiben."""
+        self._panel_hidden = not checked
+        self.panel.setVisible(checked and self._chrome_visible and self.in_loupe)
 
     def _load_loupe(self, row: int) -> None:
         item = self.model.row_data(row)
@@ -825,6 +952,11 @@ class MainWindow(QMainWindow):
             self.canvas.clear_image()
             self.statusBar().showMessage("Wird geladen …")
         self._prefetch_neighbours()
+        self.loupe_title.setText(
+            f'<b>{_html_escape(item["filename"])}</b>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{theme.TEXT_MUTED}">'
+            f'{_html_escape(item.get("folder") or "")}</span>'
+        )
         self.setWindowTitle(
             f"{APP_NAME} {__version__} — {item['filename']}  "
             f"({row + 1}/{self.model.rowCount()})"
@@ -989,7 +1121,8 @@ class MainWindow(QMainWindow):
         self.filter_bar.setVisible(visible)
         self.tree.setVisible(visible)
         self.statusBar().setVisible(visible)
-        self.panel.setVisible(visible and self.in_loupe)
+        self.loupe_header.setVisible(visible and self.in_loupe)
+        self.panel.setVisible(visible and self.in_loupe and not self._panel_hidden)
         self.crop_bar.setVisible(visible and self._crop_mode)
 
     def _toggle_chrome(self) -> None:
@@ -1642,6 +1775,7 @@ class MainWindow(QMainWindow):
         removed = list(dialog.removed_folders)
         values = dialog.values()
         old_grid = int(self.config["grid_size"])
+        old_theme = str(self.config["theme"] or "dunkel")
 
         for key, value in values.items():
             self.config[key] = value
@@ -1653,6 +1787,9 @@ class MainWindow(QMainWindow):
 
         if old_grid != values["grid_size"]:
             self.grid.setItemDelegate(PhotoDelegate(values["grid_size"]))
+
+        if old_theme != values["theme"]:
+            self._apply_theme(values["theme"])
 
         self._apply_watch_settings()
         self._apply_sync_settings()
@@ -1671,6 +1808,24 @@ class MainWindow(QMainWindow):
                 "Index gelöscht (Dateien unangetastet)", 6000)
 
     # -- Laufender Abgleich --------------------------------------------
+
+    def _apply_theme(self, name: str) -> None:
+        """Wechselt live zwischen hellem und dunklem Erscheinungsbild.
+
+        Das QSS-Stylesheet neu setzen reicht für alle normalen Widgets;
+        selbst gezeichnete Flächen (Raster, Baum-Pfeile, Bildvorschau)
+        lesen theme.XXX erst beim naechsten Zeichnen neu ein - deshalb
+        zusaetzlich gezielt neu zeichnen lassen.
+        """
+        from PyQt6.QtWidgets import QApplication
+        stylesheet = theme.set_theme(name)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet)
+        self.tree.viewport().update()
+        self.grid.viewport().update()
+        self.canvas.viewport().update()
+        self.update()
 
     def _apply_sync_settings(self) -> None:
         """Zeitgeber nach den Einstellungen an- oder abschalten."""
@@ -1896,6 +2051,26 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _has_subfolders(path: Path) -> bool:
+    """Schneller Blick, ob ein Ordner echte Unterordner hat - fuer den
+    Aufklapppfeil im Baum: der soll nur erscheinen, wenn es etwas zum
+    Aufklappen gibt.
+    """
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.is_dir() and not entry.name.startswith("."):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _html_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
 def _info_html(item: dict) -> str:
     rows = []
     if item.get("taken_at"):
@@ -1904,12 +2079,32 @@ def _info_html(item: dict) -> str:
         rows.append(item["camera"])
     if item.get("lens"):
         rows.append(item["lens"])
+    exif_bits = []
+    if item.get("focal_length"):
+        exif_bits.append(f"{item['focal_length']:g} mm")
+    if item.get("aperture"):
+        exif_bits.append(f"f/{item['aperture']:g}")
+    if item.get("exposure_time"):
+        exif_bits.append(f"{item['exposure_time']}")
+    if item.get("iso"):
+        exif_bits.append(f"ISO {item['iso']}")
+    if exif_bits:
+        rows.append("  ·  ".join(exif_bits))
     if item.get("width") and item.get("height"):
         rows.append(f"{item['width']} × {item['height']} px")
+    if item.get("filesize"):
+        rows.append(_dateigroesse(int(item["filesize"])))
     if int(item.get("stack_count") or 1) > 1:
         rows.append(f"Stapel aus {item['stack_count']} Dateien")
     rows.append(item["filename"])
     return "<br>".join(rows)
+
+
+def _dateigroesse(bytes_: int) -> str:
+    """Dateigröße lesbar - KB unter 1 MB, sonst MB mit einer Nachkommastelle."""
+    if bytes_ >= 1024 * 1024:
+        return f"{bytes_ / (1024 * 1024):.1f} MB"
+    return f"{bytes_ / 1024:.0f} KB"
 
 
 KEY_HELP = """<b>Belegung wie in Cammello</b><table cellpadding="3">

@@ -54,9 +54,9 @@ class ImageView(QGraphicsView):
 
         # Statusanzeige unten rechts (Sterne, Farbe) - im Vollbild ist
         # die Statuszeile des Fensters nicht sichtbar.
-        self.overlay = _overlay_label(self, 13)
+        self.overlay = _overlay_label(self, 16)
         # Bildangaben oben links, mit i umschaltbar.
-        self.info_overlay = _overlay_label(self, 12)
+        self.info_overlay = _overlay_label(self, 14)
 
     # -- Inhalt --------------------------------------------------------
 

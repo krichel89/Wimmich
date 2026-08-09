@@ -88,7 +88,7 @@ class SettingsDialog(QDialog):
 
         self.library_note = QLabel("")
         self.library_note.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 12px;"
+            f"color: {theme.TEXT_MUTED}; font-size: 14px;"
         )
         self.library_note.setWordWrap(True)
         layout.addWidget(self.library_note)
@@ -139,6 +139,13 @@ class SettingsDialog(QDialog):
         page = QWidget()
         form = QFormLayout(page)
         form.setSpacing(10)
+
+        self.theme_box = QComboBox()
+        self.theme_box.addItem("Dunkel", "dunkel")
+        self.theme_box.addItem("Hell", "hell")
+        index = self.theme_box.findData(self.config["theme"] or "dunkel")
+        self.theme_box.setCurrentIndex(max(0, index))
+        form.addRow("Erscheinungsbild", self.theme_box)
 
         self.grid_size = QSpinBox()
         self.grid_size.setRange(90, 400)
@@ -265,7 +272,7 @@ class SettingsDialog(QDialog):
 
     def _say(self, text: str, good: bool) -> None:
         colour = "#5ac37a" if good else "#ff6b6b"
-        self.result_label.setStyleSheet(f"color: {colour}; font-size: 12px;")
+        self.result_label.setStyleSheet(f"color: {colour}; font-size: 14px;")
         self.result_label.setText(text)
 
     # -- Ergebnis ------------------------------------------------------
@@ -274,6 +281,7 @@ class SettingsDialog(QDialog):
         return {
             "libraries": [self.folder_list.item(i).text()
                           for i in range(self.folder_list.count())],
+            "theme": self.theme_box.currentData(),
             "grid_size": self.grid_size.value(),
             "thumb_size": self.thumb_size.value(),
             "prefer_raw": self.prefer_raw.isChecked(),
@@ -291,6 +299,6 @@ class SettingsDialog(QDialog):
 
 def _hint(text: str) -> QLabel:
     label = QLabel(text)
-    label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px;")
+    label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 14px;")
     label.setWordWrap(True)
     return label

@@ -31,6 +31,7 @@ _READ_ARGS = [
     "-Title", "-XMP:Title",
     "-Description", "-ImageDescription", "-Caption-Abstract",
     "-Keywords", "-XMP:Subject",
+    "-FNumber", "-ApertureValue", "-ISO", "-FocalLength", "-ExposureTime",
 ]
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -47,6 +48,33 @@ _TAG_EXIF_IFD = 0x8769
 _TAG_DATETIME_ORIGINAL = 0x9003
 _TAG_LENS_MODEL = 0xA434
 _TAG_COLOR_TEMP = 0x9C9C          # kommt praktisch nie vor, daher meist None
+_TAG_FNUMBER = 0x829D
+_TAG_EXPOSURE_TIME = 0x829A
+_TAG_ISO = 0x8827
+_TAG_FOCAL_LENGTH = 0x920A
+
+
+def _as_float(value) -> float | None:
+    """IFDRational/Bruch/Zahl zu float - für Blende, Brennweite & Co."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _exposure_text(value) -> str | None:
+    """Belichtungszeit als lesbarer Text: '1/200' oder '2.5s'."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not seconds or seconds <= 0:
+        return None
+    if seconds < 1:
+        return f"1/{round(1 / seconds)}"
+    return f"{seconds:g}s"
 
 
 def read_fast(paths: list[str]) -> dict[str, dict]:
@@ -94,6 +122,10 @@ def read_fast(paths: list[str]) -> dict[str, dict]:
             "camera": _text(exif.get(_TAG_MODEL)),
             "lens": _text(unter.get(_TAG_LENS_MODEL)),
             "color_temp": None,
+            "aperture": _as_float(unter.get(_TAG_FNUMBER)),
+            "iso": _as_int(unter.get(_TAG_ISO)),
+            "focal_length": _as_float(unter.get(_TAG_FOCAL_LENGTH)),
+            "exposure_time": _exposure_text(unter.get(_TAG_EXPOSURE_TIME)),
             "rating": bewertung,
             "label": marke,
             "title": None, "caption": None, "keywords": None,
@@ -308,6 +340,13 @@ def _as_number(value) -> int | None:
     return number if 1000 <= number <= 30000 else None
 
 
+def _as_int(value) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_text(value) -> str | None:
     if value is None:
         return None
@@ -336,6 +375,10 @@ def _normalise(entry: dict) -> dict:
         "rating": clamp_rating(rating),
         "label": _as_text(_first(entry, "Label", "XMP:Label")),
         "color_temp": _as_number(_first(entry, "ColorTemperature")),
+        "aperture": _as_float(_first(entry, "FNumber", "ApertureValue")),
+        "iso": _as_int(_first(entry, "ISO")),
+        "focal_length": _as_float(_first(entry, "FocalLength")),
+        "exposure_time": _exposure_text(_first(entry, "ExposureTime")),
         "title": _as_text(_first(entry, "Title", "XMP:Title")),
         "caption": _as_text(
             _first(entry, "Description", "Caption-Abstract", "ImageDescription")

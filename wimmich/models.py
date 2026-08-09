@@ -290,14 +290,14 @@ class PhotoDelegate(QStyledItemDelegate):
     def __init__(self, tile: int = 180, parent=None) -> None:
         super().__init__(parent)
         self.tile = tile
-        self.label_height = 40
+        self.label_height = 46
         self.pad = 8
 
     def sizeHint(self, option, index) -> QSize:  # noqa: N802
         if index is not None and index.isValid() and index.data(ROLE_HEADER):
             # Volle Breite, damit die Kopfzeile eine eigene Reihe bekommt
             width = self._viewport_width(option)
-            return QSize(width, 34)
+            return QSize(width, 40)
         return QSize(self.tile + self.pad * 2,
                      self.tile + self.label_height + self.pad)
 
@@ -338,11 +338,11 @@ class PhotoDelegate(QStyledItemDelegate):
 
         painter.setPen(QPen(QColor("#ffffff" if selected else theme.TEXT_MUTED)))
         font = QFont(option.font)
-        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.5))
+        font.setPointSizeF(max(9.0, font.pointSizeF() - 1.8))
         painter.setFont(font)
 
         name_rect = QRect(int(card.x()) + 4, int(image_rect.bottom()) + 5,
-                          int(card.width()) - 8, 15)
+                          int(card.width()) - 8, 18)
         elided = painter.fontMetrics().elidedText(
             str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
             Qt.TextElideMode.ElideMiddle, name_rect.width(),
@@ -351,7 +351,7 @@ class PhotoDelegate(QStyledItemDelegate):
 
         rating = int(index.data(ROLE_RATING) or 0)
         mark_rect = QRect(name_rect.x(), name_rect.bottom() + 1,
-                          name_rect.width(), 14)
+                          name_rect.width(), 17)
         if marks.is_reject(rating):
             painter.setPen(QPen(QColor("#ff6b6b")))
             painter.drawText(
@@ -443,7 +443,7 @@ class PhotoDelegate(QStyledItemDelegate):
     def _draw_badge(self, painter: QPainter, image_rect: QRectF, text: str) -> None:
         painter.save()
         font = QFont(painter.font())
-        font.setPointSizeF(7.5)
+        font.setPointSizeF(9.0)
         font.setBold(True)
         painter.setFont(font)
 
@@ -485,7 +485,7 @@ class PhotoDelegate(QStyledItemDelegate):
         path.addRoundedRect(badge, 5, 5)
         painter.fillPath(path, QBrush(QColor(0, 0, 0, 170)))
         font = QFont(painter.font())
-        font.setPointSizeF(8.0)
+        font.setPointSizeF(9.5)
         painter.setFont(font)
         painter.setPen(QPen(QColor("#ffffff")))
         painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), "\u270e")
