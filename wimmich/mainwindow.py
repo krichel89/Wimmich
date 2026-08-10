@@ -26,7 +26,8 @@ from PyQt6.QtWidgets import (
     QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, __version__, marks, retouch, theme, thumbs
+from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
+               retouch, theme, thumbs)
 from .config import Config, DB_PATH, ensure_dirs, find_exiftool
 from .db import Database
 from .exif import ExifTool, ExifToolError
@@ -392,64 +393,112 @@ class MainWindow(QMainWindow):
         self.sync_progress_bar.setFixedHeight(18)
         self.sync_progress_bar.setTextVisible(True)
         self.sync_progress_bar.setVisible(False)
+
+        # Eigenes Etikett statt showMessage(): eine Zeitmeldung waere von
+        # jeder anderen Meldung ueberschrieben worden und nach Ablauf
+        # verschwunden - der Stand des Abgleichs soll aber stehen bleiben.
+        self.sync_label = QLabel("")
+        self.sync_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.sync_label)
         self.statusBar().addPermanentWidget(self.sync_progress_bar)
 
         self.status_label = QLabel("")
         self.statusBar().addPermanentWidget(self.status_label)
 
     def _build_actions(self) -> None:
-        toolbar = QToolBar("Hauptleiste")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        self.toolbar = toolbar
+        """Menüleiste und eine schlanke Werkzeugleiste.
 
-
-
+        Alles, was man selten braucht, gehört ins Menü - so wie unter
+        Windows üblich. In der Werkzeugleiste bleiben nur die drei
+        Handgriffe, die im Alltag ständig vorkommen.
+        """
         scan_action = QAction("Neu einlesen", self)
         scan_action.setShortcut(QKeySequence("F5"))
         scan_action.triggered.connect(self._rescan)
-        toolbar.addAction(scan_action)
-
-        toolbar.addSeparator()
 
         immich_action = QAction("Immich abgleichen", self)
         immich_action.setShortcut(QKeySequence("F6"))
         immich_action.triggered.connect(self._start_sync)
-        toolbar.addAction(immich_action)
 
         self.loupe_action = QAction("Lupe / Raster", self)
-        self.loupe_action.setToolTip("Zwischen Raster und Lupe wechseln (E oder G)")
+        self.loupe_action.setShortcut(QKeySequence("E"))
         self.loupe_action.triggered.connect(self._toggle_loupe)
-        toolbar.addAction(self.loupe_action)
 
-        toolbar.addSeparator()
-
-        diag_action = QAction("Diagnose", self)
-        diag_action.setToolTip("Prüft, warum etwas langsam ist")
+        diag_action = QAction("Diagnose …", self)
         diag_action.triggered.connect(self._show_diagnose)
-        toolbar.addAction(diag_action)
 
         keys_action = QAction("Tastenkürzel", self)
         keys_action.setShortcut(QKeySequence("F1"))
         keys_action.triggered.connect(self._show_keys)
-        toolbar.addAction(keys_action)
 
-        settings_action = QAction("Einstellungen", self)
+        settings_action = QAction("Einstellungen …", self)
         settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self._open_settings)
-        toolbar.addAction(settings_action)
-
-        toolbar.addSeparator()
 
         clear_action = QAction("Vorschau-Cache leeren", self)
         clear_action.triggered.connect(self._clear_cache)
-        toolbar.addAction(clear_action)
 
-        # Die Tasten laufen zentral über _handle_key(), damit Raster und
-        # Lupe dieselbe Belegung haben - siehe dort.
-        self.grid.installEventFilter(self)
-        self.canvas.installEventFilter(self)
-        self.tree.installEventFilter(self)
+        fehler_action = QAction("Fehlerprotokoll anzeigen", self)
+        fehler_action.triggered.connect(self._show_error_log)
+
+        beenden_action = QAction("Beenden", self)
+        beenden_action.setShortcut(QKeySequence("Ctrl+Q"))
+        beenden_action.triggered.connect(self.close)
+
+        vollbild_action = QAction("Vollbild", self)
+        vollbild_action.setShortcut(QKeySequence("F"))
+        vollbild_action.triggered.connect(self._toggle_fullscreen)
+
+        leisten_action = QAction("Leisten ausblenden", self)
+        leisten_action.setShortcut(QKeySequence("Tab"))
+        leisten_action.triggered.connect(
+            lambda: self._set_chrome(not self._chrome_visible))
+
+        baum_auf = QAction("Ordnerbaum ganz aufklappen", self)
+        baum_auf.triggered.connect(self._expand_all_folders)
+        baum_zu = QAction("Ordnerbaum zuklappen", self)
+        baum_zu.triggered.connect(self._collapse_all_folders)
+
+        ueber_action = QAction("Über Wimmich", self)
+        ueber_action.triggered.connect(self._show_about)
+
+        leiste = self.menuBar()
+        menu_datei = leiste.addMenu("&Datei")
+        menu_datei.addAction(scan_action)
+        menu_datei.addSeparator()
+        menu_datei.addAction(settings_action)
+        menu_datei.addSeparator()
+        menu_datei.addAction(beenden_action)
+
+        menu_ansicht = leiste.addMenu("&Ansicht")
+        menu_ansicht.addAction(self.loupe_action)
+        menu_ansicht.addAction(vollbild_action)
+        menu_ansicht.addAction(leisten_action)
+        menu_ansicht.addSeparator()
+        menu_ansicht.addAction(baum_auf)
+        menu_ansicht.addAction(baum_zu)
+
+        menu_immich = leiste.addMenu("&Immich")
+        menu_immich.addAction(immich_action)
+
+        menu_extras = leiste.addMenu("E&xtras")
+        menu_extras.addAction(clear_action)
+        menu_extras.addAction(diag_action)
+        menu_extras.addAction(fehler_action)
+
+        menu_hilfe = leiste.addMenu("&Hilfe")
+        menu_hilfe.addAction(keys_action)
+        menu_hilfe.addSeparator()
+        menu_hilfe.addAction(ueber_action)
+
+        # Werkzeugleiste: nur der tägliche Handgriff
+        toolbar = QToolBar("Hauptleiste")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+        self.toolbar = toolbar
+        toolbar.addAction(scan_action)
+        toolbar.addAction(immich_action)
+        toolbar.addAction(self.loupe_action)
 
     def _first_run_hint(self) -> None:
         QMessageBox.information(
@@ -1063,6 +1112,15 @@ class MainWindow(QMainWindow):
         self._show_before = False
         self._stroke = []
         self.panel.setEnabled(False)
+        # Reste des vorigen Bildes wegräumen. Sonst zeigen Zuschnitt,
+        # Vorher/Nachher und die Regler noch auf dessen Daten - genau
+        # daran sind Aktionen wie „Zuschnitt aufheben" abgestürzt.
+        self._stack_edits = EditStack()
+        self._loupe_small = None
+        self._loupe_full = None
+        self._crop_mode = False
+        self.crop_bar.setVisible(False)
+        self._set_tool(TOOL_NONE)
 
         daten = None
         client = getattr(self.model, "_immich_client", None)
@@ -1452,13 +1510,26 @@ class MainWindow(QMainWindow):
         self._render_loupe(keep_view=True)
         self._save_edits()
 
+    def _remote_aktiv(self) -> bool:
+        """Steht gerade ein reines Serverbild in der Lupe?
+
+        Für solche Bilder gibt es keine lokale Datei: Zuschnitt, Regler
+        und Retusche haben nichts, worauf sie wirken könnten.
+        """
+        item = self.model.row_data(self._loupe_row) if self.in_loupe else None
+        return bool(item and item.get("_remote"))
+
     def _clear_crop(self) -> None:
+        if self._remote_aktiv():
+            return
         self._stack_edits.remove_kind(CROP)
         self.canvas.set_crop(None)
         self._render_loupe()
         self._save_edits()
 
     def _toggle_crop_mode(self, on: bool | None = None) -> None:
+        if self._remote_aktiv():
+            return
         self._crop_mode = (not self._crop_mode) if on is None else bool(on)
         self._crop_aspect_key = None
         self._crop_portrait = False
@@ -1474,6 +1545,8 @@ class MainWindow(QMainWindow):
         self._render_loupe()
 
     def _flip_aspect(self) -> None:
+        if self._remote_aktiv():
+            return
         if self._crop_aspect_key:
             self._set_aspect(self._crop_aspect_key)
 
@@ -1485,6 +1558,8 @@ class MainWindow(QMainWindow):
         greifen. Mittelpunkt und Fläche bleiben dabei so weit wie
         möglich erhalten.
         """
+        if self._remote_aktiv():
+            return
         if not self._crop_mode:
             self._toggle_crop_mode(True)
         ratio = ASPECT_PRESETS.get(digit)
@@ -1877,6 +1952,35 @@ class MainWindow(QMainWindow):
 
     # -- Einlesen ------------------------------------------------------
 
+    def _show_error_log(self) -> None:
+        """Fehlerprotokoll anzeigen - die Grundlage jeder Fehlermeldung."""
+        pfad = crashlog.log_path()
+        if not pfad.exists():
+            QMessageBox.information(
+                self, "Fehlerprotokoll",
+                "Es gibt noch keine Einträge — bisher ist nichts schiefgegangen.")
+            return
+        try:
+            text = pfad.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            QMessageBox.warning(self, "Fehlerprotokoll", str(exc))
+            return
+        # Nur das Ende zeigen: das Jüngste ist das Interessante
+        letzte = text[-8000:]
+        box = QMessageBox(self)
+        box.setWindowTitle("Fehlerprotokoll")
+        box.setText(f"Datei: {pfad}")
+        box.setDetailedText(letzte)
+        box.exec()
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self, "Über Wimmich",
+            f"<b>{APP_NAME} {__version__}</b><br><br>"
+            "Lokale Fotoverwaltung mit Immich-Anbindung.<br>"
+            f"{LICENSE_SHORT} — ohne jede Gewährleistung.<br><br>"
+            "Copyright (C) 2026 Harald Krichel")
+
     def _rescan(self) -> None:
         if self._scan_thread is not None:
             self.statusBar().showMessage("Es läuft bereits ein Durchlauf", 3000)
@@ -2110,10 +2214,12 @@ class MainWindow(QMainWindow):
         self.sync_progress_bar.setRange(0, 0)   # unbestimmt, bis der erste Wert kommt
         self.sync_progress_bar.setValue(0)
         self.sync_progress_bar.setVisible(True)
-        self.statusBar().showMessage("Abgleich mit Immich läuft …")
+        self.sync_label.setText("Abgleich mit Immich läuft …")
+        self.sync_label.setVisible(True)
 
     def _sync_progress(self, message: str, done: int, total: int) -> None:
-        self.statusBar().showMessage(message)
+        self.sync_label.setText(message)
+        self.sync_label.setVisible(True)
         if total > 0:
             self.sync_progress_bar.setRange(0, total)
             self.sync_progress_bar.setValue(min(done, total))
@@ -2137,7 +2243,8 @@ class MainWindow(QMainWindow):
             parts.append(f"{result.skipped} übersprungen (Typ nicht angenommen)")
         if result.failed:
             parts.append(f"{result.failed} fehlgeschlagen")
-        self.statusBar().showMessage("Abgleich fertig: " + ", ".join(parts), 8000)
+        self.sync_label.setText("Abgleich fertig: " + ", ".join(parts))
+        self.sync_label.setVisible(True)
 
         self._apply_remote_client()
         if result.errors and not self._sync_quiet:
@@ -2159,7 +2266,8 @@ class MainWindow(QMainWindow):
         if quiet:
             # Still weiterlaufen lassen: beim nächsten Durchlauf wird
             # erneut versucht. Nur die Statuszeile sagt Bescheid.
-            self.statusBar().showMessage(f"Abgleich nicht möglich: {message}", 8000)
+            self.sync_label.setText(f"Abgleich nicht möglich: {message}")
+            self.sync_label.setVisible(True)
         else:
             QMessageBox.critical(self, "Abgleich fehlgeschlagen", message)
             self.statusBar().clearMessage()
@@ -2177,6 +2285,11 @@ class MainWindow(QMainWindow):
         self.sync_progress_bar.setRange(0, 1)
         self.sync_progress_bar.setValue(1)
         QTimer.singleShot(2000, lambda: self.sync_progress_bar.setVisible(
+            self._sync_thread is not None))
+        # Das Ergebnis bleibt eine Weile lesbar stehen, statt sofort zu
+        # verschwinden - sonst ist der Ausgang eines langen Abgleichs weg,
+        # sobald man kurz nicht hinsieht.
+        QTimer.singleShot(30000, lambda: self.sync_label.setVisible(
             self._sync_thread is not None))
 
     def _show_diagnose(self) -> None:

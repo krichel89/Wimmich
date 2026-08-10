@@ -11,7 +11,11 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QStyle, QStyledItemDelegate
 
+import time
+
 from . import marks, remote_thumbs, theme, thumbs
+
+REMOTE_PAUSE = 5.0     # Sekunden Ruhe, bevor eine Serverkachel neu versucht wird
 
 ROLE_PATH = Qt.ItemDataRole.UserRole + 1
 ROLE_ID = Qt.ItemDataRole.UserRole + 2
@@ -88,6 +92,7 @@ class PhotoModel(QAbstractListModel):
         self._requested: set[int] = set()
         self._thumb_edge = thumb_edge
         self._immich_client = None
+        self._remote_fehler: dict[int, float] = {}
         self._exiftool = exiftool
 
         self._pool = QThreadPool.globalInstance()
@@ -290,6 +295,10 @@ class PhotoModel(QAbstractListModel):
         if row not in self._requested:
             self._requested.add(row)
             if item.get("_remote"):
+                letzter = self._remote_fehler.get(row)
+                if letzter is not None and time.monotonic() - letzter < REMOTE_PAUSE:
+                    self._requested.discard(row)   # spaeter noch einmal
+                    return self._placeholder
                 self._pool.start(_RemoteThumbTask(
                     row, item["immich_id"], self._immich_client, self._signals))
                 return self._placeholder
@@ -309,6 +318,18 @@ class PhotoModel(QAbstractListModel):
         self._touch(row)
 
     def _thumb_failed(self, row: int) -> None:
+        item = self._rows[row] if 0 <= row < len(self._rows) else {}
+        if item.get("_remote"):
+            # Server-Vorschauen NICHT dauerhaft aufgeben: der Server kann
+            # beim Start noch nicht erreichbar gewesen sein oder die
+            # Verbindung kurz gehangen haben. Zeile wieder freigeben,
+            # damit ein spaeterer Anlauf (Scrollen, Ansicht wechseln,
+            # nach dem Abgleich) es erneut versucht.
+            self._requested.discard(row)
+            self._remote_fehler[row] = time.monotonic()
+            self._pixmaps.pop(row, None)
+            self._touch(row)
+            return
         self._pixmaps[row] = self._placeholder
         self._touch(row)
 

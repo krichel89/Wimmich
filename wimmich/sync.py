@@ -18,6 +18,7 @@ Immich ist der Spiegel, nicht die Quelle.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
@@ -29,6 +30,7 @@ from .immich import (ImmichClient, ImmichError, SyncResult, file_checksum,
 
 CHECK_BATCH = 100        # so viele Prüfsummen je Anfrage
 PROGRESS_INTERVAL = 0.3  # Sekunden zwischen zwei Fortschrittsmeldungen
+PARALLEL_VORGABE = 4     # gleichzeitige Uploads
 ABBRUCH_NACH_FEHLERN = 5  # so viele Fehlversuche hintereinander, dann Schluss
 
 
@@ -41,7 +43,7 @@ class SyncWorker(QObject):
 
     def __init__(self, base_url: str, api_key: str, upload: bool = True,
                  fetch_albums: bool = True, fetch_people: bool = True,
-                 fetch_remote: bool = True) -> None:
+                 fetch_remote: bool = True, parallel: int = PARALLEL_VORGABE) -> None:
         super().__init__()
         self._base_url = base_url
         self._api_key = api_key
@@ -49,6 +51,7 @@ class SyncWorker(QObject):
         self._fetch_albums = fetch_albums
         self._fetch_people = fetch_people
         self._fetch_remote = fetch_remote
+        self._parallel = max(1, min(8, int(parallel)))
         self._cancel = False
         self._db: Database | None = None
         self._last_progress = 0.0
@@ -164,6 +167,8 @@ class SyncWorker(QObject):
             known = client.check_uploaded(items)
             result.checked += len(items)
 
+            # Erst alles erledigen, was ohne Netz geht
+            hochzuladen: list[str] = []
             for key, asset_id in known.items():
                 if self._cancel:
                     break
@@ -171,10 +176,40 @@ class SyncWorker(QObject):
                 if asset_id:
                     self._db.set_immich(int(key), asset_id, row["checksum"])
                     result.already_there += 1
+                    done += 1
                 elif self._upload:
+                    hochzuladen.append(key)
+                    continue
+                else:
+                    # Nicht hochladen: leere Kennung merken, damit die Datei
+                    # nicht in jedem Durchlauf erneut geprüft wird.
+                    self._db.set_immich(int(key), "", row["checksum"])
+                    done += 1
+                self._report(f"Abgeglichen: {done} von {offen}", done, offen)
+
+            # Uploads GLEICHZEITIG: sie warten fast nur auf das Netz.
+            # Gemessen bei 150 ms Serverantwort: viermal so schnell mit
+            # vier Strängen. Die Datenbank wird weiterhin NUR hier im
+            # Abgleichfaden beschrieben - sqlite-Verbindungen sind nicht
+            # zwischen Fäden teilbar.
+            for stapel in _haeppchen(hochzuladen, self._parallel):
+                if self._cancel:
+                    break
+                ergebnisse = []
+                with ThreadPoolExecutor(max_workers=self._parallel) as pool:
+                    auftraege = {
+                        pool.submit(self._upload_versuch, client, by_id[k]): k
+                        for k in stapel
+                    }
+                    for auftrag in as_completed(auftraege):
+                        ergebnisse.append((auftrag.result(), auftraege[auftrag]))
+
+                for (asset_id, duplikat, fehler), key in ergebnisse:
+                    row = by_id[key]
                     self._report(f"Lade hoch: {row['filename']} ({done} von {offen})",
                                  done, offen)
-                    if self._upload_one(client, int(key), row, result):
+                    if self._verbuche_upload(int(key), row, asset_id, duplikat,
+                                             fehler, result):
                         misserfolge = 0
                     else:
                         # Fehlgeschlagene Datei für DIESEN Lauf zurückstellen,
@@ -190,14 +225,12 @@ class SyncWorker(QObject):
                                 f"Nach {misserfolge} Fehlversuchen hintereinander "
                                 f"abgebrochen — der Server nimmt nichts an.")
                             self._abgebrochen = True
+                            self._db.commit()
                             return
-                else:
-                    # Nicht hochladen: leere Kennung merken, damit die Datei
-                    # nicht in jedem Durchlauf erneut geprüft wird.
-                    self._db.set_immich(int(key), "", row["checksum"])
 
-                done += 1
-                self._report(f"Abgeglichen: {done} von {offen}", done, offen)
+                    done += 1
+                    self._report(f"Abgeglichen: {done} von {offen}", done, offen)
+                self._db.commit()
             self._db.commit()
 
         if self._abgelehnte_typen:
@@ -205,6 +238,46 @@ class SyncWorker(QObject):
             result.errors.append(
                 f"Dieser Immich-Server nimmt {typen} nicht an — diese Dateien wurden übersprungen.")
         self._report(f"Bilder fertig: {done} von {offen}", done, offen, force=True)
+
+    def _upload_versuch(self, client: ImmichClient, row: dict):
+        """NUR die Netzarbeit - laeuft in mehreren Faeden gleichzeitig.
+
+        Hier wird bewusst NICHT auf die Datenbank zugegriffen: eine
+        sqlite-Verbindung gehoert genau einem Faden. Das Ergebnis wird
+        zurueckgegeben und im Abgleichfaden verbucht.
+        """
+        sidecar = Path(row["path"]).with_suffix(".xmp")
+        mit_sidecar = bool(row.get("is_raw")) and sidecar.exists()
+        try:
+            asset_id, duplikat = client.upload(
+                row["path"], checksum=row.get("checksum"),
+                sidecar=str(sidecar) if mit_sidecar else None)
+            return asset_id, duplikat, None
+        except (ImmichError, OSError) as exc:
+            return None, False, exc
+
+    def _verbuche_upload(self, photo_id: int, row: dict, asset_id, duplikat,
+                         fehler, result: SyncResult) -> bool:
+        """Ergebnis eines Uploads in die Datenbank schreiben."""
+        if fehler is not None:
+            result.failed += 1
+            if len(result.errors) < 20:
+                result.errors.append(f"{row['filename']}: {fehler}")
+            self._letzter_fehler = str(fehler)
+            if ist_dauerhafter_fehler(str(fehler)):
+                self._db.set_immich(photo_id, "", row.get("checksum"))
+                result.skipped += 1
+                result.failed -= 1
+                self._abgelehnte_typen.add(Path(row["path"]).suffix.lower())
+                return True
+            return False
+
+        self._db.set_immich(photo_id, asset_id or "", row.get("checksum"))
+        if duplikat:
+            result.already_there += 1
+        else:
+            result.uploaded += 1
+        return True
 
     def _upload_one(self, client: ImmichClient, photo_id: int, row: dict,
                     result: SyncResult) -> bool:
@@ -335,3 +408,9 @@ def _remote_eintrag(asset: dict) -> dict:
         "width": exif.get("exifImageWidth"),
         "height": exif.get("exifImageHeight"),
     }
+
+
+def _haeppchen(werte: list, groesse: int):
+    """Liste in Stapel schneiden - je Stapel ein Schwung gleichzeitiger Uploads."""
+    for anfang in range(0, len(werte), groesse):
+        yield werte[anfang:anfang + groesse]

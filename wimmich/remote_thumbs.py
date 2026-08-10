@@ -16,11 +16,47 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from .config import CACHE_DIR
+from .config import CACHE_DIR, Config
 
 REMOTE_DIR = CACHE_DIR / "remote"
 
 _sperre = threading.Lock()
+_client_sperre = threading.Lock()
+_ersatz_client = None
+_letzte_meldung = ""
+
+
+def letzte_meldung() -> str:
+    """Warum die letzte Vorschau nicht kam - fuer die Diagnose."""
+    return _letzte_meldung
+
+
+def _client_bei_bedarf():
+    """Eigener Client, falls das Fenster keinen mitgibt.
+
+    Frueher hing alles an einem Client, der EINMAL beim Start gebaut
+    wurde. War der Server da gerade nicht erreichbar, blieben alle
+    Serverkacheln fuer den Rest der Sitzung leer. Jetzt wird bei Bedarf
+    einer aufgebaut und behalten.
+    """
+    global _ersatz_client, _letzte_meldung
+    with _client_sperre:
+        if _ersatz_client is not None:
+            return _ersatz_client
+        from .immich import ImmichClient, ImmichError
+        cfg = Config()
+        url, key = cfg["immich_url"], cfg["immich_key"]
+        if not url or not key:
+            _letzte_meldung = "Immich ist nicht eingerichtet"
+            return None
+        client = ImmichClient(url, key)
+        try:
+            client.connect()
+        except ImmichError as exc:
+            _letzte_meldung = f"Verbindung fehlgeschlagen: {exc}"
+            return None
+        _ersatz_client = client
+        return client
 
 
 def cache_path(immich_id: str, gross: bool = False) -> Path:
@@ -45,14 +81,23 @@ def fetch(client, immich_id: str, gross: bool = False) -> bytes | None:
     Liefert None, wenn der Server sie nicht hergibt. Das ist kein Fehler:
     die Kachel zeigt dann einen Platzhalter.
     """
+    global _letzte_meldung
     vorhanden = cached(immich_id, gross)
     if vorhanden:
         return vorhanden
+
+    if client is None:
+        client = _client_bei_bedarf()
     if client is None:
         return None
 
-    daten = client.thumbnail(immich_id, gross=gross)
+    try:
+        daten = client.thumbnail(immich_id, gross=gross)
+    except Exception as exc:                     # Netz, Zeitgrenze, alles
+        _letzte_meldung = f"{immich_id}: {exc}"
+        return None
     if not daten:
+        _letzte_meldung = f"{immich_id}: Server lieferte keine Vorschau"
         return None
 
     with _sperre:

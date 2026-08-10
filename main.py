@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import QApplication
 
 from wimmich import APP_NAME, __version__, theme
 from wimmich.config import Config
+from wimmich import crashlog
 from wimmich.icon import app_icon
 from wimmich.mainwindow import MainWindow
 
@@ -31,7 +32,14 @@ def main() -> int:
     theme.set_theme(str(startup_config["theme"] or "dunkel"))
     app.setStyleSheet(theme.STYLESHEET)
 
+    # Fehlerhaken VOR dem ersten Fenster setzen: PyQt6 wuerde das
+    # Programm sonst bei jeder unbehandelten Ausnahme in einem Slot
+    # kommentarlos beenden.
+    fenster: list = []
+    crashlog.install(__version__, lambda: fenster[0] if fenster else None)
+
     window = MainWindow()
+    fenster.append(window)
     window.show()
     return app.exec()
 

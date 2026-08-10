@@ -403,16 +403,30 @@ class ImmichClient:
     def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:
         """Vorschaubild vom Server. Keine Ausnahme bei Misserfolg."""
         groesse = "preview" if gross else "thumbnail"
-        for pfad, abfrage in (
+        # Mehrere Schreibweisen, weil sich der Weg zwischen den
+        # Immich-Fassungen geaendert hat. Ein Fehlschlag darf NICHT die
+        # restlichen Versuche verhindern - genau daran scheiterten
+        # aeltere Server bisher stumm.
+        versuche = [
             (f"/assets/{asset_id}/thumbnail", {"size": groesse}),
+            (f"/assets/{asset_id}/thumbnail", None),
             (f"/asset/thumbnail/{asset_id}", {"format": "JPEG"}),
-        ):
+            (f"/asset/thumbnail/{asset_id}", None),
+        ]
+        if gross:
+            versuche.insert(2, (f"/assets/{asset_id}/original", None))
+        letzter = None
+        for pfad, abfrage in versuche:
             try:
                 status, payload = self._request("GET", pfad, query=abfrage)
-            except ImmichError:
-                return None
+            except ImmichError as exc:
+                letzter = exc
+                continue
             if status < 400 and payload:
                 return payload
+            letzter = ImmichError(_error_text(status, payload), status)
+        if letzter is not None:
+            self.letzter_vorschaufehler = str(letzter)
         return None
 
     def download_original(self, asset_id: str) -> bytes | None:
