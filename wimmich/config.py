@@ -93,6 +93,13 @@ class Config:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
+        # In dieser Datei steht der Immich-Schlüssel im Klartext - sie geht
+        # niemanden sonst etwas an. Auf Windows läuft das ins Leere (dort
+        # gelten ACLs), schadet aber nicht.
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
         tmp.replace(CONFIG_PATH)
 
     def __getitem__(self, key: str):

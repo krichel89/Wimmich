@@ -20,9 +20,9 @@ from PyQt6.QtGui import (
     QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QListView, QMainWindow, QMenu, QMessageBox, QPushButton, QSplitter,
-    QStackedWidget, QStatusBar,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
+    QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
+    QProgressBar, QPushButton, QSplitter, QStackedWidget, QStatusBar,
     QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -378,6 +378,16 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
+
+        # Fortschrittsbalken fuer den Immich-Abgleich - sonst gibt es bei
+        # groesseren Bibliotheken lange keine sichtbare Regung.
+        self.sync_progress_bar = QProgressBar()
+        self.sync_progress_bar.setFixedWidth(160)
+        self.sync_progress_bar.setFixedHeight(14)
+        self.sync_progress_bar.setTextVisible(False)
+        self.sync_progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self.sync_progress_bar)
+
         self.status_label = QLabel("")
         self.statusBar().addPermanentWidget(self.status_label)
 
@@ -539,7 +549,14 @@ class MainWindow(QMainWindow):
             self._add_children(item, data[1])
 
     def _expand_all_folders(self) -> None:
-        """Klappt den ganzen Ordnerbaum auf - laedt fehlende Ebenen nach."""
+        """Klappt den ganzen Ordnerbaum auf - laedt fehlende Ebenen nach.
+
+        Bei tiefen Baeumen auf langsamen Laufwerken (Netzwerkfreigabe,
+        externe Platte) kostet das spuerbar Zeit, weil jede noch nicht
+        geladene Ebene einmal von der Platte gelesen wird. Gemessen auf
+        lokaler Platte: 44 ms fuer 590 Ordner. Sanduhr deshalb als
+        Rueckmeldung, damit es nicht wie ein Haenger wirkt.
+        """
         def rekursiv(item: QTreeWidgetItem) -> None:
             data = item.data(0, Qt.ItemDataRole.UserRole)
             if data and data[0] == "folder" and item.childCount() == 1 \
@@ -550,8 +567,12 @@ class MainWindow(QMainWindow):
             for i in range(item.childCount()):
                 rekursiv(item.child(i))
 
-        rekursiv(self._folders_root)
-        self._folders_root.setExpanded(True)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rekursiv(self._folders_root)
+            self._folders_root.setExpanded(True)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _collapse_all_folders(self) -> None:
         def rekursiv(item: QTreeWidgetItem) -> None:
@@ -1817,7 +1838,6 @@ class MainWindow(QMainWindow):
         lesen theme.XXX erst beim naechsten Zeichnen neu ein - deshalb
         zusaetzlich gezielt neu zeichnen lassen.
         """
-        from PyQt6.QtWidgets import QApplication
         stylesheet = theme.set_theme(name)
         app = QApplication.instance()
         if app is not None:
@@ -1918,10 +1938,20 @@ class MainWindow(QMainWindow):
 
         self._sync_thread = thread
         self._sync_worker = worker
+        self.sync_progress_bar.setRange(0, 0)   # unbestimmt, bis der erste Wert kommt
+        self.sync_progress_bar.setValue(0)
+        self.sync_progress_bar.setVisible(True)
         self.statusBar().showMessage("Abgleich mit Immich läuft …")
 
     def _sync_progress(self, message: str, done: int, total: int) -> None:
         self.statusBar().showMessage(message)
+        if total > 0:
+            self.sync_progress_bar.setRange(0, total)
+            self.sync_progress_bar.setValue(min(done, total))
+        else:
+            # Kein Gesamtwert bekannt (z. B. beim Verbinden oder zwischen
+            # Alben/Personen) - unbestimmter Balken statt eingefrorener Wert.
+            self.sync_progress_bar.setRange(0, 0)
 
     def _sync_finished(self, result) -> None:
         self._teardown_sync()
@@ -1963,6 +1993,7 @@ class MainWindow(QMainWindow):
             self._sync_thread.wait(5000)
         self._sync_thread = None
         self._sync_worker = None
+        self.sync_progress_bar.setVisible(False)
 
     def _show_diagnose(self) -> None:
         """Sagt, woran es hängt, statt raten zu lassen.

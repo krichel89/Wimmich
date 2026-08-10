@@ -18,13 +18,12 @@ RADIUS = 8
 
 # Schrift insgesamt 20% groesser als der urspruengliche Ausgangswert (13px)
 FONT_SIZE = 16
-FONT_SIZE_SMALL = 14      # Hinweistexte, Kachel-Bildunterschrift (vorher 12/11px)
 
 _DARK = dict(
     BG="#141417", PANEL="#1b1b20", ELEVATED="#23232a", HOVER="#2c2c35",
     BORDER="#2e2e37", TEXT="#e6e6ea", TEXT_MUTED="#8e8e9c",
     ACCENT="#6f8cf5", ACCENT_DIM="#3d4a80", STAR="#f0b429",
-    BADGE_BG="#000000", TILE_BG="#000000", VIEWER_BG="#0d0d10",
+    VIEWER_BG="#0d0d10",
     SCROLLBAR="#55555f", SCROLLBAR_HOVER="#7a7a86",
 )
 
@@ -32,7 +31,7 @@ _LIGHT = dict(
     BG="#f4f4f6", PANEL="#ffffff", ELEVATED="#ffffff", HOVER="#e9e9ee",
     BORDER="#d6d6dc", TEXT="#1c1c22", TEXT_MUTED="#6b6b76",
     ACCENT="#3d5fd0", ACCENT_DIM="#c4d0f7", STAR="#b8790a",
-    BADGE_BG="#000000", TILE_BG="#e2e2e6", VIEWER_BG="#e7e7eb",
+    VIEWER_BG="#e7e7eb",
     SCROLLBAR="#b9b9c2", SCROLLBAR_HOVER="#8f8f9c",
 )
 
@@ -271,5 +270,38 @@ def set_theme(name: str) -> str:
     return STYLESHEET
 
 
+def check_palettes() -> list[str]:
+    """Prueft beide Paletten auf Vollstaendigkeit. Liefert die Maengelliste.
+
+    Weil die Farbnamen erst zur Laufzeit ueber _apply() entstehen, kann
+    kein Pruefwerkzeug einen Tippfehler im Stylesheet-Bauplan finden -
+    er faellt sonst erst beim Themenwechsel als NameError auf. Diese
+    Pruefung schliesst die Luecke und laeuft beim Import mit.
+    """
+    import re
+
+    maengel = []
+    if set(_DARK) != set(_LIGHT):
+        fehlt_hell = set(_DARK) - set(_LIGHT)
+        fehlt_dunkel = set(_LIGHT) - set(_DARK)
+        if fehlt_hell:
+            maengel.append(f"in der hellen Palette fehlen: {sorted(fehlt_hell)}")
+        if fehlt_dunkel:
+            maengel.append(f"in der dunklen Palette fehlen: {sorted(fehlt_dunkel)}")
+
+    verwendet = set(re.findall(r"\{([A-Z][A-Z_]*)\}", _BAUPLAN_QUELLE))
+    eigene = {"RADIUS", "FONT_SIZE"}
+    unbekannt = verwendet - set(_DARK) - eigene
+    if unbekannt:
+        maengel.append(f"im Stylesheet ohne Palettenwert: {sorted(unbekannt)}")
+    return maengel
+
+
 # Einmal beim Import mit der Vorgabe (dunkel) fuellen
+import inspect as _inspect
+_BAUPLAN_QUELLE = _inspect.getsource(_build_stylesheet)
+_MAENGEL = check_palettes()
+if _MAENGEL:                      # nur bei echtem Fehler, nie im Normalbetrieb
+    raise RuntimeError("theme.py unvollstaendig: " + "; ".join(_MAENGEL))
+
 STYLESHEET = set_theme("dunkel")

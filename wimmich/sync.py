@@ -17,6 +17,7 @@ Immich ist der Spiegel, nicht die Quelle.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
@@ -26,6 +27,7 @@ from .db import Database
 from .immich import ImmichClient, ImmichError, SyncResult, file_checksum
 
 CHECK_BATCH = 100        # so viele Prüfsummen je Anfrage
+PROGRESS_INTERVAL = 0.3  # Sekunden zwischen zwei Fortschrittsmeldungen
 
 
 class SyncWorker(QObject):
@@ -45,9 +47,25 @@ class SyncWorker(QObject):
         self._fetch_people = fetch_people
         self._cancel = False
         self._db: Database | None = None
+        self._last_progress = 0.0
 
     def cancel(self) -> None:
         self._cancel = True
+
+    def _report(self, message: str, done: int, total: int,
+               force: bool = False) -> None:
+        """Fortschritt melden, aber zeitlich gedrosselt.
+
+        Ohne Drosselung würde ein schneller Abgleich (Prüfsummen aus dem
+        Plattencache, kein Hochladen nötig) die Ereignisschleife mit
+        Signalen fluten. force=True für den letzten Schritt, damit der
+        Balken nie auf einem Zwischenstand stehen bleibt.
+        """
+        now = time.monotonic()
+        if not force and (now - self._last_progress) < PROGRESS_INTERVAL:
+            return
+        self._last_progress = now
+        self.progress.emit(message, done, total)
 
     @pyqtSlot()
     def run(self) -> None:
@@ -55,9 +73,9 @@ class SyncWorker(QObject):
         try:
             client = ImmichClient(self._base_url, self._api_key)
             info = client.connect()
-            self.progress.emit(
+            self._report(
                 f"Verbunden mit Immich {info.version or '?'}"
-                + (f" als {info.user}" if info.user else ""), 0, 0)
+                + (f" als {info.user}" if info.user else ""), 0, 0, force=True)
 
             self._db = Database(DB_PATH)
             self._match_and_upload(client, result)
@@ -82,8 +100,9 @@ class SyncWorker(QObject):
         total, synced = self._db.sync_counts()
         offen = total - synced
         if not offen:
-            self.progress.emit("Alle Bilder sind bereits zugeordnet", 0, 0)
+            self._report("Alle Bilder sind bereits zugeordnet", 0, 0, force=True)
             return
+        self._report(f"Abgeglichen: 0 von {offen}", 0, offen, force=True)
 
         done = 0
         while not self._cancel:
@@ -132,12 +151,10 @@ class SyncWorker(QObject):
                     self._db.set_immich(int(key), "", row["checksum"])
 
                 done += 1
-                if done % 10 == 0:
-                    self.progress.emit(
-                        f"Abgeglichen: {done} von {offen}", done, offen)
+                self._report(f"Abgeglichen: {done} von {offen}", done, offen)
             self._db.commit()
 
-        self.progress.emit(f"Bilder fertig: {done} von {offen}", done, offen)
+        self._report(f"Bilder fertig: {done} von {offen}", done, offen, force=True)
 
     def _upload_one(self, client: ImmichClient, photo_id: int, row: dict,
                     result: SyncResult) -> None:
@@ -169,7 +186,7 @@ class SyncWorker(QObject):
     def _sync_albums(self, client: ImmichClient) -> None:
         albums = client.albums()
         self._db.replace_albums(albums)
-        self.progress.emit(f"{len(albums)} Alben geholt", 0, 0)
+        self._report(f"{len(albums)} Alben geholt", 0, len(albums), force=True)
 
         for index, album in enumerate(albums, start=1):
             if self._cancel:
@@ -181,14 +198,14 @@ class SyncWorker(QObject):
             self._db.set_album_assets(
                 album.id, [a["id"] for a in assets if a.get("id")]
             )
-            if index % 5 == 0:
-                self.progress.emit(
-                    f"Alben: {index} von {len(albums)}", index, len(albums))
+            self._report(f"Alben: {index} von {len(albums)}", index, len(albums))
+        self._report(f"Alben fertig: {len(albums)} von {len(albums)}",
+                     len(albums), len(albums), force=True)
 
     def _sync_people(self, client: ImmichClient) -> None:
         people = client.people()
         self._db.replace_people(people)
-        self.progress.emit(f"{len(people)} Personen geholt", 0, 0)
+        self._report(f"{len(people)} Personen geholt", 0, len(people), force=True)
 
         for index, person in enumerate(people, start=1):
             if self._cancel:
@@ -200,6 +217,6 @@ class SyncWorker(QObject):
             self._db.set_person_assets(
                 person.id, [a["id"] for a in assets if a.get("id")]
             )
-            if index % 5 == 0:
-                self.progress.emit(
-                    f"Personen: {index} von {len(people)}", index, len(people))
+            self._report(f"Personen: {index} von {len(people)}", index, len(people))
+        self._report(f"Personen fertig: {len(people)} von {len(people)}",
+                     len(people), len(people), force=True)
