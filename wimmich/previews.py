@@ -43,6 +43,93 @@ except ImportError:  # pragma: no cover
 SCREEN_EDGE = 2560          # längste Kante der Bildschirm-Ebene
 
 
+# -- Qt-Bildformate ----------------------------------------------------
+#
+# Qt liest JPEG NICHT selbst, sondern über ein nachladbares Modul
+# (imageformats/qjpeg). Fehlt es im gebauten Programm oder laesst es
+# sich nicht laden, liefert QImage.load() still ein leeres Bild: keine
+# Ausnahme, kein Logeintrag, nur graue Kacheln. Genau darauf darf sich
+# Wimmich nicht verlassen - Pillow ist ohnehin dabei und kann JPEG.
+
+def qt_formate() -> list[str]:
+    """Bildformate, die Qt in DIESER Installation lesen kann."""
+    try:
+        from PyQt6.QtGui import QImageReader
+        return sorted({bytes(f).decode("ascii", "replace").lower()
+                       for f in QImageReader.supportedImageFormats()})
+    except Exception:
+        return []
+
+
+def qt_kann_jpeg() -> bool:
+    return "jpeg" in qt_formate() or "jpg" in qt_formate()
+
+
+def _qimage_von_pillow(quelle) -> QImage | None:
+    """Notweg: mit Pillow dekodieren und als QImage zurueckgeben.
+
+    `quelle` ist ein Pfad oder JPEG-Bytes. Die Ausrichtung wird hier
+    NICHT angewandt - darum kuemmert sich decode() weiter unten, sonst
+    wuerde zweimal gedreht.
+    """
+    if not HAVE_PIL:
+        return None
+    try:
+        if isinstance(quelle, (bytes, bytearray, memoryview)):
+            bild = Image.open(io.BytesIO(bytes(quelle)))
+        else:
+            bild = Image.open(str(quelle))
+        bild.load()
+        if bild.mode != "RGB":
+            bild = bild.convert("RGB")
+        nutzlast = bild.tobytes()
+        breite, hoehe = bild.size
+        bild.close()
+        # .copy(), weil QImage den Puffer sonst nur ausleiht und er
+        # nach dieser Funktion nicht mehr existiert.
+        return QImage(nutzlast, breite, hoehe, breite * 3,
+                      QImage.Format.Format_RGB888).copy()
+    except Exception:
+        return None
+
+
+def lade_qimage(pfad: str) -> QImage:
+    """Bilddatei als QImage, mit Pillow als Notweg."""
+    image = QImage()
+    image.load(pfad)
+    if image.isNull():
+        ersatz = _qimage_von_pillow(pfad)
+        if ersatz is not None:
+            return ersatz
+    return image
+
+
+def lade_qimage_aus_bytes(daten: bytes) -> QImage:
+    """Bilddaten als QImage, mit Pillow als Notweg."""
+    image = QImage()
+    if daten:
+        image.loadFromData(daten)
+        if image.isNull():
+            ersatz = _qimage_von_pillow(daten)
+            if ersatz is not None:
+                return ersatz
+    return image
+
+
+def pixmap_aus_datei(pfad: str):
+    """QPixmap aus einer Bilddatei, mit Pillow als Notweg.
+
+    Nur im GUI-Faden aufrufen - QPixmap gehoert dorthin.
+    """
+    from PyQt6.QtGui import QPixmap
+    pixmap = QPixmap(str(pfad))
+    if pixmap.isNull():
+        ersatz = _qimage_von_pillow(pfad)
+        if ersatz is not None and not ersatz.isNull():
+            return QPixmap.fromImage(ersatz)
+    return pixmap
+
+
 # -- Orientierung ------------------------------------------------------
 
 _orientation: dict[str, int] = {}
@@ -133,7 +220,7 @@ def decode(path: str, max_edge: int | None = None) -> QImage | None:
     if is_raw(path):
         data = _embedded_bytes(path)
         if data:
-            image.loadFromData(data)
+            image = lade_qimage_aus_bytes(data)
         if image.isNull():
             image = _develop_raw(path)
             if image is None or image.isNull():
@@ -141,7 +228,7 @@ def decode(path: str, max_edge: int | None = None) -> QImage | None:
             # Entwickelte Bilder stehen schon aufrecht
             return _scaled(image, max_edge)
     else:
-        image.load(path)
+        image = lade_qimage(path)
 
     if image.isNull():
         return None

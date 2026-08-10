@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
-               retouch, theme, thumbs)
+               previews, retouch, theme, thumbs)
 from .config import Config, DB_PATH, ensure_dirs, find_exiftool
 from .db import Database
 from .exif import ExifTool, ExifToolError
@@ -1129,9 +1129,7 @@ class MainWindow(QMainWindow):
         except Exception:
             daten = None
 
-        bild = QImage()
-        if daten:
-            bild.loadFromData(daten)
+        bild = previews.lade_qimage_aus_bytes(daten)
         if bild.isNull():
             self.canvas.clear_image()
             self.canvas.set_info_overlay("Vorschau vom Server nicht verfügbar")
@@ -2319,6 +2317,14 @@ class MainWindow(QMainWindow):
         zeile("OpenCV", "vorhanden" if _r.HAVE_CV2 else "nicht vorhanden",
               "nur für die Rissreparatur")
 
+        # Qt liest JPEG über ein nachladbares Modul. Fehlt es, bleiben
+        # ALLE Kacheln leer, ohne dass irgendwo ein Fehler auftaucht.
+        formate = previews.qt_formate()
+        zeile("Qt-Bildformate",
+              ", ".join(formate) if formate else "KEINE",
+              "" if previews.qt_kann_jpeg() else
+              "Qt kann kein JPEG - Wimmich weicht auf Pillow aus")
+
         gesamt, offen = self.db.counts()
         zeile("Bilder im Index", f"{gesamt}")
         zeile("ohne Metadaten", f"{offen}",
@@ -2339,10 +2345,15 @@ class MainWindow(QMainWindow):
             t = time.perf_counter()
             bild = previews.decode(pfad, 1200)
             dekodieren = (time.perf_counter() - t) * 1000
+            geglueckt = bild is not None and not bild.isNull()
             zeitmessung = (f"Metadaten {lesen:.0f} ms, "
-                           f"Vorschau {dekodieren:.0f} ms"
-                           + ("" if bild is not None and not bild.isNull()
-                              else " (Vorschau FEHLGESCHLAGEN)"))
+                           f"Vorschau {dekodieren:.0f} ms")
+            if not geglueckt:
+                # Nicht nur MELDEN, dass es scheitert - sagen, WARUM.
+                zeitmessung += " (FEHLGESCHLAGEN: " + _vorschau_grund(pfad) + ")"
+            zeilen.append(
+                f"<tr><td>Datei</td><td colspan='2' style='color:#8e8e9c'>"
+                f"{_html_escape(pfad)}</td></tr>")
         zeile("erste Datei der Ansicht", zeitmessung)
 
         zeilen.append("</table>")
@@ -2430,6 +2441,42 @@ def _remote_zeile(row) -> dict:
         "is_raw": 0,
         "filesize": 0,
     }
+
+
+def _vorschau_grund(pfad: str) -> str:
+    """Sagt, WARUM eine Vorschau nicht zustande kommt.
+
+    Die vier moeglichen Ursachen liegen weit auseinander und verlangen
+    ganz verschiedene Gegenmassnahmen: Datei weg, Datei nicht lesbar,
+    Qt hat keinen Dekoder, oder der Dekoder scheitert am Inhalt.
+    """
+    from pathlib import Path as _Pfad
+    from PyQt6.QtGui import QImageReader
+
+    try:
+        datei = _Pfad(pfad)
+        if not datei.exists():
+            return "Datei nicht gefunden (Laufwerk weg? Ordner verschoben?)"
+        if datei.stat().st_size == 0:
+            return "Datei ist 0 Bytes gross"
+        with open(pfad, "rb") as f:
+            f.read(16)
+    except OSError as fehler:
+        return f"Datei nicht lesbar: {fehler}"
+
+    leser = QImageReader(pfad)
+    leser.setDecideFormatFromContent(True)
+    erkannt = bytes(leser.format()).decode("ascii", "replace") or "unbekannt"
+    if not leser.canRead():
+        return (f"Qt hat keinen Dekoder (erkanntes Format: {erkannt}; "
+                f"{leser.errorString() or 'ohne naehere Angabe'})")
+    if leser.read().isNull():
+        return f"Qt-Dekoder bricht ab: {leser.errorString() or 'ohne Angabe'}"
+
+    from . import previews as _p
+    if _p._qimage_von_pillow(pfad) is None:
+        return "Qt liest die Datei, Pillow nicht - Inhalt beschaedigt?"
+    return "Qt liest die Datei - der Fehler liegt hinter dem Dekodieren"
 
 
 def _html_escape(text: str) -> str:

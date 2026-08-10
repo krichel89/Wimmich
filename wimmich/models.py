@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QStyle, QStyledItemDelegate
 
 import time
 
-from . import marks, remote_thumbs, theme, thumbs
+from . import marks, previews, remote_thumbs, theme, thumbs
 
 REMOTE_PAUSE = 5.0     # Sekunden Ruhe, bevor eine Serverkachel neu versucht wird
 
@@ -314,7 +314,7 @@ class PhotoModel(QAbstractListModel):
         return self._placeholder
 
     def _thumb_ready(self, row: int, cache_file: str) -> None:
-        self._pixmaps[row] = QPixmap(cache_file)
+        self._pixmaps[row] = previews.pixmap_aus_datei(cache_file)
         self._touch(row)
 
     def _thumb_failed(self, row: int) -> None:

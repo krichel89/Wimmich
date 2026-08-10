@@ -175,6 +175,18 @@ jobs:
           Write-Host "exiftool im Paket: $($bundled.FullName)"
           & $bundled.FullName -ver
 
+          # Qt liest JPEG über ein nachladbares Modul. Fehlt qjpeg.dll,
+          # bleiben ALLE Kacheln leer - ohne Fehlermeldung, ohne
+          # Logeintrag. Seit 0.3.26 weicht Wimmich auf Pillow aus, aber
+          # der schnelle Weg soll trotzdem im Paket sein.
+          $jpeg = Get-ChildItem dist/Wimmich -Recurse -Filter "qjpeg.dll" |
+                  Select-Object -First 1
+          if ($null -eq $jpeg) {
+            Write-Host "WARNUNG: qjpeg.dll fehlt im Paket - Vorschauen laufen über den Pillow-Notweg"
+          } else {
+            Write-Host "Qt-JPEG-Modul im Paket: $($jpeg.FullName)"
+          }
+
           $groesse = [math]::Round((Get-ChildItem dist/Wimmich -Recurse |
                      Measure-Object -Property Length -Sum).Sum / 1MB, 1)
           Write-Host "Paketgroesse: $groesse MB"
