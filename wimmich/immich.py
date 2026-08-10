@@ -382,7 +382,52 @@ class ImmichClient:
             extra_headers=headers,
         )
 
+    # -- Bilder, die (nur) auf dem Server liegen ------------------------
+
+    def list_assets(self, seite: int = 1, groesse: int = 250) -> tuple[list[dict], bool]:
+        """Eine Seite aller Server-Bilder. Ergebnis: (Eintraege, gibt_es_mehr).
+
+        Laeuft ueber POST /search/metadata - denselben Weg, den Wimmich
+        schon fuer die Bilder einer Person benutzt. Ein reines
+        GET /assets gibt es in neueren Immich-Fassungen nicht mehr.
+        """
+        data = self._json(
+            "POST", self._path("/search/metadata", "/search/metadata"),
+            body={"page": seite, "size": groesse, "withExif": True},
+        ) or {}
+        eintraege = (data.get("assets") or {})
+        elemente = eintraege.get("items") or []
+        weiter = bool(eintraege.get("nextPage"))
+        return elemente, weiter
+
+    def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:
+        """Vorschaubild vom Server. Keine Ausnahme bei Misserfolg."""
+        groesse = "preview" if gross else "thumbnail"
+        for pfad, abfrage in (
+            (f"/assets/{asset_id}/thumbnail", {"size": groesse}),
+            (f"/asset/thumbnail/{asset_id}", {"format": "JPEG"}),
+        ):
+            try:
+                status, payload = self._request("GET", pfad, query=abfrage)
+            except ImmichError:
+                return None
+            if status < 400 and payload:
+                return payload
+        return None
+
+    def download_original(self, asset_id: str) -> bytes | None:
+        """Originaldatei vom Server holen - nur auf ausdruecklichen Wunsch."""
+        for pfad in (f"/assets/{asset_id}/original", f"/asset/file/{asset_id}"):
+            try:
+                status, payload = self._request("GET", pfad)
+            except ImmichError:
+                return None
+            if status < 400 and payload:
+                return payload
+        return None
+
     # -- Alben ---------------------------------------------------------
+
 
     def albums(self) -> list[Album]:
         data = self._json("GET", self._path("/albums", "/album")) or []

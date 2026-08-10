@@ -16,7 +16,7 @@ from pathlib import Path
 from .config import DB_PATH, CONFIG_DIR
 from .marks import REJECT, clamp_rating
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -62,6 +62,18 @@ CREATE INDEX IF NOT EXISTS idx_photos_immich   ON photos(immich_id);
 
 -- Alben und Personen kommen vom Server und sind hier nur gespiegelt.
 -- Sie dürfen jederzeit gelöscht und neu geholt werden.
+CREATE TABLE IF NOT EXISTS remote_assets (
+    immich_id   TEXT PRIMARY KEY,
+    filename    TEXT,
+    taken_at    TEXT,
+    checksum    TEXT,
+    kind        TEXT,
+    width       INTEGER,
+    height      INTEGER,
+    seen        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_remote_taken ON remote_assets(taken_at);
+
 CREATE TABLE IF NOT EXISTS albums (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -190,6 +202,12 @@ class Database:
             conn.execute("ALTER TABLE photos ADD COLUMN focal_length REAL")
         if "exposure_time" not in columns:
             conn.execute("ALTER TABLE photos ADD COLUMN exposure_time TEXT")
+        # Schema 9: Bilder, die (noch) nur auf dem Server liegen
+        conn.execute("""CREATE TABLE IF NOT EXISTS remote_assets (
+            immich_id TEXT PRIMARY KEY, filename TEXT, taken_at TEXT,
+            checksum TEXT, kind TEXT, width INTEGER, height INTEGER, seen REAL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_remote_taken "
+                     "ON remote_assets(taken_at)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_immich ON photos(immich_id)"
         )
@@ -599,6 +617,77 @@ class Database:
             [(person_id, i) for i in immich_ids],
         )
         conn.commit()
+
+
+    # -- Bilder, die nur auf dem Server liegen --------------------------
+
+    def upsert_remote(self, eintraege: list[dict], jetzt: float) -> int:
+        """Server-Bilder in den Spiegel schreiben. Ergebnis: Anzahl."""
+        if not eintraege:
+            return 0
+        self.conn.executemany(
+            """INSERT INTO remote_assets
+                   (immich_id, filename, taken_at, checksum, kind,
+                    width, height, seen)
+               VALUES (:immich_id, :filename, :taken_at, :checksum, :kind,
+                       :width, :height, :seen)
+               ON CONFLICT(immich_id) DO UPDATE SET
+                   filename=excluded.filename, taken_at=excluded.taken_at,
+                   checksum=excluded.checksum, kind=excluded.kind,
+                   width=excluded.width, height=excluded.height,
+                   seen=excluded.seen""",
+            [dict(e, seen=jetzt) for e in eintraege],
+        )
+        return len(eintraege)
+
+    def prune_remote(self, aelter_als: float) -> int:
+        """Was der Server nicht mehr kennt, fliegt aus dem Spiegel."""
+        cur = self.conn.execute(
+            "DELETE FROM remote_assets WHERE seen IS NULL OR seen < ?",
+            (aelter_als,))
+        return cur.rowcount or 0
+
+    def remote_only(self, order: str = "taken_at", desc: bool = True,
+                    limit: int = 0) -> list[sqlite3.Row]:
+        """Server-Bilder, zu denen es KEINE lokale Datei gibt.
+
+        Bilder, die schon lokal liegen, werden ueber immich_id
+        ausgeschlossen - sie erscheinen ja bereits als richtige Kachel.
+        """
+        richtung = "DESC" if desc else "ASC"
+        spalte = "taken_at" if order == "taken_at" else "filename"
+        grenze = f" LIMIT {int(limit)}" if limit else ""
+        return self.conn.execute(
+            f"""SELECT * FROM remote_assets r
+                WHERE NOT EXISTS (SELECT 1 FROM photos p
+                                  WHERE p.immich_id = r.immich_id
+                                    AND p.immich_id <> '')
+                ORDER BY {spalte} {richtung}{grenze}"""
+        ).fetchall()
+
+    def remote_count(self) -> int:
+        row = self.conn.execute(
+            """SELECT COUNT(*) FROM remote_assets r
+               WHERE NOT EXISTS (SELECT 1 FROM photos p
+                                 WHERE p.immich_id = r.immich_id
+                                   AND p.immich_id <> '')"""
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def remote_by_link(self, table: str, key_column: str, key: str) -> list[sqlite3.Row]:
+        """Server-Bilder eines Albums oder einer Person ohne lokale Datei."""
+        if table not in ("album_assets", "person_assets"):
+            raise ValueError("unbekannte Tabelle")
+        return self.conn.execute(
+            f"""SELECT r.* FROM remote_assets r
+                WHERE r.immich_id IN (SELECT immich_id FROM {table}
+                                      WHERE {key_column} = ?)
+                  AND NOT EXISTS (SELECT 1 FROM photos p
+                                  WHERE p.immich_id = r.immich_id
+                                    AND p.immich_id <> '')
+                ORDER BY r.taken_at DESC""",
+            (key,),
+        ).fetchall()
 
     def albums(self) -> list[sqlite3.Row]:
         return self.conn.execute(

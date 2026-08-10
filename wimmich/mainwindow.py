@@ -16,8 +16,8 @@ from PyQt6.QtCore import (
     QEvent, QFileSystemWatcher, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QIcon, QKeySequence, QPainter, QPainterPath,
-    QPixmap, QShortcut,
+    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter,
+    QPainterPath, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
@@ -30,12 +30,14 @@ from . import APP_NAME, __version__, marks, retouch, theme, thumbs
 from .config import Config, DB_PATH, ensure_dirs, find_exiftool
 from .db import Database
 from .exif import ExifTool, ExifToolError
-from .models import PhotoDelegate, PhotoModel, ROLE_ID, ROLE_PATH
+from .immich import ImmichClient, ImmichError
+from .models import PhotoDelegate, PhotoModel, ROLE_ID, ROLE_PATH, ROLE_REMOTE
 from .previews import PreviewLoader
 from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
 from .filterbar import FilterBar
 from .icon import app_icon
+from . import remote_thumbs
 from .edits import (
     CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
     array_to_qimage, downscale, qimage_to_array,
@@ -186,6 +188,7 @@ class MainWindow(QMainWindow):
         self.grid.setFocus()
         self._apply_watch_settings()
         self._apply_sync_settings()
+        self._apply_remote_client()
 
         if not self.config.libraries:
             QTimer.singleShot(300, self._first_run_hint)
@@ -476,6 +479,13 @@ class MainWindow(QMainWindow):
             0, "Alle Ordner untereinander, wie in Picasa")
         self.tree.addTopLevelItem(self._all_item)
 
+        self._remote_item = QTreeWidgetItem(["Nur auf dem Server"])
+        self._remote_item.setData(0, Qt.ItemDataRole.UserRole, ("remote", ""))
+        self._remote_item.setToolTip(
+            0, "Bilder, die auf Immich liegen, aber nicht in deinen Ordnern.\n"
+               "Vorschau kommt vom Server; das Original wird nur auf Wunsch geholt.")
+        self.tree.addTopLevelItem(self._remote_item)
+
         self._folders_root = QTreeWidgetItem(["Ordner"])
         self._folders_root.setData(0, Qt.ItemDataRole.UserRole, None)
         self.tree.addTopLevelItem(self._folders_root)
@@ -695,7 +705,11 @@ class MainWindow(QMainWindow):
             rows = []
         else:
             kind, key = self._selection
-            if kind == "all":
+            if kind == "remote":
+                rows = [_remote_zeile(r) for r in self.db.remote_only(
+                    order=self.sort_box.currentData(),
+                    desc=self.sort_desc_button.isChecked())]
+            elif kind == "all":
                 rows = []          # wird weiter unten als Cursor geholt
             elif kind == "folder":
                 rows = self.db.photos_in_folder(
@@ -707,11 +721,17 @@ class MainWindow(QMainWindow):
                     "album_assets", "album_id", key,
                     order=self.sort_box.currentData(), **richtung, **common,
                 )
+                rows = list(rows) + [
+                    _remote_zeile(r) for r in
+                    self.db.remote_by_link("album_assets", "album_id", key)]
             else:
                 rows = self.db.photos_by_immich(
                     "person_assets", "person_id", key,
                     order=self.sort_box.currentData(), **richtung, **common,
                 )
+                rows = list(rows) + [
+                    _remote_zeile(r) for r in
+                    self.db.remote_by_link("person_assets", "person_id", key)]
 
         # „Alle Fotos" läuft endlos durch: die Zeilen werden stückweise
         # nachgeholt, wenn die Ansicht sie braucht. Gruppiert wird nach
@@ -774,6 +794,63 @@ class MainWindow(QMainWindow):
             parts.append("Immich nicht eingerichtet")
         self.status_label.setText("  |  ".join(parts))
 
+    def _download_remote(self, rows: list[int]) -> None:
+        """Originale vom Server holen - nur auf ausdruecklichen Wunsch.
+
+        Die Dateien landen in einem Ordner, den Harald waehlt. Wimmich
+        legt sie NUR ab; eingelesen werden sie erst beim naechsten
+        Durchlauf, wenn der Ordner zur Bibliothek gehoert.
+        """
+        if not rows:
+            return
+        ziel = QFileDialog.getExistingDirectory(
+            self, "Wohin sollen die Originale?",
+            self.config.libraries[0] if self.config.libraries else "")
+        if not ziel:
+            return
+
+        client = ImmichClient(self.config["immich_url"], self.config["immich_key"])
+        try:
+            client.connect()
+        except ImmichError as exc:
+            QMessageBox.critical(self, "Immich nicht erreichbar", str(exc))
+            return
+
+        geholt, fehler = 0, []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for nummer, row in enumerate(rows, start=1):
+                item = self.model.row_data(row) or {}
+                if not item.get("_remote"):
+                    continue
+                self.statusBar().showMessage(
+                    f"Lade herunter: {item['filename']} ({nummer} von {len(rows)})")
+                QApplication.processEvents()
+                try:
+                    daten = client.download_original(item["immich_id"])
+                except ImmichError as exc:
+                    fehler.append(f"{item['filename']}: {exc}")
+                    continue
+                if not daten:
+                    fehler.append(f"{item['filename']}: nichts erhalten")
+                    continue
+                pfad = _freier_name(Path(ziel) / item["filename"])
+                try:
+                    pfad.write_bytes(daten)
+                    geholt += 1
+                except OSError as exc:
+                    fehler.append(f"{item['filename']}: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.statusBar().showMessage(
+            f"{geholt} Original(e) nach {ziel} geholt"
+            + (f", {len(fehler)} fehlgeschlagen" if fehler else ""), 8000)
+        if fehler:
+            QMessageBox.warning(
+                self, "Nicht alles geholt",
+                "\n".join(fehler[:10]) + ("\n…" if len(fehler) > 10 else ""))
+
     def _grid_menu(self, position) -> None:
         """Rechtsklick auf eine Kachel.
 
@@ -786,6 +863,18 @@ class MainWindow(QMainWindow):
         rows = sorted({idx.row() for idx in self.grid.selectedIndexes()})
         if not rows:
             return
+
+        nur_server = [r for r in rows
+                      if (self.model.row_data(r) or {}).get("_remote")]
+        if nur_server and len(nur_server) == len(rows):
+            # Reine Serverbilder: Bewerten und Bearbeiten geht nicht,
+            # dafuer gibt es hier das Herunterladen.
+            menu = QMenu(self)
+            menu.addAction(f"{len(rows)} Original(e) herunterladen …",
+                           lambda: self._download_remote(nur_server))
+            menu.exec(self.grid.viewport().mapToGlobal(position))
+            return
+
         menu = self._build_grid_menu(len(rows))
         menu.exec(self.grid.viewport().mapToGlobal(position))
 
@@ -827,9 +916,15 @@ class MainWindow(QMainWindow):
         failed: list[str] = []
         files = 0
 
+        uebergangen = 0
         for row in rows:
             item = self.model.row_data(row)
             if item is None:
+                continue
+            if item.get("_remote"):
+                # Kein lokales Gegenstueck - es gibt keine Datei und keinen
+                # Sidecar, in den die Bewertung geschrieben werden koennte.
+                uebergangen += 1
                 continue
 
             # Bei einem Stapel gilt die Bewertung für alle Dateien der
@@ -852,11 +947,19 @@ class MainWindow(QMainWindow):
                 + "\n".join(failed[:10]),
             )
 
+        if uebergangen and uebergangen == len(rows):
+            self.statusBar().showMessage(
+                "Nur auf dem Server: Bewertung braucht eine lokale Datei — "
+                "erst herunterladen (Rechtsklick)", 6000)
+            return
+
         extra = f" ({files} Dateien)" if files != len(rows) else ""
+        if uebergangen:
+            extra += f", {uebergangen} nur auf dem Server übergangen"
         wording = ("als abgelehnt markiert" if marks.is_reject(rating)
                    else f"mit {rating} Stern(en) bewertet")
         self.statusBar().showMessage(
-            f"{len(rows)} Aufnahme(n) {wording}{extra}", 4000
+            f"{len(rows) - uebergangen} Aufnahme(n) {wording}{extra}", 4000
         )
 
     def _label_selection(self, index: int | None) -> None:
@@ -946,14 +1049,58 @@ class MainWindow(QMainWindow):
         self._panel_hidden = not checked
         self.panel.setVisible(checked and self._chrome_visible and self.in_loupe)
 
+    def _load_remote_loupe(self, row: int, item: dict) -> None:
+        """Grossansicht eines Bildes, das nur auf dem Server liegt.
+
+        Gezeigt wird die groessere Server-Vorschau, NICHT das Original -
+        das holt Wimmich nur auf ausdruecklichen Wunsch. Bearbeiten ist
+        hier ausgeschaltet: es gibt keine Datei, in die etwas
+        zurueckgeschrieben werden koennte.
+        """
+        self._loupe_row = row
+        self._loupe_path = ""
+        self._want_full = False
+        self._show_before = False
+        self._stroke = []
+        self.panel.setEnabled(False)
+
+        daten = None
+        client = getattr(self.model, "_immich_client", None)
+        try:
+            daten = remote_thumbs.fetch(client, item["immich_id"], gross=True)
+        except Exception:
+            daten = None
+
+        bild = QImage()
+        if daten:
+            bild.loadFromData(daten)
+        if bild.isNull():
+            self.canvas.clear_image()
+            self.canvas.set_info_overlay("Vorschau vom Server nicht verfügbar")
+            self.canvas.show_info_overlay(True)
+        else:
+            self.canvas.set_image(bild)
+
+        self.loupe_title.setText(
+            f'<b>{_html_escape(item["filename"])}</b>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{theme.TEXT_MUTED}">'
+            f'nur auf dem Server — Vorschau, nicht das Original</span>')
+        self.setWindowTitle(
+            f"{APP_NAME} {__version__} — {item['filename']} (nur auf dem Server)")
+        self.canvas.set_overlay("Nur auf dem Server")
+
     def _load_loupe(self, row: int) -> None:
         item = self.model.row_data(row)
         if item is None:
+            return
+        if item.get("_remote"):
+            self._load_remote_loupe(row, item)
             return
         # Beim Stapel wird das JPEG gezeigt und bearbeitet - eine
         # RAW-Datei lässt sich nicht pixelweise verändern.
         self._loupe_row = row
         self._loupe_path = item.get("thumb_path") or item["path"]
+        self.panel.setEnabled(True)      # nach einem Serverbild wieder frei
         self._want_full = False
         self._show_before = False
         self._stroke = []
@@ -1850,6 +1997,25 @@ class MainWindow(QMainWindow):
         self.canvas.viewport().update()
         self.update()
 
+    def _apply_remote_client(self) -> None:
+        """Dem Rastermodell einen Client fuer Server-Vorschauen geben.
+
+        Ohne ihn blieben die Kacheln der reinen Serverbilder leer. Der
+        Client wird NUR fuer Vorschauen benutzt; Originale holt allein
+        _download_remote() auf ausdruecklichen Wunsch.
+        """
+        url, key = self.config["immich_url"], self.config["immich_key"]
+        if url and key:
+            client = ImmichClient(url, key)
+            try:
+                client.connect()
+            except ImmichError:
+                client = None       # spaeter erneut versuchen
+        else:
+            client = None
+        self.model._immich_client = client
+        self._remote_item.setHidden(client is None and not self.db.remote_count())
+
     def _apply_sync_settings(self) -> None:
         """Zeitgeber nach den Einstellungen an- oder abschalten."""
         auto = (bool(self.config["immich_auto"])
@@ -1973,6 +2139,7 @@ class MainWindow(QMainWindow):
             parts.append(f"{result.failed} fehlgeschlagen")
         self.statusBar().showMessage("Abgleich fertig: " + ", ".join(parts), 8000)
 
+        self._apply_remote_client()
         if result.errors and not self._sync_quiet:
             QMessageBox.warning(
                 self, "Abgleich mit Fehlern",
@@ -2112,6 +2279,44 @@ def _has_subfolders(path: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def _freier_name(pfad: Path) -> Path:
+    """Nie eine vorhandene Datei ueberschreiben - Wimmich loescht nichts."""
+    if not pfad.exists():
+        return pfad
+    stamm, endung = pfad.stem, pfad.suffix
+    nummer = 1
+    while True:
+        kandidat = pfad.with_name(f"{stamm} ({nummer}){endung}")
+        if not kandidat.exists():
+            return kandidat
+        nummer += 1
+
+
+def _remote_zeile(row) -> dict:
+    """Serverbild als Modellzeile.
+
+    Bekommt bewusst dieselben Schluessel wie eine lokale Zeile, damit
+    Raster und Lupe nichts Besonderes wissen muessen - erkennbar ist es
+    allein an _remote. path bleibt leer: es GIBT keine lokale Datei.
+    """
+    return {
+        "id": -1,
+        "_remote": True,
+        "immich_id": row["immich_id"],
+        "path": "",
+        "filename": row["filename"] or "(ohne Namen)",
+        "folder": "Nur auf dem Server",
+        "taken_at": row["taken_at"],
+        "width": row["width"],
+        "height": row["height"],
+        "rating": 0,
+        "label": None,
+        "stack_count": 1,
+        "is_raw": 0,
+        "filesize": 0,
+    }
 
 
 def _html_escape(text: str) -> str:

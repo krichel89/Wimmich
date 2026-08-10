@@ -40,13 +40,15 @@ class SyncWorker(QObject):
     failed = pyqtSignal(str)
 
     def __init__(self, base_url: str, api_key: str, upload: bool = True,
-                 fetch_albums: bool = True, fetch_people: bool = True) -> None:
+                 fetch_albums: bool = True, fetch_people: bool = True,
+                 fetch_remote: bool = True) -> None:
         super().__init__()
         self._base_url = base_url
         self._api_key = api_key
         self._upload = upload
         self._fetch_albums = fetch_albums
         self._fetch_people = fetch_people
+        self._fetch_remote = fetch_remote
         self._cancel = False
         self._db: Database | None = None
         self._last_progress = 0.0
@@ -92,6 +94,8 @@ class SyncWorker(QObject):
                 self._sync_albums(client)
             if not self._cancel and self._fetch_people:
                 self._sync_people(client)
+            if not self._cancel and self._fetch_remote:
+                self._sync_remote(client, result)
             self._db.commit()
             self._match_and_upload(client, result)
 
@@ -246,6 +250,38 @@ class SyncWorker(QObject):
             result.uploaded += 1
         return True
 
+    def _sync_remote(self, client: ImmichClient, result: SyncResult) -> None:
+        """Verzeichnis der Server-Bilder spiegeln.
+
+        Es werden NUR Angaben geholt, keine Bilddaten - Vorschauen kommen
+        erst, wenn eine Kachel sie wirklich braucht. Das Original holt
+        Wimmich ausschliesslich auf ausdruecklichen Wunsch.
+        """
+        jetzt = time.time()
+        seite, gesamt = 1, 0
+        while not self._cancel:
+            try:
+                elemente, weiter = client.list_assets(seite)
+            except ImmichError as exc:
+                result.errors.append(f"Serverbilder: {exc}")
+                return
+            if not elemente:
+                break
+            self._db.upsert_remote(
+                [_remote_eintrag(e) for e in elemente if e.get("id")], jetzt)
+            gesamt += len(elemente)
+            self._report(f"Serverbilder: {gesamt} gelesen", gesamt, 0)
+            self._db.commit()
+            if not weiter:
+                break
+            seite += 1
+
+        if not self._cancel:
+            entfernt = self._db.prune_remote(jetzt)
+            self._report(f"Serverbilder: {gesamt} bekannt"
+                         + (f", {entfernt} nicht mehr vorhanden" if entfernt else ""),
+                         gesamt, gesamt, force=True)
+
     # -- Alben und Personen --------------------------------------------
 
     def _sync_albums(self, client: ImmichClient) -> None:
@@ -285,3 +321,17 @@ class SyncWorker(QObject):
             self._report(f"Personen: {index} von {len(people)}", index, len(people))
         self._report(f"Personen fertig: {len(people)} von {len(people)}",
                      len(people), len(people), force=True)
+
+
+def _remote_eintrag(asset: dict) -> dict:
+    """Server-Antwort auf die Spalten unserer Spiegel-Tabelle bringen."""
+    exif = asset.get("exifInfo") or {}
+    return {
+        "immich_id": asset.get("id"),
+        "filename": asset.get("originalFileName") or "",
+        "taken_at": (asset.get("fileCreatedAt") or "")[:19].replace("T", " "),
+        "checksum": asset.get("checksum"),
+        "kind": asset.get("type") or "IMAGE",
+        "width": exif.get("exifImageWidth"),
+        "height": exif.get("exifImageHeight"),
+    }

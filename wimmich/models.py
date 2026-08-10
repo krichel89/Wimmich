@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import (
-    QAbstractListModel, QModelIndex, QObject, QRect, QRectF, QRunnable, QSize,
-    Qt, QThreadPool, pyqtSignal,
+    QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRectF, QRunnable,
+    QSize, Qt, QThreadPool, pyqtSignal,
 )
 from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from pathlib import Path
 
 from PyQt6.QtWidgets import QStyle, QStyledItemDelegate
 
-from . import marks, theme, thumbs
+from . import marks, remote_thumbs, theme, thumbs
 
 ROLE_PATH = Qt.ItemDataRole.UserRole + 1
 ROLE_ID = Qt.ItemDataRole.UserRole + 2
@@ -21,6 +21,7 @@ ROLE_STACK = Qt.ItemDataRole.UserRole + 5
 ROLE_LABEL = Qt.ItemDataRole.UserRole + 6
 ROLE_EDITED = Qt.ItemDataRole.UserRole + 7
 ROLE_HEADER = Qt.ItemDataRole.UserRole + 8
+ROLE_REMOTE = Qt.ItemDataRole.UserRole + 9   # liegt nur auf dem Server
 
 MONATE = {
     "01": "Januar", "02": "Februar", "03": "März", "04": "April",
@@ -51,6 +52,32 @@ class _ThumbTask(QRunnable):
             self._signals.done.emit(row, str(result))
 
 
+class _RemoteThumbTask(QRunnable):
+    """Holt die Vorschau eines Bildes, das nur auf dem Server liegt.
+
+    Laeuft im selben Pool wie die lokalen Kacheln. Der Cache in
+    remote_thumbs sorgt dafuer, dass der Server jede Vorschau nur EINMAL
+    liefern muss.
+    """
+
+    def __init__(self, row: int, immich_id: str, client, signals) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._args = (row, immich_id, client)
+        self._signals = signals
+
+    def run(self) -> None:
+        row, immich_id, client = self._args
+        try:
+            daten = remote_thumbs.fetch(client, immich_id)
+        except Exception:            # Netzfehler darf keine Kachel killen
+            daten = None
+        if daten:
+            self._signals.done.emit(row, str(remote_thumbs.cache_path(immich_id)))
+        else:
+            self._signals.fail.emit(row)
+
+
 class PhotoModel(QAbstractListModel):
     """Haelt die Ergebnisliste einer Abfrage und lädt Vorschauen nach."""
 
@@ -60,6 +87,7 @@ class PhotoModel(QAbstractListModel):
         self._pixmaps: dict[int, QPixmap] = {}
         self._requested: set[int] = set()
         self._thumb_edge = thumb_edge
+        self._immich_client = None
         self._exiftool = exiftool
 
         self._pool = QThreadPool.globalInstance()
@@ -206,8 +234,10 @@ class PhotoModel(QAbstractListModel):
             return self._pixmap_for(row, item)
         if role == Qt.ItemDataRole.ToolTipRole:
             return _tooltip(item)
+        if role == ROLE_REMOTE:
+            return bool(item.get("_remote"))
         if role == ROLE_PATH:
-            return item["path"]
+            return item.get("path") or ""
         if role == ROLE_ID:
             return item["id"]
         if role == ROLE_RATING:
@@ -259,6 +289,10 @@ class PhotoModel(QAbstractListModel):
             return pixmap
         if row not in self._requested:
             self._requested.add(row)
+            if item.get("_remote"):
+                self._pool.start(_RemoteThumbTask(
+                    row, item["immich_id"], self._immich_client, self._signals))
+                return self._placeholder
             # thumb_path zeigt bei Stapeln auf das JPEG - das spart das
             # Entwickeln der RAW-Datei für die Kachel
             self._pool.start(_ThumbTask(
@@ -433,12 +467,38 @@ class PhotoDelegate(QStyledItemDelegate):
         if badge:
             self._draw_badge(painter, target, badge)
 
+        if index.data(ROLE_REMOTE):
+            # Wolke oben links: dieses Bild liegt NUR auf dem Server,
+            # es gibt keine lokale Datei dazu.
+            self._draw_remote(painter, target)
+
         colour = index.data(ROLE_LABEL)
         if colour:
             self._draw_dot(painter, target, colour)
 
         if index.data(ROLE_EDITED):
             self._draw_edited(painter, target)
+
+    def _draw_remote(self, painter: QPainter, image_rect: QRectF) -> None:
+        """Wolkenzeichen fuer Bilder, die nur auf dem Server liegen."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = 9.0
+        mitte = QPointF(image_rect.left() + r + 6, image_rect.top() + r + 6)
+
+        hof = QPainterPath()
+        hof.addEllipse(mitte, r + 3, r + 3)
+        painter.fillPath(hof, QBrush(QColor(0, 0, 0, 150)))
+
+        # Wolke aus drei Kreisen und einem Sockel - klein, aber eindeutig
+        wolke = QPainterPath()
+        wolke.addEllipse(QPointF(mitte.x() - 3.5, mitte.y() + 0.5), 4.0, 4.0)
+        wolke.addEllipse(QPointF(mitte.x() + 0.5, mitte.y() - 2.0), 5.0, 5.0)
+        wolke.addEllipse(QPointF(mitte.x() + 4.0, mitte.y() + 1.0), 3.8, 3.8)
+        wolke.addRoundedRect(
+            QRectF(mitte.x() - 6.0, mitte.y() + 1.0, 11.0, 4.5), 2.2, 2.2)
+        painter.fillPath(wolke, QBrush(QColor("#ffffff")))
+        painter.restore()
 
     def _draw_badge(self, painter: QPainter, image_rect: QRectF, text: str) -> None:
         painter.save()
