@@ -274,6 +274,7 @@ class MainWindow(QMainWindow):
         self.model = PhotoModel(
             exiftool=self.exiftool, thumb_edge=self.config["thumb_size"]
         )
+        self.model.serverfehler.connect(self._zeige_serverfehler)
         self.grid = QListView()
         self.grid.setModel(self.model)
         self.grid.setItemDelegate(PhotoDelegate(self.config["grid_size"]))
@@ -2281,6 +2282,16 @@ class MainWindow(QMainWindow):
         # Das Ergebnis bleibt STEHEN, bis der naechste Abgleich es
         # ersetzt. Frueher verschwand es nach 30 Sekunden - wer in der
         # Zeit nicht hinsah, erfuhr nie, wie der Abgleich ausgegangen ist.
+
+    def _zeige_serverfehler(self, grund: str) -> None:
+        """Ausbleibende Server-Vorschauen sichtbar machen.
+
+        Vorher blieb die Kachel einfach grau - kein Hinweis, kein
+        Logeintrag, nichts zum Nachgehen. Der Text steht in der
+        Statuszeile, bis etwas anderes ihn ersetzt.
+        """
+        self.sync_label.setText(f"Server-Vorschau kommt nicht an — {grund}")
+        self.sync_label.setVisible(True)
 
     def _show_diagnose(self) -> None:
         """Sagt, woran es hängt, statt raten zu lassen.

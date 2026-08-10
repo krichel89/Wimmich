@@ -94,6 +94,10 @@ class _RemoteThumbTask(QRunnable):
 class PhotoModel(QAbstractListModel):
     """Haelt die Ergebnisliste einer Abfrage und lädt Vorschauen nach."""
 
+    # Bleibt eine Server-Vorschau aus, soll das SICHTBAR werden statt
+    # nur eine graue Kachel zu hinterlassen.
+    serverfehler = pyqtSignal(str)
+
     def __init__(self, exiftool=None, thumb_edge: int = 256, parent=None) -> None:
         super().__init__(parent)
         self._rows: list[dict] = []
@@ -108,6 +112,7 @@ class PhotoModel(QAbstractListModel):
         self._signals = _ThumbSignals()
         self._signals.done.connect(self._thumb_ready)
         self._signals.fail.connect(self._thumb_failed)
+        self._serverfehler_gemeldet = ""
 
         self._placeholder = QPixmap()   # leer = Delegate zeichnet Platzhalter
         self._edited: set[str] = set()
@@ -337,6 +342,10 @@ class PhotoModel(QAbstractListModel):
             self._requested.discard(row)
             self._remote_fehler[row] = time.monotonic()
             self._pixmaps.pop(row, None)
+            grund = remote_thumbs.letzte_meldung()
+            if grund and grund != self._serverfehler_gemeldet:
+                self._serverfehler_gemeldet = grund
+                self.serverfehler.emit(grund)
             self._touch(row)
             return
         self._pixmaps[row] = self._placeholder
