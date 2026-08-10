@@ -50,8 +50,10 @@ def _apply(values: dict) -> None:
         module[key] = value
 
 
-def _build_stylesheet() -> str:
-    return f"""
+# Bauplan des Stylesheets. Bewusst eine normale Zeichenkette und
+# keine f-String-Funktion: so laesst sie sich zur Laufzeit lesen
+# und pruefen, auch im gebauten Programm ohne Quelltext.
+_TEMPLATE = """
 QWidget {{
     background: {BG};
     color: {TEXT};
@@ -256,6 +258,13 @@ QMessageBox {{ background: {PANEL}; }}
 """
 
 
+def _build_stylesheet() -> str:
+    """Setzt die aktuellen Farbwerte in den Bauplan ein."""
+    werte = dict(PALETTES[_current_name])
+    werte.update(RADIUS=RADIUS, FONT_SIZE=FONT_SIZE)
+    return _TEMPLATE.format(**werte)
+
+
 def set_theme(name: str) -> str:
     """Wechselt die Palette ('dunkel' oder 'hell') und baut STYLESHEET neu.
 
@@ -289,7 +298,7 @@ def check_palettes() -> list[str]:
         if fehlt_dunkel:
             maengel.append(f"in der dunklen Palette fehlen: {sorted(fehlt_dunkel)}")
 
-    verwendet = set(re.findall(r"\{([A-Z][A-Z_]*)\}", _BAUPLAN_QUELLE))
+    verwendet = set(re.findall(r"(?<!\{)\{([A-Z][A-Z_]*)\}(?!\})", _TEMPLATE))
     eigene = {"RADIUS", "FONT_SIZE"}
     unbekannt = verwendet - set(_DARK) - eigene
     if unbekannt:
@@ -298,8 +307,6 @@ def check_palettes() -> list[str]:
 
 
 # Einmal beim Import mit der Vorgabe (dunkel) fuellen
-import inspect as _inspect
-_BAUPLAN_QUELLE = _inspect.getsource(_build_stylesheet)
 _MAENGEL = check_palettes()
 if _MAENGEL:                      # nur bei echtem Fehler, nie im Normalbetrieb
     raise RuntimeError("theme.py unvollstaendig: " + "; ".join(_MAENGEL))
