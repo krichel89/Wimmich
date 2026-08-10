@@ -1967,6 +1967,8 @@ class MainWindow(QMainWindow):
             parts.append(f"{result.uploaded} hochgeladen")
         if result.already_there:
             parts.append(f"{result.already_there} waren schon da")
+        if result.skipped:
+            parts.append(f"{result.skipped} übersprungen (Typ nicht angenommen)")
         if result.failed:
             parts.append(f"{result.failed} fehlgeschlagen")
         self.statusBar().showMessage("Abgleich fertig: " + ", ".join(parts), 8000)

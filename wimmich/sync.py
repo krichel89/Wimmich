@@ -24,7 +24,8 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .config import DB_PATH
 from .db import Database
-from .immich import ImmichClient, ImmichError, SyncResult, file_checksum
+from .immich import (ImmichClient, ImmichError, SyncResult, file_checksum,
+                     ist_dauerhafter_fehler)
 
 CHECK_BATCH = 100        # so viele Prüfsummen je Anfrage
 PROGRESS_INTERVAL = 0.3  # Sekunden zwischen zwei Fortschrittsmeldungen
@@ -52,6 +53,7 @@ class SyncWorker(QObject):
         self._zurueckgestellt: set[int] = set()
         self._letzter_fehler = ""
         self._abgebrochen = False
+        self._abgelehnte_typen: set[str] = set()
 
     def cancel(self) -> None:
         self._cancel = True
@@ -194,6 +196,10 @@ class SyncWorker(QObject):
                 self._report(f"Abgeglichen: {done} von {offen}", done, offen)
             self._db.commit()
 
+        if self._abgelehnte_typen:
+            typen = ", ".join(sorted(self._abgelehnte_typen))
+            result.errors.append(
+                f"Dieser Immich-Server nimmt {typen} nicht an — diese Dateien wurden übersprungen.")
         self._report(f"Bilder fertig: {done} von {offen}", done, offen, force=True)
 
     def _upload_one(self, client: ImmichClient, photo_id: int, row: dict,
@@ -221,6 +227,16 @@ class SyncWorker(QObject):
             if len(result.errors) < 20:
                 result.errors.append(f"{row['filename']}: {exc}")
             self._letzter_fehler = str(exc)
+            if ist_dauerhafter_fehler(str(exc)):
+                # Der Server nimmt diesen Dateityp grundsaetzlich nicht.
+                # Leere Kennung merken, damit die Datei nicht bei jedem
+                # Lauf erneut angeboten wird - und den Abgleich nicht
+                # wegen einer Eigenart des Servers abbrechen lassen.
+                self._db.set_immich(photo_id, "", row.get("checksum"))
+                result.skipped += 1
+                result.failed -= 1
+                self._abgelehnte_typen.add(Path(row["path"]).suffix.lower())
+                return True
             return False
 
         self._db.set_immich(photo_id, asset_id or "", row.get("checksum"))

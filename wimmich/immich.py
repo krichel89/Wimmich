@@ -34,6 +34,62 @@ from pathlib import Path
 USER_AGENT = "Wimmich"
 TIMEOUT = 60
 
+# Dateiendung -> Inhaltstyp, wie Immich es selbst fuehrt
+# (server/src/utils/mime-types.ts). Der Server prueft den mitgeschickten
+# Typ; "application/octet-stream" fuer alles fuehrt dazu, dass RAW-Dateien
+# abgelehnt werden, obwohl die Endung unterstuetzt waere.
+CONTENT_TYPES = {
+    ".3fr": "image/3fr", ".ari": "image/ari", ".arw": "image/arw",
+    ".cap": "image/cap", ".cin": "image/cin", ".cr2": "image/cr2",
+    ".cr3": "image/cr3", ".crw": "image/crw", ".dcr": "image/dcr",
+    ".dng": "image/dng", ".erf": "image/erf", ".fff": "image/fff",
+    ".iiq": "image/iiq", ".k25": "image/k25", ".kdc": "image/kdc",
+    ".mrw": "image/mrw", ".nef": "image/nef", ".nrw": "image/nrw",
+    ".orf": "image/orf", ".ori": "image/ori", ".pef": "image/pef",
+    ".psd": "image/psd", ".raf": "image/raf", ".raw": "image/raw",
+    ".rw2": "image/rw2", ".rwl": "image/rwl", ".sr2": "image/sr2",
+    ".srf": "image/srf", ".srw": "image/srw", ".x3f": "image/x3f",
+    ".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif",
+    ".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".jpe": "image/jpeg",
+    ".insp": "image/jpeg", ".mpo": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif",
+    ".hif": "image/hif", ".jp2": "image/jp2", ".jxl": "image/jxl",
+    ".svg": "image/svg", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".xmp": "application/xml",
+}
+
+
+def content_type_for(filename: str) -> str:
+    """Inhaltstyp anhand der Endung; unbekanntes bleibt octet-stream."""
+    endung = Path(filename).suffix.lower()
+    return CONTENT_TYPES.get(endung, "application/octet-stream")
+
+def _meckert_geraetefelder(payload: bytes | None) -> bool:
+    """Bemaengelt der Server die Geraetefelder als UEBERFLUESSIG?"""
+    text = (payload or b"").decode("utf-8", "replace").lower()
+    return ("deviceassetid" in text or "deviceid" in text) and (
+        "should not exist" in text or "unexpected" in text
+        or "not allowed" in text or "property" in text and "exist" in text)
+
+
+def _verlangt_geraetefelder(payload: bytes | None) -> bool:
+    """Verlangt der Server die Geraetefelder?"""
+    text = (payload or b"").decode("utf-8", "replace").lower()
+    return ("deviceassetid" in text or "deviceid" in text) and (
+        "must be" in text or "should not be empty" in text
+        or "required" in text)
+
+
+def ist_dauerhafter_fehler(meldung: str) -> bool:
+    """Fehler, die sich beim naechsten Lauf NICHT von selbst erledigen.
+
+    Ein nicht unterstuetzter Dateityp bleibt es auch morgen noch. Solche
+    Dateien immer wieder anzubieten haelt den Abgleich nur auf.
+    """
+    text = (meldung or "").lower()
+    return "unsupported file type" in text or "nicht unterstützt" in text
+
+
 
 class ImmichError(RuntimeError):
     """Fehler beim Reden mit dem Server."""
@@ -71,6 +127,7 @@ class SyncResult:
     uploaded: int = 0
     already_there: int = 0
     failed: int = 0
+    skipped: int = 0          # vom Server grundsätzlich abgelehnte Dateitypen
     errors: list[str] = field(default_factory=list)
 
 
@@ -271,11 +328,23 @@ class ImmichClient:
         headers = {"x-immich-checksum": checksum} if checksum else None
         status, payload = self._post_multipart(fields, files, headers)
 
-        if status == 400 and self.info.device_fields:
-            # Neuere Server kennen die Gerätefelder nicht mehr - ohne wiederholen.
+        # Nur dann ohne Gerätefelder wiederholen, wenn der Server GENAU DIESE
+        # Felder bemängelt. Vorher genügte irgendein 400er - eine Ablehnung
+        # wegen eines nicht unterstützten Dateityps schaltete die Felder
+        # dauerhaft ab, und danach scheiterte JEDER weitere Upload an
+        # „deviceAssetId must be a string". Die meisten Immich-Fassungen
+        # VERLANGEN die Felder.
+        if status == 400 and self.info.device_fields and _meckert_geraetefelder(payload):
             self.info.device_fields = False
             fields.pop("deviceAssetId", None)
             fields.pop("deviceId", None)
+            status, payload = self._post_multipart(fields, files, headers)
+        elif status == 400 and not self.info.device_fields and _verlangt_geraetefelder(payload):
+            # Umgekehrter Fall: der Server will sie doch haben.
+            self.info.device_fields = True
+            stat_neu = target.stat()
+            fields["deviceAssetId"] = f"{target.name}-{int(stat_neu.st_mtime)}"
+            fields["deviceId"] = "wimmich"
             status, payload = self._post_multipart(fields, files, headers)
 
         if status >= 400:
@@ -301,7 +370,7 @@ class ImmichClient:
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="{name}"; '
                 f'filename="{filename}"\r\n'
-                "Content-Type: application/octet-stream\r\n\r\n"
+                f"Content-Type: {content_type_for(filename)}\r\n\r\n"
             ).encode("utf-8")
             body += blob + b"\r\n"
         body += f"--{boundary}--\r\n".encode("utf-8")
