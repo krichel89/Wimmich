@@ -28,6 +28,7 @@ from .immich import ImmichClient, ImmichError, SyncResult, file_checksum
 
 CHECK_BATCH = 100        # so viele Prüfsummen je Anfrage
 PROGRESS_INTERVAL = 0.3  # Sekunden zwischen zwei Fortschrittsmeldungen
+ABBRUCH_NACH_FEHLERN = 5  # so viele Fehlversuche hintereinander, dann Schluss
 
 
 class SyncWorker(QObject):
@@ -48,6 +49,9 @@ class SyncWorker(QObject):
         self._cancel = False
         self._db: Database | None = None
         self._last_progress = 0.0
+        self._zurueckgestellt: set[int] = set()
+        self._letzter_fehler = ""
+        self._abgebrochen = False
 
     def cancel(self) -> None:
         self._cancel = True
@@ -78,11 +82,16 @@ class SyncWorker(QObject):
                 + (f" als {info.user}" if info.user else ""), 0, 0, force=True)
 
             self._db = Database(DB_PATH)
-            self._match_and_upload(client, result)
+            # Alben und Personen ZUERST: die sind in Sekunden da und
+            # erscheinen sofort im Baum. Die Bilder danach koennen Stunden
+            # dauern - stuenden sie davor, saehe Harald tagelang keine
+            # Alben, obwohl der Abgleich laeuft.
             if not self._cancel and self._fetch_albums:
                 self._sync_albums(client)
             if not self._cancel and self._fetch_people:
                 self._sync_people(client)
+            self._db.commit()
+            self._match_and_upload(client, result)
 
             self._db.commit()
             self.finished.emit(result)
@@ -105,17 +114,28 @@ class SyncWorker(QObject):
         self._report(f"Abgeglichen: 0 von {offen}", 0, offen, force=True)
 
         done = 0
+        misserfolge = 0
         while not self._cancel:
-            rows = self._db.unsynced(CHECK_BATCH)
+            rows = [r for r in self._db.unsynced(CHECK_BATCH + len(self._zurueckgestellt))
+                    if r["id"] not in self._zurueckgestellt][:CHECK_BATCH]
             if not rows:
                 break
 
-            # Prüfsummen bilden (und merken - sie ändern sich nur mit der Datei)
+            # Prüfsummen bilden (und merken - sie ändern sich nur mit der Datei).
+            # Das ist die LANGSAMSTE Stelle des Abgleichs: jede Datei wird
+            # ganz gelesen (45 MB RAW ≈ 41 ms auf schneller Platte, auf einer
+            # Netzwerkfreigabe ein Vielfaches). Ohne Meldung hier stünde der
+            # Balken minutenlang still, obwohl gearbeitet wird.
             items: list[tuple[str, str]] = []
             by_id: dict[str, dict] = {}
             for row in rows:
+                if self._cancel:
+                    break
                 checksum = row["checksum"]
                 if not checksum:
+                    self._report(
+                        f"Prüfsummen: {row['filename']} ({done} von {offen})",
+                        done, offen)
                     try:
                         checksum = file_checksum(row["path"])
                     except OSError as exc:
@@ -133,6 +153,8 @@ class SyncWorker(QObject):
             if not items:
                 continue
 
+            self._report(f"Frage Server: {len(items)} Bilder ({done} von {offen})",
+                         done, offen, force=True)
             known = client.check_uploaded(items)
             result.checked += len(items)
 
@@ -144,7 +166,25 @@ class SyncWorker(QObject):
                     self._db.set_immich(int(key), asset_id, row["checksum"])
                     result.already_there += 1
                 elif self._upload:
-                    self._upload_one(client, int(key), row, result)
+                    self._report(f"Lade hoch: {row['filename']} ({done} von {offen})",
+                                 done, offen)
+                    if self._upload_one(client, int(key), row, result):
+                        misserfolge = 0
+                    else:
+                        # Fehlgeschlagene Datei für DIESEN Lauf zurückstellen,
+                        # sonst holt unsynced() sie sofort wieder und der
+                        # Abgleich dreht sich ewig im Kreis.
+                        self._zurueckgestellt.add(int(key))
+                        misserfolge += 1
+                        self._report(
+                            f"Fehlgeschlagen ({result.failed}): {row['filename']}"
+                            f" — {self._letzter_fehler}", done, offen, force=True)
+                        if misserfolge >= ABBRUCH_NACH_FEHLERN:
+                            result.errors.append(
+                                f"Nach {misserfolge} Fehlversuchen hintereinander "
+                                f"abgebrochen — der Server nimmt nichts an.")
+                            self._abgebrochen = True
+                            return
                 else:
                     # Nicht hochladen: leere Kennung merken, damit die Datei
                     # nicht in jedem Durchlauf erneut geprüft wird.
@@ -157,7 +197,14 @@ class SyncWorker(QObject):
         self._report(f"Bilder fertig: {done} von {offen}", done, offen, force=True)
 
     def _upload_one(self, client: ImmichClient, photo_id: int, row: dict,
-                    result: SyncResult) -> None:
+                    result: SyncResult) -> bool:
+        """Eine Datei hochladen. Liefert True bei Erfolg.
+
+        Bei Misserfolg wird die Datei NICHT als erledigt vermerkt (sie soll
+        beim nächsten Lauf wieder drankommen) - deshalb muss der Aufrufer
+        sie für DIESEN Lauf zurückstellen, sonst zieht die Arbeitsliste
+        immer wieder dieselben Dateien und der Abgleich endet nie.
+        """
         # Sidecar nur bei RAW mitschicken. Bei einem JPEG steckt XMP in der
         # Datei selbst; die danebenliegende BILD.xmp gehört zur RAW-Fassung
         # und hätte am JPEG nichts zu suchen.
@@ -173,13 +220,15 @@ class SyncWorker(QObject):
             result.failed += 1
             if len(result.errors) < 20:
                 result.errors.append(f"{row['filename']}: {exc}")
-            return
+            self._letzter_fehler = str(exc)
+            return False
 
         self._db.set_immich(photo_id, asset_id or "", row.get("checksum"))
         if duplicate:
             result.already_there += 1
         else:
             result.uploaded += 1
+        return True
 
     # -- Alben und Personen --------------------------------------------
 

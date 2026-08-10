@@ -35,6 +35,7 @@ from .previews import PreviewLoader
 from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
 from .filterbar import FilterBar
+from .icon import app_icon
 from .edits import (
     CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
     array_to_qimage, downscale, qimage_to_array,
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         self.exiftool = ExifTool(exe)
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
+        self.setWindowIcon(app_icon())
         self.resize(1360, 860)
         # Falls das Fenster ohne main.py erzeugt wird (Tests), trotzdem dunkel
         if not self.styleSheet():
@@ -380,11 +382,12 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
         # Fortschrittsbalken fuer den Immich-Abgleich - sonst gibt es bei
-        # groesseren Bibliotheken lange keine sichtbare Regung.
+        # groesseren Bibliotheken lange keine sichtbare Regung. Mit Text
+        # (Prozent), damit auch ein unbewegter Balken zeigt, wo es steht.
         self.sync_progress_bar = QProgressBar()
-        self.sync_progress_bar.setFixedWidth(160)
-        self.sync_progress_bar.setFixedHeight(14)
-        self.sync_progress_bar.setTextVisible(False)
+        self.sync_progress_bar.setFixedWidth(220)
+        self.sync_progress_bar.setFixedHeight(18)
+        self.sync_progress_bar.setTextVisible(True)
         self.sync_progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.sync_progress_bar)
 
@@ -1975,6 +1978,11 @@ class MainWindow(QMainWindow):
                 + "\n".join(result.errors[:10])
                 + ("\n…" if len(result.errors) > 10 else ""),
             )
+        elif result.errors:
+            # Auch im stillen Modus darf ein dauerhaft scheiternder Abgleich
+            # nicht spurlos bleiben - sonst laeuft er wochenlang ins Leere.
+            self.statusBar().showMessage(
+                f"Abgleich mit {result.failed} Fehlern: {result.errors[0]}", 15000)
 
     def _sync_failed(self, message: str) -> None:
         quiet = self._sync_quiet
@@ -1993,7 +2001,14 @@ class MainWindow(QMainWindow):
             self._sync_thread.wait(5000)
         self._sync_thread = None
         self._sync_worker = None
-        self.sync_progress_bar.setVisible(False)
+        # Balken noch kurz stehen lassen. Ein Abgleich, bei dem schon alles
+        # zugeordnet ist, ist in Sekundenbruchteilen vorbei - der Balken
+        # waere sonst nur ein unsichtbares Aufblitzen, und es sieht aus,
+        # als sei nie etwas passiert.
+        self.sync_progress_bar.setRange(0, 1)
+        self.sync_progress_bar.setValue(1)
+        QTimer.singleShot(2000, lambda: self.sync_progress_bar.setVisible(
+            self._sync_thread is not None))
 
     def _show_diagnose(self) -> None:
         """Sagt, woran es hängt, statt raten zu lassen.

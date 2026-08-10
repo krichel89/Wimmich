@@ -179,6 +179,20 @@ QScrollBar::handle:horizontal {{
 }}
 QScrollBar::handle:horizontal:hover {{ background: {SCROLLBAR_HOVER}; }}
 
+/* Fortschrittsbalken beim Immich-Abgleich */
+QProgressBar {{
+    background: {ELEVATED};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    text-align: center;
+    color: {TEXT};
+    font-size: 12px;
+}}
+QProgressBar::chunk {{
+    background: {ACCENT};
+    border-radius: 6px;
+}}
+
 /* Statuszeile */
 QStatusBar {{
     background: {PANEL};

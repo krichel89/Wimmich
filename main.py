@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import QApplication
 
 from wimmich import APP_NAME, __version__, theme
 from wimmich.config import Config
+from wimmich.icon import app_icon
 from wimmich.mainwindow import MainWindow
 
 
@@ -22,6 +23,7 @@ def main() -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationName("krichel")
     app.setStyle("Fusion")
+    app.setWindowIcon(app_icon())
 
     # Gespeichertes Erscheinungsbild (hell/dunkel) schon vor dem ersten
     # Fenster anwenden, damit nichts kurz im falschen Thema aufblitzt.

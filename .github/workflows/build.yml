@@ -151,6 +151,7 @@ jobs:
             --onedir `
             --windowed `
             --name Wimmich `
+            --icon wimmich.ico `
             --add-data "build/exiftool;exiftool" `
             --collect-all rawpy `
             --exclude-module tkinter `
