@@ -2325,9 +2325,13 @@ class MainWindow(QMainWindow):
         # Stand der Kacheln in der laufenden Ansicht - das ist die Frage,
         # um die es geht: erscheinen Vorschauen oder nicht?
         bildzeilen, vorhanden, leer = self.model.kachel_stand()
+        server_zeilen = sum(1 for r in self.model.photo_rows()
+                            if (self.model.row_data(r) or {}).get("_remote"))
         zeile("Kacheln in der Ansicht",
               f"{vorhanden} von {bildzeilen} geladen",
-              f"{leer} leer geblieben" if leer else "")
+              (f"{server_zeilen} davon nur auf dem Server"
+               if server_zeilen else "") +
+              (f", {leer} leer geblieben" if leer else ""))
 
         # Ein echter Messwert statt Vermutung.
         #
@@ -2342,8 +2346,18 @@ class MainWindow(QMainWindow):
             if kandidat and (kandidat.get("thumb_path") or kandidat.get("path")):
                 item = kandidat
                 break
-        if item is None and self.model.photo_rows():
-            zeitmessung = "nur Bilder ohne lokale Datei (nur auf dem Server)"
+        aus_datenbank = False
+        if item is None:
+            # Die Ansicht kann ausschliesslich Serverbilder enthalten
+            # (Album ohne hochgeladene Bilder). Dann wird trotzdem eine
+            # echte lokale Datei geprueft - irgendeine aus dem Index.
+            try:
+                treffer = self.db.all_photos(self.config.libraries)[:1]
+                if treffer:
+                    item = dict(treffer[0])
+                    aus_datenbank = True
+            except Exception:
+                item = None
         if item:
             pfad = item.get("thumb_path") or item["path"]
             t = time.perf_counter()
@@ -2364,7 +2378,10 @@ class MainWindow(QMainWindow):
                 zeitmessung += " (FEHLGESCHLAGEN: " + _vorschau_grund(pfad) + ")"
             zeilen.append(
                 f"<tr><td>Datei</td><td colspan='2' style='color:#8e8e9c'>"
-                f"{_html_escape(pfad)}</td></tr>")
+                f"{_html_escape(pfad)}"
+                + (" (aus dem Index, nicht aus der Ansicht)"
+                   if aus_datenbank else "")
+                + "</td></tr>")
 
             # Und getrennt davon: kommt die KACHEL zustande? Das ist ein
             # anderer Weg als die Grossansicht (Pillow schreibt eine
@@ -2396,6 +2413,34 @@ class MainWindow(QMainWindow):
                 kachel = f"Fehler: {fehler}"
             zeile("Kachel dieser Datei", kachel)
         zeile("erste Datei der Ansicht", zeitmessung)
+
+        # -- Serverbilder: den Weg wirklich gehen, nicht nur beschreiben --
+        if server_zeilen:
+            erste = next((self.model.row_data(r) for r in self.model.photo_rows()
+                          if (self.model.row_data(r) or {}).get("_remote")), None)
+            client = getattr(self.model, "_immich_client", None)
+            zeile("Immich-Client",
+                  "vom Fenster" if client is not None else "keiner - wird bei Bedarf gebaut")
+            if erste:
+                t = time.perf_counter()
+                try:
+                    daten = remote_thumbs.fetch(client, erste["immich_id"])
+                except Exception as fehler:
+                    daten = None
+                    remote_thumbs._letzte_meldung = f"Ausnahme: {fehler}"
+                dauer = (time.perf_counter() - t) * 1000
+                if daten:
+                    zeile("Server-Vorschau",
+                          f"{len(daten)} B in {dauer:.0f} ms", "kommt an")
+                else:
+                    zeile("Server-Vorschau", "KEINE",
+                          _html_escape(remote_thumbs.letzte_meldung() or "ohne Angabe"))
+                # Welcher der vier Wege was geantwortet hat - genau das
+                # entscheidet bei einem aelteren Server.
+                aktiv = client or getattr(remote_thumbs, "_ersatz_client", None)
+                versuche = getattr(aktiv, "letzte_vorschauversuche", []) if aktiv else []
+                for eintrag in versuche:
+                    zeile("", _html_escape(eintrag))
 
         zeilen.append("</table>")
         box = QMessageBox(self)

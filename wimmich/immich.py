@@ -168,6 +168,10 @@ class ImmichClient:
         self.api_key = (api_key or "").strip()
         self.info = ServerInfo()
         self._connected = False
+        # Fuer die Diagnose: warum die letzte Vorschau nicht kam und
+        # welche Wege dabei probiert wurden.
+        self.letzter_vorschaufehler = ""
+        self.letzte_vorschauversuche: list[str] = []
 
     @property
     def configured(self) -> bool:
@@ -400,7 +404,7 @@ class ImmichClient:
         weiter = bool(eintraege.get("nextPage"))
         return elemente, weiter
 
-    def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:
+    def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:  # noqa: C901
         """Vorschaubild vom Server. Keine Ausnahme bei Misserfolg."""
         groesse = "preview" if gross else "thumbnail"
         # Mehrere Schreibweisen, weil sich der Weg zwischen den
@@ -416,14 +420,30 @@ class ImmichClient:
         if gross:
             versuche.insert(2, (f"/assets/{asset_id}/original", None))
         letzter = None
+        self.letzte_vorschauversuche = []
         for pfad, abfrage in versuche:
             try:
-                status, payload = self._request("GET", pfad, query=abfrage)
+                # Accept MUSS hier auf Bilddaten stehen. Der Vorgabewert
+                # ist application/json - ein Server, der sich daran haelt,
+                # lehnt einen Bildabruf damit ab.
+                status, payload = self._request(
+                    "GET", pfad, query=abfrage,
+                    extra_headers={"Accept": "image/*, */*"})
             except ImmichError as exc:
+                self.letzte_vorschauversuche.append(f"{pfad}: {exc}")
                 letzter = exc
                 continue
-            if status < 400 and payload:
+            self.letzte_vorschauversuche.append(
+                f"{pfad}: HTTP {status}, {len(payload or b'')} B")
+            if status < 400 and _sieht_nach_bild_aus(payload):
                 return payload
+            if status < 400 and payload:
+                # 200 mit JSON oder einer Anmeldeseite: der Server hat
+                # geantwortet, aber kein Bild geliefert. Das als Vorschau
+                # weiterzureichen ergaebe eine kaputte Kachel.
+                letzter = ImmichError(
+                    f"Antwort ist kein Bild ({len(payload)} B)", status)
+                continue
             letzter = ImmichError(_error_text(status, payload), status)
         if letzter is not None:
             self.letzter_vorschaufehler = str(letzter)
@@ -524,6 +544,23 @@ class ImmichClient:
 def _iso(timestamp: float) -> str:
     from datetime import datetime, timezone
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def _sieht_nach_bild_aus(payload: bytes | None) -> bool:
+    """Sind das wirklich Bilddaten?
+
+    Ein Server kann mit HTTP 200 antworten und trotzdem kein Bild
+    schicken - JSON-Fehler, Anmeldeseite, Platzhalter eines Proxys. Das
+    ungeprueft als Vorschau zu nehmen ergibt eine kaputte Kachel und
+    verdeckt die eigentliche Ursache.
+    """
+    if not payload or len(payload) < 32:
+        return False
+    return (payload[:3] == b"\xff\xd8\xff"                    # JPEG
+            or payload[:8] == b"\x89PNG\r\n\x1a\n"             # PNG
+            or payload[:6] in (b"GIF87a", b"GIF89a")
+            or payload[:2] in (b"II", b"MM")                   # TIFF
+            or (payload[:4] == b"RIFF" and payload[8:12] == b"WEBP"))
 
 
 def _error_text(status: int, payload: bytes) -> str:
