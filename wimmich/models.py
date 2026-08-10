@@ -49,7 +49,16 @@ class _ThumbTask(QRunnable):
 
     def run(self) -> None:
         row, path, mtime, filesize, edge, exiftool = self._args
-        result = thumbs.get_thumbnail(path, mtime, filesize, edge, exiftool)
+        try:
+            result = thumbs.get_thumbnail(path, mtime, filesize, edge, exiftool)
+        except BaseException:
+            # Eine Ausnahme in einem Pool-Faden erreicht sys.excepthook
+            # NICHT - sie verschwindet spurlos, und die Kachel bleibt fuer
+            # immer grau. Genau deshalb hier protokollieren.
+            from . import crashlog
+            crashlog.protokolliere(f"Vorschau fehlgeschlagen: {path}")
+            self._signals.fail.emit(row)
+            return
         if result is None:
             self._signals.fail.emit(row)
         else:
@@ -332,6 +341,20 @@ class PhotoModel(QAbstractListModel):
             return
         self._pixmaps[row] = self._placeholder
         self._touch(row)
+
+    def kachel_stand(self) -> tuple[int, int, int]:
+        """(Bildzeilen, Vorschau vorhanden, Vorschau leer geblieben)."""
+        zeilen = self.photo_rows()
+        vorhanden = leer = 0
+        for r in zeilen:
+            pixmap = self._pixmaps.get(r)
+            if pixmap is None:
+                continue
+            if pixmap.isNull():
+                leer += 1
+            else:
+                vorhanden += 1
+        return len(zeilen), vorhanden, leer
 
     def _touch(self, row: int) -> None:
         if row < len(self._rows):

@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QStackedWidget, QStatusBar,
-    QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
@@ -491,14 +491,9 @@ class MainWindow(QMainWindow):
         menu_hilfe.addSeparator()
         menu_hilfe.addAction(ueber_action)
 
-        # Werkzeugleiste: nur der tägliche Handgriff
-        toolbar = QToolBar("Hauptleiste")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        self.toolbar = toolbar
-        toolbar.addAction(scan_action)
-        toolbar.addAction(immich_action)
-        toolbar.addAction(self.loupe_action)
+        # Keine Werkzeugleiste mehr: seit 0.3.24 steht alles im Menue,
+        # und die drei verbliebenen Knoepfe haben nur Platz gekostet.
+        # Die Tastenkuerzel (F5, F6, E/G) bleiben unveraendert.
 
     def _first_run_hint(self) -> None:
         QMessageBox.information(
@@ -1344,7 +1339,6 @@ class MainWindow(QMainWindow):
         nicht das Foto ist, verschwindet.
         """
         self._chrome_visible = visible
-        self.toolbar.setVisible(visible)
         self.filter_bar.setVisible(visible)
         self.tree.setVisible(visible)
         self.statusBar().setVisible(visible)
@@ -2284,11 +2278,9 @@ class MainWindow(QMainWindow):
         self.sync_progress_bar.setValue(1)
         QTimer.singleShot(2000, lambda: self.sync_progress_bar.setVisible(
             self._sync_thread is not None))
-        # Das Ergebnis bleibt eine Weile lesbar stehen, statt sofort zu
-        # verschwinden - sonst ist der Ausgang eines langen Abgleichs weg,
-        # sobald man kurz nicht hinsieht.
-        QTimer.singleShot(30000, lambda: self.sync_label.setVisible(
-            self._sync_thread is not None))
+        # Das Ergebnis bleibt STEHEN, bis der naechste Abgleich es
+        # ersetzt. Frueher verschwand es nach 30 Sekunden - wer in der
+        # Zeit nicht hinsah, erfuhr nie, wie der Abgleich ausgegangen ist.
 
     def _show_diagnose(self) -> None:
         """Sagt, woran es hängt, statt raten zu lassen.
@@ -2330,9 +2322,28 @@ class MainWindow(QMainWindow):
         zeile("ohne Metadaten", f"{offen}",
               "F5 lässt den Rest nachlaufen" if offen else "")
 
-        # Ein echter Messwert statt Vermutung
+        # Stand der Kacheln in der laufenden Ansicht - das ist die Frage,
+        # um die es geht: erscheinen Vorschauen oder nicht?
+        bildzeilen, vorhanden, leer = self.model.kachel_stand()
+        zeile("Kacheln in der Ansicht",
+              f"{vorhanden} von {bildzeilen} geladen",
+              f"{leer} leer geblieben" if leer else "")
+
+        # Ein echter Messwert statt Vermutung.
+        #
+        # ACHTUNG: Zeile 0 ist in "Alle Fotos" eine KOPFZEILE ("August
+        # 2026") ohne Pfad. Bis 0.3.26 wurde genau die gemessen - die
+        # Diagnose meldete "FEHLGESCHLAGEN", obwohl gar keine Datei
+        # gemeint war. Gemessen wird das erste echte Bild MIT Pfad.
         zeitmessung = "keine Datei zum Messen"
-        item = self.model.row_data(0)
+        item = None
+        for r in self.model.photo_rows():
+            kandidat = self.model.row_data(r)
+            if kandidat and (kandidat.get("thumb_path") or kandidat.get("path")):
+                item = kandidat
+                break
+        if item is None and self.model.photo_rows():
+            zeitmessung = "nur Bilder ohne lokale Datei (nur auf dem Server)"
         if item:
             pfad = item.get("thumb_path") or item["path"]
             t = time.perf_counter()
@@ -2354,6 +2365,36 @@ class MainWindow(QMainWindow):
             zeilen.append(
                 f"<tr><td>Datei</td><td colspan='2' style='color:#8e8e9c'>"
                 f"{_html_escape(pfad)}</td></tr>")
+
+            # Und getrennt davon: kommt die KACHEL zustande? Das ist ein
+            # anderer Weg als die Grossansicht (Pillow schreibt eine
+            # JPEG-Datei, Qt zeigt sie an) und kann fuer sich scheitern.
+            kachel = "?"
+            try:
+                schluessel = thumbs.cache_key(
+                    pfad,
+                    item.get("thumb_mtime") or item.get("mtime") or 0.0,
+                    item.get("thumb_size") or item.get("filesize") or 0,
+                    self.config["thumb_size"])
+                ziel = thumbs.cache_path(schluessel)
+                if not ziel.exists():
+                    erzeugt = thumbs.get_thumbnail(
+                        pfad,
+                        item.get("thumb_mtime") or item.get("mtime") or 0.0,
+                        item.get("thumb_size") or item.get("filesize") or 0,
+                        self.config["thumb_size"], self.exiftool)
+                    ziel = erzeugt if erzeugt is not None else ziel
+                if ziel is None or not Path(ziel).exists():
+                    kachel = "wird nicht erzeugt"
+                else:
+                    pix = previews.pixmap_aus_datei(str(ziel))
+                    kachel = (f"{pix.width()}×{pix.height()} aus {ziel}"
+                              if not pix.isNull()
+                              else f"Datei da ({Path(ziel).stat().st_size} B), "
+                                   f"laesst sich aber nicht anzeigen")
+            except Exception as fehler:
+                kachel = f"Fehler: {fehler}"
+            zeile("Kachel dieser Datei", kachel)
         zeile("erste Datei der Ansicht", zeitmessung)
 
         zeilen.append("</table>")

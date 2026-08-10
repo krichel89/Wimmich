@@ -17,6 +17,7 @@ oder später; siehe LICENSE. Ohne jede Gewährleistung.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -89,6 +90,28 @@ def install(app_version: str = "", parent_getter=None) -> None:
         _zeige_meldung(typ, wert, parent_getter)
 
     sys.excepthook = haken
+
+    # Faeden haben ihren EIGENEN Haken. Ohne den hier verschwindet jede
+    # Ausnahme aus einem Lade- oder Abgleichfaden restlos: kein Fenster,
+    # kein Logeintrag, nur eine Kachel, die nie erscheint.
+    def faden_haken(args):
+        if issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        text = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        name = getattr(args.thread, "name", "?")
+        schreibe(text, kopf=f"Wimmich {app_version} (Faden {name})")
+
+    threading.excepthook = faden_haken
+
+
+def protokolliere(kopf: str = "") -> None:
+    """Die gerade behandelte Ausnahme in die Logdatei schreiben.
+
+    Fuer Stellen, die einen Fehler abfangen MUESSEN (sonst stuerzt ein
+    Pool-Faden ab), ihn aber nicht verschweigen sollen.
+    """
+    schreibe(traceback.format_exc(), kopf=kopf)
 
 
 def _zeige_meldung(typ, wert, parent_getter) -> None:
