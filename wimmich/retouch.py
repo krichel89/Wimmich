@@ -13,6 +13,8 @@ einfache Ausbreiten hier.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import numpy as np
 
 try:
@@ -27,7 +29,6 @@ except ImportError:      # pragma: no cover
 
 def _disc(radius: int, feather: float = 0.35) -> np.ndarray:
     """Weiche Kreisscheibe als Deckungsmaske, Werte 0…1."""
-    size = radius * 2 + 1
     y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
     dist = np.sqrt(x * x + y * y) / max(radius, 1)
     inner = max(0.0, 1.0 - feather)
@@ -120,12 +121,12 @@ def heal_stroke(rgb: np.ndarray, points: list[tuple[int, int]],
 def _resample(points: list[tuple[int, int]], step: int):
     """Punkte auf gleichmäßigen Abstand bringen, damit keine Lücken bleiben."""
     out = [points[0]]
-    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+    for (x0, y0), (x1, y1) in pairwise(points):
         distance = max(abs(x1 - x0), abs(y1 - y0))
         count = max(1, distance // step)
-        for i in range(1, count + 1):
-            out.append((int(x0 + (x1 - x0) * i / count),
-                        int(y0 + (y1 - y0) * i / count)))
+        out.extend((int(x0 + (x1 - x0) * i / count),
+                    int(y0 + (y1 - y0) * i / count))
+                   for i in range(1, count + 1))
     return out
 
 
@@ -431,8 +432,10 @@ def white_balance_from_pixel(rgb: np.ndarray, cx: int, cy: int,
     direkt auflösen, statt zu probieren.
     """
     height, width = rgb.shape[:2]
-    x0 = max(0, int(cx) - radius); x1 = min(width, int(cx) + radius + 1)
-    y0 = max(0, int(cy) - radius); y1 = min(height, int(cy) + radius + 1)
+    x0 = max(0, int(cx) - radius)
+    x1 = min(width, int(cx) + radius + 1)
+    y0 = max(0, int(cy) - radius)
+    y1 = min(height, int(cy) + radius + 1)
     if x1 <= x0 or y1 <= y0:
         return 0.0, 0.0
 
@@ -455,10 +458,10 @@ def crop(rgb: np.ndarray, x: float, y: float, width: float,
          height: float) -> np.ndarray:
     """Zuschnitt. Alle vier Werte sind Bruchteile der Bildgröße (0…1)."""
     full_h, full_w = rgb.shape[:2]
-    x0 = int(round(np.clip(x, 0.0, 1.0) * full_w))
-    y0 = int(round(np.clip(y, 0.0, 1.0) * full_h))
-    x1 = int(round(np.clip(x + width, 0.0, 1.0) * full_w))
-    y1 = int(round(np.clip(y + height, 0.0, 1.0) * full_h))
+    x0 = round(np.clip(x, 0.0, 1.0) * full_w)
+    y0 = round(np.clip(y, 0.0, 1.0) * full_h)
+    x1 = round(np.clip(x + width, 0.0, 1.0) * full_w)
+    y1 = round(np.clip(y + height, 0.0, 1.0) * full_h)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return rgb
     return rgb[y0:y1, x0:x1]
@@ -565,7 +568,7 @@ def _homography(src, dst) -> np.ndarray:
     """3x3-Abbildung aus vier Punktpaaren."""
     rows = []
     ziel = []
-    for (x, y), (u, v) in zip(src, dst):
+    for (x, y), (u, v) in zip(src, dst, strict=True):
         rows.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
         ziel.append(u)
         rows.append([0, 0, 0, x, y, 1, -v * x, -v * y])

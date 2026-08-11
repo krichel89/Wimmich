@@ -173,7 +173,7 @@ class EditStack:
         unit = min(width, height)
 
         for step in self.steps:
-            radius = max(2, int(round(step.radius * unit)))
+            radius = max(2, round(step.radius * unit))
             if step.kind == SPOT:
                 result = retouch.heal_spot(
                     result, int(step.x * width), int(step.y * height), radius)

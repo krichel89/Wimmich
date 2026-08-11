@@ -1,0 +1,11 @@
+# Prueflauf: ruff check .
+#
+# RUF001/RUF002/RUF003 melden "mehrdeutige" Zeichen wie „ “ – und – in
+# Texten. Die sind hier ABSICHT: die Oberflaeche ist deutsch und soll
+# richtige Anfuehrungszeichen und Gedankenstriche zeigen, keine
+# Schreibmaschinenersatzzeichen.
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "B", "C4", "SIM", "PERF", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "SIM105", "PERF203", "C408", "B008"]

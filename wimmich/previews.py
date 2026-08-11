@@ -20,7 +20,6 @@ from __future__ import annotations
 import io
 import threading
 from collections import OrderedDict
-from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -35,7 +34,7 @@ except ImportError:  # pragma: no cover
     HAVE_RAWPY = False
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image
     HAVE_PIL = True
 except ImportError:  # pragma: no cover
     HAVE_PIL = False

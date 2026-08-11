@@ -33,6 +33,10 @@ from pathlib import Path
 
 USER_AGENT = "Wimmich"
 TIMEOUT = 60
+# Vorschauen duerfen NICHT in die grosse Zeitgrenze laufen: sie werden
+# beim Blaettern geholt, und vier Wege a 60 s waeren vier Minuten, in
+# denen das Fenster steht.
+VORSCHAU_TIMEOUT = 8
 
 # Dateiendung -> Inhaltstyp, wie Immich es selbst fuehrt
 # (server/src/utils/mime-types.ts). Der Server prueft den mitgeschickten
@@ -69,7 +73,8 @@ def _meckert_geraetefelder(payload: bytes | None) -> bool:
     text = (payload or b"").decode("utf-8", "replace").lower()
     return ("deviceassetid" in text or "deviceid" in text) and (
         "should not exist" in text or "unexpected" in text
-        or "not allowed" in text or "property" in text and "exist" in text)
+        or "not allowed" in text
+        or ("property" in text and "exist" in text))
 
 
 def _verlangt_geraetefelder(payload: bytes | None) -> bool:
@@ -182,7 +187,8 @@ class ImmichClient:
     def _request(self, method: str, path: str, *, query: dict | None = None,
                  body: dict | None = None, raw: bytes | None = None,
                  content_type: str | None = None,
-                 extra_headers: dict | None = None) -> tuple[int, bytes]:
+                 extra_headers: dict | None = None,
+                 timeout: float | None = None) -> tuple[int, bytes]:
         if not self.configured:
             raise ImmichError("Server oder Schlüssel fehlt")
 
@@ -209,7 +215,8 @@ class ImmichClient:
         request = urllib.request.Request(url, data=data, headers=headers,
                                          method=method)
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            with urllib.request.urlopen(request,
+                                        timeout=timeout or TIMEOUT) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
@@ -404,7 +411,7 @@ class ImmichClient:
         weiter = bool(eintraege.get("nextPage"))
         return elemente, weiter
 
-    def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:  # noqa: C901
+    def thumbnail(self, asset_id: str, gross: bool = False) -> bytes | None:
         """Vorschaubild vom Server. Keine Ausnahme bei Misserfolg."""
         groesse = "preview" if gross else "thumbnail"
         # Mehrere Schreibweisen, weil sich der Weg zwischen den
@@ -428,10 +435,16 @@ class ImmichClient:
                 # lehnt einen Bildabruf damit ab.
                 status, payload = self._request(
                     "GET", pfad, query=abfrage,
-                    extra_headers={"Accept": "image/*, */*"})
+                    extra_headers={"Accept": "image/*, */*"},
+                    timeout=VORSCHAU_TIMEOUT)
             except ImmichError as exc:
                 self.letzte_vorschauversuche.append(f"{pfad}: {exc}")
                 letzter = exc
+                # Ist der Server gar nicht erreichbar, helfen die
+                # anderen Schreibweisen auch nicht - sie kosten nur
+                # dieselbe Wartezeit noch dreimal.
+                if "nicht erreichbar" in str(exc) or "Verbindungsfehler" in str(exc):
+                    break
                 continue
             # Den ANTWORTTEXT mitschreiben, nicht nur Status und Groesse.
             # Bei 403 standen dort 117 Bytes, die das fehlende Recht
@@ -569,13 +582,11 @@ class ImmichClient:
                        "withHidden": "true" if with_hidden else "false"},
             ) or {}
             batch = data.get("people") or []
-            for entry in batch:
-                if entry.get("id"):
-                    result.append(Person(
-                        id=entry["id"],
-                        name=entry.get("name") or "",
-                        hidden=bool(entry.get("isHidden")),
-                    ))
+            result.extend(
+                Person(id=entry["id"],
+                       name=entry.get("name") or "",
+                       hidden=bool(entry.get("isHidden")))
+                for entry in batch if entry.get("id"))
             if not data.get("hasNextPage") or not batch:
                 break
             page += 1

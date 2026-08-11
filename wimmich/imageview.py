@@ -242,7 +242,7 @@ class ImageView(QGraphicsView):
 
     # -- Ereignisse ----------------------------------------------------
 
-    def resizeEvent(self, event) -> None:  # noqa: N802
+    def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._fit:
             self.fit()
@@ -252,7 +252,7 @@ class ImageView(QGraphicsView):
             self.set_zoom(self.zoom_factor())
         self._place_overlay()
 
-    def wheelEvent(self, event) -> None:  # noqa: N802
+    def wheelEvent(self, event) -> None:
         if not self.has_image():
             return
         delta = event.angleDelta().y()
@@ -269,7 +269,7 @@ class ImageView(QGraphicsView):
             self.set_zoom(self.zoom_factor() * schritt, anchor)
         event.accept()
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
+    def mousePressEvent(self, event) -> None:
         if (event.button() == Qt.MouseButton.LeftButton and self._fit
                 and self.has_image()):
             # Klick im eingepassten Zustand: auf 100 % an der Klickstelle.
@@ -283,7 +283,7 @@ class ImageView(QGraphicsView):
             self._press_pos = event.position().toPoint()
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+    def mouseReleaseEvent(self, event) -> None:
         if (event.button() == Qt.MouseButton.LeftButton and not self._fit
                 and self._press_pos is not None
                 and (event.position().toPoint()
@@ -292,7 +292,7 @@ class ImageView(QGraphicsView):
         self._press_pos = None
         super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+    def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             # Qt liefert den zweiten Druck als dieses Ereignis, der erste
             # hat aber schon auf 100 % gezoomt. Das nehmen wir zurück,

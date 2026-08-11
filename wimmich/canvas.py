@@ -74,7 +74,7 @@ class CanvasView(ImageView):
 
     # -- Rahmen zeichnen -----------------------------------------------
 
-    def drawForeground(self, painter: QPainter, rect) -> None:  # noqa: N802
+    def drawForeground(self, painter: QPainter, rect) -> None:
         """Zuschnitt als Rahmen über dem ganzen Bild.
 
         Das Bild bleibt ungeschnitten sichtbar - sonst würden Retuschen,
@@ -115,7 +115,7 @@ class CanvasView(ImageView):
 
     # -- Maus ----------------------------------------------------------
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
+    def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton or not self.has_image():
             return
         point = self.mapToScene(event.position().toPoint())
@@ -136,7 +136,7 @@ class CanvasView(ImageView):
             return
         event.accept()
 
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+    def mouseMoveEvent(self, event) -> None:
         point = self.mapToScene(event.position().toPoint())
         if self._crop_drag is not None:
             self._crop_now = self._rect_from(point)
@@ -163,7 +163,7 @@ class CanvasView(ImageView):
         top = y0 if point.y() >= y0 else y0 - height
         return QRectF(left, top, width, height)
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+    def mouseReleaseEvent(self, event) -> None:
         if self._crop_drag is not None:
             self._crop_drag = None
             size = self.image_size()
@@ -184,7 +184,7 @@ class CanvasView(ImageView):
             return
         super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+    def mouseDoubleClickEvent(self, event) -> None:
         if self._mode != NONE:
             event.accept()      # beim Bearbeiten kein Vollbild
             return

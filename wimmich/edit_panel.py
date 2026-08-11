@@ -250,11 +250,11 @@ class EditPanel(QWidget):
         self._loading = True
         for field, _l, _lo, _hi, scale in GEO_SLIDERS:
             wert = getattr(geo, field, 0.0) if geo else 0.0
-            self.geo_sliders[field].setValue(int(round(wert * scale)))
+            self.geo_sliders[field].setValue(round(wert * scale))
         for field, _l, _lo, _hi, _u, scale in TONE_SLIDERS:
             value = getattr(tone, field, 0.0) if tone else 0.0
-            self.sliders[field].setValue(int(round(value * scale)))
-        self.fade_slider.setValue(int(round((fade.strength if fade else 0) * 100)))
+            self.sliders[field].setValue(round(value * scale))
+        self.fade_slider.setValue(round((fade.strength if fade else 0) * 100))
         if fade:
             self.neutral_box.setChecked(bool(fade.neutralise))
         self._loading = False
@@ -282,8 +282,8 @@ class EditPanel(QWidget):
         slider.setValue(slider.value() + direction * EV_STEP)
 
     def set_white_balance(self, warmth: float, tint: float) -> None:
-        self.sliders["warmth"].setValue(int(round(warmth * 100)))
-        self.sliders["tint"].setValue(int(round(tint * 100)))
+        self.sliders["warmth"].setValue(round(warmth * 100))
+        self.sliders["tint"].setValue(round(tint * 100))
 
     def set_quarters(self, quarters: int) -> None:
         """Vierteldrehung von außen setzen (Taste R)."""

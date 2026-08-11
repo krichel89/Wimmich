@@ -13,14 +13,15 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QEvent, QFileSystemWatcher, Qt, QThread, QTimer, pyqtSignal,
+    QEvent, QFileSystemWatcher, Qt, QThread, QThreadPool, QTimer,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter,
-    QPainterPath, QPixmap, QShortcut,
+    QAction, QBrush, QColor, QIcon, QKeySequence, QPainter,
+    QPainterPath, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox, QDialog,
     QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
@@ -30,23 +31,25 @@ from PyQt6.QtWidgets import (
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
                previews, retouch, theme, thumbs)
-from .config import Config, DB_PATH, ensure_dirs, find_exiftool, is_raw
+from .config import Config, DB_PATH, ensure_dirs, find_exiftool
 from .db import Database
 from .exif import ExifTool, ExifToolError, read_fast
-from .immich import ImmichClient, ImmichError
-from .models import PhotoDelegate, PhotoModel, ROLE_ID, ROLE_PATH, ROLE_REMOTE
+from .immich import ImmichError
+from .models import PhotoDelegate, PhotoModel
 from .previews import PreviewLoader
 from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
 from .filterbar import FilterBar
 from .icon import app_icon
-from .jahresleiste import Jahresleiste
+from .jahresleiste import Jahresleiste, monatstitel
 from . import remote_thumbs
 from .edits import (
-    CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
+    CROP, EditStack, FADED, GEOMETRY, STROKE, Step, TONE,
     array_to_qimage, downscale, qimage_to_array,
 )
 from .previews import decode as decode_image
+from .export import ExportDialog, ExportWorker
+from .serverbilder import ServerbilderMixin, _VorschauSignale
 from .settings import SettingsDialog
 from .sync import SyncWorker
 from .scanner import ScanWorker
@@ -84,7 +87,7 @@ class FolderTree(QTreeWidget):
     das Element tatsaechlich Kinder hat (siehe _add_children).
     """
 
-    def drawBranches(self, painter, rect, index) -> None:  # noqa: N802
+    def drawBranches(self, painter, rect, index) -> None:
         item = self.itemFromIndex(index)
         if item is None or item.childCount() == 0:
             return
@@ -110,8 +113,7 @@ class FolderTree(QTreeWidget):
         painter.fillPath(path, QBrush(QColor(theme.TEXT_MUTED)))
         painter.restore()
 
-
-class MainWindow(QMainWindow):
+class MainWindow(ServerbilderMixin, QMainWindow):
     start_scan = pyqtSignal(list)
 
     def __init__(self, melde=None) -> None:
@@ -136,6 +138,14 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(theme.STYLESHEET)
 
         self.loader = PreviewLoader(self)
+        # Eigener kleiner Pool fuer Server-Vorschauen in der Lupe
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(2)
+        self._vorschau_signale = _VorschauSignale()
+        self._vorschau_signale.fertig.connect(self._vorschau_da)
+        self._remote_wartet = ""
+        self._export_thread: QThread | None = None
+        self._export_worker: ExportWorker | None = None
         self._scan_thread: QThread | None = None
         self._sync_thread: QThread | None = None
         self._sync_worker: SyncWorker | None = None
@@ -193,8 +203,14 @@ class MainWindow(QMainWindow):
 
         self._chrome_visible = True
         self._panel_hidden = not bool(self.config["edit_panel"])
+        self._filter_hidden = not bool(self.config["filter_bar"])
         self._gesamt = 0        # Aufnahmen in der aktuellen Ansicht
         self._scan_worker: ScanWorker | None = None
+
+        # Dicht an dicht ist ab 0.3.33 fest eingebaut. Wer den alten
+        # Schalter einmal ausgeschaltet hatte, saehe sonst weiter das
+        # alte Raster.
+        self.config["grid_packed"] = True
 
         self._melde("Oberfläche wird aufgebaut …")
         self._build_ui()
@@ -206,6 +222,9 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self)
         self.panel_box.setVisible(False)
         self.loupe_header.setVisible(False)
+        # Die Filterleiste entsteht sichtbar - erst hier greift die
+        # Vorgabe aus der Konfiguration.
+        self._filterleiste_zeigen()
         self.loader.ready.connect(self._image_arrived)
         self._melde("Ordner werden gelesen …")
         self._reload_folder_tree()
@@ -559,6 +578,12 @@ class MainWindow(QMainWindow):
         menu_datei = leiste.addMenu("&Datei")
         menu_datei.addAction(scan_action)
         menu_datei.addSeparator()
+        self.export_action = QAction("Auswahl exportieren …", self)
+        self.export_action.setShortcut("Ctrl+Shift+E")
+        self.export_action.triggered.connect(self._export_auswahl)
+        menu_datei.addAction(self.export_action)
+        self.addAction(self.export_action)
+        menu_datei.addSeparator()
         menu_datei.addAction(settings_action)
         menu_datei.addSeparator()
         menu_datei.addAction(beenden_action)
@@ -577,6 +602,14 @@ class MainWindow(QMainWindow):
         self.panel_action.toggled.connect(self.panel_toggle.setChecked)
         menu_ansicht.addAction(self.panel_action)
         self.addAction(self.panel_action)
+
+        self.filter_action = QAction("Filterleiste", self)
+        self.filter_action.setCheckable(True)
+        self.filter_action.setChecked(bool(self.config["filter_bar"]))
+        self.filter_action.setShortcut("Ctrl+L")
+        self.filter_action.toggled.connect(self._toggle_filterleiste)
+        menu_ansicht.addAction(self.filter_action)
+        self.addAction(self.filter_action)
         menu_ansicht.addSeparator()
 
         # Gruppierung in „Alle Fotos" und „Nur auf dem Server"
@@ -594,8 +627,7 @@ class MainWindow(QMainWindow):
 
         # Was auf der Kachel steht - alles einzeln abschaltbar
         menu_kachel = menu_ansicht.addMenu("Kacheln")
-        for name, text in (("packed", "Dicht an dicht"),
-                           ("filenames", "Dateinamen"),
+        for name, text in (("filenames", "Dateinamen"),
                            ("stars", "Bewertung"),
                            ("labels", "Farbmarkierung"),
                            ("stack", "RAW+JPG-Abzeichen")):
@@ -713,10 +745,8 @@ class MainWindow(QMainWindow):
             root.takeChildren()
             for row in rows:
                 name = row["name"] or "(ohne Namen)"
-                if kind == "album":
-                    label = f"{name}  ({self.db.album_count(row['id'])})"
-                else:
-                    label = name
+                label = (f"{name}  ({self.db.album_count(row['id'])})"
+                         if kind == "album" else name)
                 item = QTreeWidgetItem([label])
                 item.setData(0, Qt.ItemDataRole.UserRole, (kind, row["id"]))
                 if kind == "album" and not row["immich_id"]:
@@ -1085,19 +1115,21 @@ class MainWindow(QMainWindow):
         kind = self._selection[0]
         if kind == "remote":
             jahre = self.db.remote_jahre()
+            monate = self.db.remote_monate()
         elif kind == "all":
-            jahre = self.db.jahre(
-                self.config.libraries,
+            filter_args = dict(
                 min_rating=self._current_min_rating(),
                 stacked=self.stack_button.isChecked(),
                 show_rejects=self.filters.show_rejects(),
                 labels=self._current_labels(),
                 unlabeled=self.filters.include_unlabeled())
+            jahre = self.db.jahre(self.config.libraries, **filter_args)
+            monate = self.db.monate(self.config.libraries, **filter_args)
         else:
-            jahre = []
+            jahre, monate = [], []
         if self.sort_desc_button.isChecked():
             jahre = list(reversed(jahre))
-        self.jahresleiste.setze_jahre(jahre)
+        self.jahresleiste.setze_jahre(jahre, monate)
         self._jahr_der_ansicht()
 
     def _jahr_der_ansicht(self) -> None:
@@ -1110,16 +1142,23 @@ class MainWindow(QMainWindow):
             item = self.model.row_data(kandidat) or {}
             taken = str(item.get("taken_at") or "")
             if len(taken) >= 4 and "_header" not in item:
-                self.jahresleiste.setze_aktuell(taken[:4])
+                # Monatsgenau, damit auch der Spiegelstrich mitwandert
+                self.jahresleiste.setze_aktuell(taken[:7] if len(taken) >= 7
+                                                else taken[:4])
                 return
 
-    def _springe_zu_jahr(self, jahr: str) -> None:
-        """Zum ersten Bild dieses Jahres blättern.
+    def _springe_zu_jahr(self, ziel: str) -> None:
+        """Zum ersten Bild dieses Jahres oder Monats blättern.
+
+        `ziel` ist entweder ein Jahr ('2026') oder ein Monat
+        ('2026-08'); verglichen wird auf so vielen Stellen, wie das
+        Ziel lang ist.
 
         Die Ansicht laedt stueckweise nach; das Ziel kann also noch gar
         nicht geholt sein. Deshalb wird nachgeschoben, bis es auftaucht
         oder nichts mehr kommt.
         """
+        stellen = len(ziel)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             geprueft = 0
@@ -1128,7 +1167,7 @@ class MainWindow(QMainWindow):
                     item = self.model.row_data(row) or {}
                     if "_header" in item:
                         continue
-                    if str(item.get("taken_at") or "")[:4] == jahr:
+                    if str(item.get("taken_at") or "")[:stellen] == ziel:
                         self._go_to_jahr(row)
                         return
                 geprueft = self.model.rowCount()
@@ -1137,7 +1176,8 @@ class MainWindow(QMainWindow):
                 self.model.fetchMore()
         finally:
             QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(f"{jahr}: nichts gefunden", 4000)
+        name = ziel if stellen <= 4 else monatstitel(ziel)
+        self.statusBar().showMessage(f"{name}: nichts gefunden", 4000)
 
     def _go_to_jahr(self, row: int) -> None:
         # Die Kopfzeile ueber dem ersten Bild soll mit ins Bild kommen
@@ -1145,7 +1185,9 @@ class MainWindow(QMainWindow):
         index = self.model.index(ziel, 0)
         self.grid.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtTop)
         self.grid.setCurrentIndex(self.model.index(row, 0))
-        self.jahresleiste.setze_aktuell(jahr_von(self.model.row_data(row)))
+        taken = str((self.model.row_data(row) or {}).get("taken_at") or "")
+        self.jahresleiste.setze_aktuell(taken[:7] if len(taken) >= 7
+                                        else taken[:4])
 
     def _toggle_subfolders(self, checked: bool) -> None:
         self.config["show_subfolders"] = checked
@@ -1283,160 +1325,6 @@ class MainWindow(QMainWindow):
             parts.append("Immich nicht eingerichtet")
         self.status_label.setText("  |  ".join(parts))
 
-    def _download_remote(self, rows: list[int]) -> None:
-        """Originale vom Server holen - nur auf ausdruecklichen Wunsch.
-
-        Die Dateien landen in einem Ordner, den Harald waehlt. Wimmich
-        legt sie NUR ab; eingelesen werden sie erst beim naechsten
-        Durchlauf, wenn der Ordner zur Bibliothek gehoert.
-        """
-        if not rows:
-            return
-        ziel = QFileDialog.getExistingDirectory(
-            self, "Wohin sollen die Originale?",
-            self.config.libraries[0] if self.config.libraries else "")
-        if not ziel:
-            return
-
-        client = ImmichClient(self.config["immich_url"], self.config["immich_key"])
-        try:
-            client.connect()
-        except ImmichError as exc:
-            QMessageBox.critical(self, "Immich nicht erreichbar", str(exc))
-            return
-
-        geholt, fehler = 0, []
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            for nummer, row in enumerate(rows, start=1):
-                item = self.model.row_data(row) or {}
-                if not item.get("_remote"):
-                    continue
-                self.statusBar().showMessage(
-                    f"Lade herunter: {item['filename']} ({nummer} von {len(rows)})")
-                QApplication.processEvents()
-                try:
-                    daten = client.download_original(item["immich_id"])
-                except ImmichError as exc:
-                    fehler.append(f"{item['filename']}: {exc}")
-                    continue
-                if not daten:
-                    fehler.append(f"{item['filename']}: nichts erhalten")
-                    continue
-                pfad = _freier_name(Path(ziel) / item["filename"])
-                try:
-                    pfad.write_bytes(daten)
-                    geholt += 1
-                except OSError as exc:
-                    fehler.append(f"{item['filename']}: {exc}")
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        self.statusBar().showMessage(
-            f"{geholt} Original(e) nach {ziel} geholt"
-            + (f", {len(fehler)} fehlgeschlagen" if fehler else ""), 8000)
-        if fehler:
-            QMessageBox.warning(
-                self, "Nicht alles geholt",
-                "\n".join(fehler[:10]) + ("\n…" if len(fehler) > 10 else ""))
-
-    # -- Serverbilder: bearbeiten und löschen ---------------------------
-
-    def _immich_verbunden(self) -> ImmichClient | None:
-        """Verbundener Client oder None samt Meldung an den Benutzer."""
-        client = ImmichClient(self.config["immich_url"], self.config["immich_key"])
-        if not client.configured:
-            QMessageBox.information(self, "Immich",
-                                    "Immich ist nicht eingerichtet.")
-            return None
-        try:
-            client.connect()
-        except ImmichError as exc:
-            QMessageBox.critical(self, "Immich nicht erreichbar", str(exc))
-            return None
-        return client
-
-    def _zielordner(self) -> str | None:
-        """Wohin geholte Originale kommen - einmal wählen, dann gemerkt.
-
-        Liegt der Ordner in keiner Bibliothek, taucht das Bild nachher
-        nirgends auf. Deshalb wird angeboten, ihn aufzunehmen.
-        """
-        ziel = str(self.config["download_dir"] or "")
-        if not ziel or not Path(ziel).is_dir():
-            start = self.config.libraries[0] if self.config.libraries else ""
-            ziel = QFileDialog.getExistingDirectory(
-                self, "Wohin sollen geholte Originale?", start)
-            if not ziel:
-                return None
-            self.config["download_dir"] = ziel
-
-        if not any(str(Path(ziel)).startswith(str(Path(lib)))
-                   for lib in self.config.libraries):
-            antwort = QMessageBox.question(
-                self, "Ordner gehört nicht zur Bibliothek",
-                f"{ziel}\n\nDieser Ordner ist keine Bibliothek von Wimmich. "
-                "Ohne ihn erscheint das geholte Bild in keiner Ansicht.\n\n"
-                "Ordner jetzt aufnehmen?")
-            if antwort == QMessageBox.StandardButton.Yes:
-                self.config.add_library(ziel)
-                self._reload_folder_tree()
-                self._apply_watch_settings()
-        return ziel
-
-    def _original_holen(self, item: dict, client: ImmichClient) -> Path | None:
-        """Ein Original vom Server holen, ablegen und einlesen."""
-        ziel = self._zielordner()
-        if not ziel:
-            return None
-        try:
-            daten = client.download_original(item["immich_id"])
-        except ImmichError as exc:
-            QMessageBox.critical(self, "Nicht geholt", str(exc))
-            return None
-        if not daten:
-            QMessageBox.warning(self, "Nicht geholt",
-                                f"{item['filename']}: nichts erhalten")
-            return None
-
-        pfad = _freier_name(Path(ziel) / item["filename"])
-        try:
-            pfad.write_bytes(daten)
-        except OSError as exc:
-            QMessageBox.critical(self, "Nicht gespeichert", str(exc))
-            return None
-        self._indiziere(pfad, item["immich_id"])
-        return pfad
-
-    def _indiziere(self, pfad: Path, immich_id: str) -> None:
-        """Frisch geholte Datei sofort in den Index aufnehmen.
-
-        Ohne das müsste erst F5 laufen, bevor das Bild sichtbar wird.
-        Die Immich-Kennung wird gleich mit eingetragen - dadurch fällt
-        das Bild aus „Nur auf dem Server" heraus (dort steht nur, wozu
-        es KEINE lokale Datei gibt) und wird beim nächsten Abgleich
-        nicht erneut hochgeladen.
-        """
-        st = pfad.stat()
-        photo_id, _neu = self.db.upsert_file(
-            str(pfad), str(pfad.parent), pfad.name, pfad.suffix.lower(),
-            is_raw(pfad), st.st_size, st.st_mtime)
-
-        meta: dict = {}
-        if not is_raw(pfad):
-            try:
-                meta = read_fast([str(pfad)]).get(str(pfad), {})
-            except Exception:
-                meta = {}
-        if not meta and self.exiftool.available:
-            try:
-                meta = self.exiftool.read_batch([str(pfad)]).get(str(pfad), {})
-            except Exception:
-                meta = {}
-        self.db.store_metadata(photo_id, meta or {})
-        self.db.set_immich(photo_id, immich_id)
-        self.db.commit()
-
     def _zeile_mit_pfad(self, pfad: str) -> int:
         """Zeilennummer einer Datei in der aktuellen Ansicht, sonst -1."""
         geprueft = 0
@@ -1470,81 +1358,6 @@ class MainWindow(QMainWindow):
                 return
             stapel.extend(item.child(i) for i in range(item.childCount()))
         self.tree.setCurrentItem(self._all_item)
-
-    def _serverbild_bearbeiten(self, row: int) -> None:
-        """Serverbild bearbeitbar machen: Original holen, dann lokal öffnen.
-
-        Bearbeitet wird bei Wimmich immer eine DATEI - die Schrittfolge
-        hängt am Pfad, und die Ausgabe rechnet in voller Auflösung neu.
-        Ein Bild, das nur auf dem Server liegt, hat beides nicht. Statt
-        die Vorschau zu verbiegen, wird deshalb das Original geholt,
-        eingelesen und ganz normal als lokales Bild geöffnet.
-        """
-        item = self.model.row_data(row) or {}
-        if not item.get("_remote"):
-            return
-        client = self._immich_verbunden()
-        if client is None:
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.statusBar().showMessage(f"Hole Original: {item['filename']} …")
-        try:
-            pfad = self._original_holen(item, client)
-        finally:
-            QApplication.restoreOverrideCursor()
-        if pfad is None:
-            return
-
-        self._refresh_view()
-        ziel = self._zeile_mit_pfad(str(pfad))
-        if ziel < 0:
-            # Wir stehen noch in „Nur auf dem Server" - dort taucht die
-            # frisch geholte Datei naturgemaess nicht auf. Also in den
-            # Ordner wechseln, in dem sie jetzt liegt.
-            self._zeige_ordner(pfad.parent)
-            ziel = self._zeile_mit_pfad(str(pfad))
-        self.statusBar().showMessage(
-            f"{pfad.name} liegt jetzt in {pfad.parent} und ist bearbeitbar", 8000)
-        if ziel >= 0:
-            self._show_loupe(ziel)
-
-    def _serverbilder_loeschen(self, rows: list[int]) -> None:
-        """Bilder auf dem Immich-Server löschen - nach Rückfrage.
-
-        Lokale Dateien rührt Wimmich weiterhin nicht an; hier geht es
-        ausschließlich um Aufnahmen, die es NUR auf dem Server gibt.
-        """
-        eintraege = [self.model.row_data(r) or {} for r in rows]
-        ids = [e["immich_id"] for e in eintraege if e.get("_remote")]
-        if not ids:
-            return
-        namen = ", ".join(e["filename"] for e in eintraege[:5] if e.get("_remote"))
-        antwort = QMessageBox.question(
-            self, "Auf dem Server löschen",
-            f"{len(ids)} Aufnahme(n) auf dem Immich-Server löschen?\n\n"
-            f"{namen}{' …' if len(ids) > 5 else ''}\n\n"
-            "Sie landen im Papierkorb von Immich und lassen sich dort "
-            "zurückholen. Lokale Dateien sind nicht betroffen.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if antwort != QMessageBox.StandardButton.Yes:
-            return
-
-        client = self._immich_verbunden()
-        if client is None:
-            return
-        try:
-            client.delete_assets(ids)
-        except ImmichError as exc:
-            QMessageBox.critical(self, "Nicht gelöscht", str(exc))
-            return
-        self.db.forget_remote(ids)
-        if self.in_loupe:
-            self._show_grid()
-        self._refresh_view()
-        self.statusBar().showMessage(
-            f"{len(ids)} Aufnahme(n) auf dem Server gelöscht "
-            "(Papierkorb von Immich)", 8000)
 
     def _grid_menu(self, position) -> None:
         """Rechtsklick auf eine Kachel.
@@ -1587,6 +1400,8 @@ class MainWindow(QMainWindow):
     def _build_grid_menu(self, count: int) -> QMenu:
         menu = QMenu(self)
         menu.addAction("In der Lupe öffnen …\tE", self._loupe_from_selection)
+        menu.addAction(f"{count} Aufnahme(n) exportieren …\tStrg+Umsch+E",
+                       self._export_auswahl)
         menu.addSeparator()
 
         stars = menu.addMenu("Bewertung")
@@ -1728,13 +1543,15 @@ class MainWindow(QMainWindow):
             self._loupe_from_selection()
 
     def _show_grid(self) -> None:
+        self._remote_wartet = ""
+        self._vorschau_signale.gewuenscht = ""
         self._set_tool(TOOL_NONE)
         self._crop_mode = False
         self.pages.setCurrentIndex(0)
         self.panel_box.setVisible(False)
         self.loupe_header.setVisible(False)
         self.crop_bar.setVisible(False)
-        self.filter_bar.setVisible(self._chrome_visible)
+        self._filterleiste_zeigen()
         self.grid.setFocus()
         if 0 <= self._loupe_row < self.model.rowCount():
             index = self.model.index(self._loupe_row, 0)
@@ -1752,6 +1569,21 @@ class MainWindow(QMainWindow):
         self._load_loupe(row)
         self.canvas.setFocus()
 
+    def _filterleiste_zeigen(self) -> None:
+        """Filterleiste nur zeigen, wenn sie eingeschaltet ist.
+
+        Sie gehoert zum Raster; in der Lupe ist sie ohnehin weg, und
+        ausgeblendete Leisten (Tab) haben Vorrang.
+        """
+        self.filter_bar.setVisible(
+            self._chrome_visible and not self.in_loupe
+            and not self._filter_hidden)
+
+    def _toggle_filterleiste(self, checked: bool) -> None:
+        self._filter_hidden = not checked
+        self.config["filter_bar"] = bool(checked)
+        self._filterleiste_zeigen()
+
     def _toggle_panel_column(self, checked: bool) -> None:
         """Blendet NUR die Bearbeitungsspalte aus - Bild und Kopfzeile bleiben.
 
@@ -1768,85 +1600,6 @@ class MainWindow(QMainWindow):
         self.panel_box.setVisible(checked and self._chrome_visible and self.in_loupe)
         if checked and self.in_loupe and self._remote_aktiv():
             self._serverbild_bearbeiten(self._loupe_row)
-
-    def _load_remote_loupe(self, row: int, item: dict) -> None:
-        """Grossansicht eines Bildes, das nur auf dem Server liegt.
-
-        Gezeigt wird die groessere Server-Vorschau, NICHT das Original -
-        das holt Wimmich nur auf ausdruecklichen Wunsch. Bearbeiten ist
-        hier ausgeschaltet: es gibt keine Datei, in die etwas
-        zurueckgeschrieben werden koennte.
-        """
-        self._loupe_row = row
-        self._loupe_path = ""
-        self._want_full = False
-        self._show_before = False
-        self._stroke = []
-        self.panel.sperre(
-            "Dieses Bild liegt nur auf dem Server. Bearbeiten braucht "
-            "eine Datei — mit „Original holen und bearbeiten“ (oder dem "
-            "Stift oben) holt Wimmich sie in deine Bibliothek.")
-        self.remote_edit_button.setVisible(True)
-        self.remote_delete_button.setVisible(True)
-        # Reste des vorigen Bildes wegräumen. Sonst zeigen Zuschnitt,
-        # Vorher/Nachher und die Regler noch auf dessen Daten - genau
-        # daran sind Aktionen wie „Zuschnitt aufheben" abgestürzt.
-        self._stack_edits = EditStack()
-        self._loupe_small = None
-        self._loupe_full = None
-        self._crop_mode = False
-        self.crop_bar.setVisible(False)
-        self._set_tool(TOOL_NONE)
-
-        # Reihenfolge: grosse Vorschau (Cache oder Server), sonst die
-        # kleine aus dem Cache, sonst die Kachel, die schon im Fenster
-        # steht. Erst wenn NICHTS davon da ist, wird gemeckert - die
-        # Meldung „Vorschau vom Server nicht verfuegbar“ ueber einem
-        # Bild, das man sieht, ist nur Laerm.
-        kennung = item["immich_id"]
-        client = getattr(self.model, "_immich_client", None)
-        bild = None
-        for daten in self._vorschau_quellen(client, kennung):
-            versuch = previews.lade_qimage_aus_bytes(daten)
-            if not versuch.isNull():
-                bild = versuch
-                break
-
-        if bild is None:
-            bild = self.model.kachel_bild(row)
-
-        if bild is None or bild.isNull():
-            self.canvas.clear_image()
-            self.canvas.set_info_overlay("Vorschau vom Server nicht verfügbar")
-            self.canvas.show_info_overlay(True)
-        else:
-            self.canvas.set_image(bild)
-
-        self.loupe_title.setText(
-            f'<b>{_html_escape(item["filename"])}</b>'
-            f'&nbsp;&nbsp;&nbsp;<span style="color:{theme.TEXT_MUTED}">'
-            f'nur auf dem Server — Vorschau, nicht das Original</span>')
-        self.setWindowTitle(
-            f"{APP_NAME} {__version__} — {item['filename']} (nur auf dem Server)")
-        self.canvas.set_overlay("Nur auf dem Server")
-
-    @staticmethod
-    def _vorschau_quellen(client, kennung: str):
-        """Vorschaudaten eines Serverbildes, beste zuerst.
-
-        Liefert nacheinander: grosse Vorschau (Cache, sonst Server),
-        kleine Vorschau aus dem Cache. Jeder Schritt darf scheitern -
-        dann kommt der naechste dran.
-        """
-        for gross in (True, False):
-            try:
-                daten = remote_thumbs.fetch(client, kennung, gross=gross)
-            except Exception:
-                daten = None
-            if not daten and not gross:
-                daten = remote_thumbs.cached(kennung, gross=False)
-            if daten:
-                yield daten
 
     def _load_loupe(self, row: int) -> None:
         item = self.model.row_data(row)
@@ -2056,7 +1809,7 @@ class MainWindow(QMainWindow):
         """
         self._chrome_visible = visible
         self.menuBar().setVisible(visible)
-        self.filter_bar.setVisible(visible and not self.in_loupe)
+        self._filterleiste_zeigen()
         self.tree.setVisible(visible)
         self.statusBar().setVisible(visible)
         self.loupe_header.setVisible(visible and self.in_loupe)
@@ -2065,8 +1818,6 @@ class MainWindow(QMainWindow):
 
     def _toggle_chrome(self) -> None:
         self._set_chrome(not self._chrome_visible)
-        self.statusBar().showMessage(
-            "" if self._chrome_visible else "", 1)
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -2229,15 +1980,6 @@ class MainWindow(QMainWindow):
         self._render_loupe(keep_view=True)
         self._save_edits()
 
-    def _remote_aktiv(self) -> bool:
-        """Steht gerade ein reines Serverbild in der Lupe?
-
-        Für solche Bilder gibt es keine lokale Datei: Zuschnitt, Regler
-        und Retusche haben nichts, worauf sie wirken könnten.
-        """
-        item = self.model.row_data(self._loupe_row) if self.in_loupe else None
-        return bool(item and item.get("_remote"))
-
     def _clear_crop(self) -> None:
         if self._remote_aktiv():
             return
@@ -2365,7 +2107,7 @@ class MainWindow(QMainWindow):
         if self._loupe_source is None:
             return
         value = retouch.auto_faded_strength(self._loupe_source)
-        self.panel.fade_slider.setValue(int(round(value * 100)))
+        self.panel.fade_slider.setValue(round(value * 100))
         self.statusBar().showMessage(
             f"Vorschlag: {value * 100:.0f} % Auffrischen" if value
             else "Das Bild wirkt nicht verblasst.", 4000)
@@ -2403,6 +2145,100 @@ class MainWindow(QMainWindow):
         self.db.save_edits(self._loupe_path, self._stack_edits.to_json())
         self.model.set_edited(self.db.edited_paths())
 
+    def _export_auswahl(self) -> None:
+        """Stapel-Export: die ausgewaehlten Bilder in einen Ordner rechnen.
+
+        Reine Serverbilder haben keine Datei und fallen heraus - gerechnet
+        wird immer aus dem Original auf der Platte.
+        """
+        if self._export_thread is not None:
+            self.statusBar().showMessage("Es läuft bereits ein Export.", 4000)
+            return
+        rows = sorted({idx.row() for idx in self.grid.selectedIndexes()})
+        if not rows and self.in_loupe and self._loupe_path:
+            rows = [self._loupe_row]
+
+        auftraege: list[tuple[str, str | None]] = []
+        ohne_datei = 0
+        for row in rows:
+            item = self.model.row_data(row) or {}
+            pfad = str(item.get("path") or "")
+            if not pfad:
+                ohne_datei += 1
+                continue
+            auftraege.append((pfad, self.db.load_edits(pfad)))
+
+        if not auftraege:
+            QMessageBox.information(
+                self, "Nichts zu exportieren",
+                "Es ist kein Bild mit lokaler Datei ausgewählt."
+                + (" Reine Serverbilder müssen erst geholt werden."
+                   if ohne_datei else ""))
+            return
+
+        dialog = ExportDialog(len(auftraege), self.config["export_dir"], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        optionen = dialog.optionen()
+        if optionen is None:
+            self.statusBar().showMessage("Kein Zielordner gewählt.", 4000)
+            return
+        self.config["export_dir"] = str(optionen.ziel)
+
+        self._starte_export(auftraege, optionen, ohne_datei)
+
+    def _starte_export(self, auftraege, optionen, ohne_datei: int) -> None:
+        """Den Stapel in einem eigenen Faden rechnen lassen.
+
+        Im Fensterfaden stuende das Programm: ein 45-MP-RAW mit
+        Retuschen braucht Sekunden, und der Balken soll laufen.
+        """
+        self._export_ohne_datei = ohne_datei
+        self.sync_progress_bar.setRange(0, len(auftraege))
+        self.sync_progress_bar.setValue(0)
+        self.sync_progress_bar.setVisible(True)
+        self.sync_label.setText("Export läuft …")
+        self.sync_label.setVisible(True)
+
+        self._export_thread = QThread(self)
+        self._export_worker = ExportWorker(auftraege, optionen)
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.fortschritt.connect(self._export_fortschritt)
+        self._export_worker.fertig.connect(self._export_fertig)
+        self._export_thread.start()
+
+    def _export_fortschritt(self, name: str, fertig: int, gesamt: int) -> None:
+        self.sync_progress_bar.setValue(fertig)
+        self.sync_label.setText(
+            f"Export {fertig}/{gesamt}" + (f": {name}" if name else ""))
+
+    def _export_fertig(self, geschrieben: int, uebersprungen: int,
+                       fehler: list) -> None:
+        if self._export_thread is not None:
+            self._export_thread.quit()
+            self._export_thread.wait(5000)
+        self._export_thread = None
+        self._export_worker = None
+        self.sync_progress_bar.setVisible(False)
+
+        teile = [f"{geschrieben} Bild(er) exportiert"]
+        if uebersprungen:
+            teile.append(f"{uebersprungen} ohne Bearbeitung übersprungen")
+        if getattr(self, "_export_ohne_datei", 0):
+            teile.append(f"{self._export_ohne_datei} ohne lokale Datei")
+        if fehler:
+            teile.append(f"{len(fehler)} Fehler")
+        self.sync_label.setText(", ".join(teile))
+        self.sync_label.setVisible(True)
+
+        if fehler:
+            QMessageBox.warning(
+                self, "Export mit Fehlern",
+                "Diese Bilder konnten nicht geschrieben werden:\n\n"
+                + "\n".join(fehler[:12])
+                + (f"\n… und {len(fehler) - 12} weitere" if len(fehler) > 12 else ""))
+
     def _export_edited(self) -> None:
         if not self._stack_edits or not self._loupe_path:
             QMessageBox.information(self, "Nichts zu speichern",
@@ -2432,7 +2268,7 @@ class MainWindow(QMainWindow):
 
     # -- Tasten --------------------------------------------------------
 
-    def eventFilter(self, obj, event):  # noqa: N802
+    def eventFilter(self, obj, event):
         """Tasten aus Raster, Lupe und Baum zentral behandeln.
 
         Bis 0.3.29 stand diese Methode zwar da, war aber NIRGENDS
@@ -2442,9 +2278,9 @@ class MainWindow(QMainWindow):
         Liste sie fuer ihre eigene Auswahl genommen und aus Ziffern eine
         Namenssuche gemacht - „3" setzte also keine Bewertung.
         """
-        if event.type() == QEvent.Type.KeyPress and self._tasten_hier(obj):
-            if self._handle_key(event):
-                return True
+        if (event.type() == QEvent.Type.KeyPress and self._tasten_hier(obj)
+                and self._handle_key(event)):
+            return True
         return super().eventFilter(obj, event)
 
     def _tasten_hier(self, obj) -> bool:
@@ -2461,11 +2297,9 @@ class MainWindow(QMainWindow):
         fokus = QApplication.focusWidget()
         if isinstance(fokus, (QLineEdit, QComboBox, QAbstractSpinBox)):
             return False
-        if isinstance(fokus, QWidget) and fokus.window() is not self:
-            return False
-        return True
+        return not (isinstance(fokus, QWidget) and fokus.window() is not self)
 
-    def keyPressEvent(self, event) -> None:  # noqa: N802
+    def keyPressEvent(self, event) -> None:
         if not self._handle_key(event):
             super().keyPressEvent(event)
 
@@ -2847,36 +2681,6 @@ class MainWindow(QMainWindow):
         self.canvas.viewport().update()
         self.update()
 
-    def _apply_remote_client(self) -> None:
-        """Dem Rastermodell einen Client fuer Server-Vorschauen geben.
-
-        Ohne ihn blieben die Kacheln der reinen Serverbilder leer. Der
-        Client wird NUR fuer Vorschauen benutzt; Originale holt allein
-        _download_remote() auf ausdruecklichen Wunsch.
-        """
-        url, key = self.config["immich_url"], self.config["immich_key"]
-        if url and key:
-            client = ImmichClient(url, key)
-            try:
-                client.connect()
-            except ImmichError:
-                client = None       # spaeter erneut versuchen
-        else:
-            client = None
-        self.model._immich_client = client
-        self._remote_item.setHidden(client is None and not self.db.remote_count())
-
-    def _apply_sync_settings(self) -> None:
-        """Zeitgeber nach den Einstellungen an- oder abschalten."""
-        auto = (bool(self.config["immich_auto"])
-                and bool(self.config["immich_url"])
-                and bool(self.config["immich_key"]))
-        if auto:
-            minutes = max(1, int(self.config["immich_interval_min"]))
-            self._sync_timer.start(minutes * 60 * 1000)
-        else:
-            self._sync_timer.stop()
-
     def _apply_watch_settings(self) -> None:
         """Bibliotheksordner überwachen - oder eben nicht."""
         for group in (self._watcher.directories(), self._watcher.files()):
@@ -2920,132 +2724,6 @@ class MainWindow(QMainWindow):
         self._sync_after_scan = bool(self.config["immich_auto"])
         self._rescan()
 
-    def _auto_sync(self) -> None:
-        """Regelmäßiger Durchlauf. Still: keine Fenster, keine Störung."""
-        if self._sync_thread is not None or self._scan_thread is not None:
-            return
-        if not (self.config["immich_url"] and self.config["immich_key"]):
-            return
-        self._start_sync(quiet=True)
-
-    def _start_sync(self, quiet: bool = False) -> None:
-        """quiet=True: der laufende Abgleich. Meldet sich nur in der
-        Statuszeile und öffnet bei Fehlern kein Fenster - sonst würde
-        ein kurz nicht erreichbarer Server alle 15 Minuten stören."""
-        if self._sync_thread is not None:
-            if not quiet:
-                self.statusBar().showMessage("Der Abgleich läuft bereits", 3000)
-            return
-        if not (self.config["immich_url"] and self.config["immich_key"]):
-            if not quiet:
-                self._open_settings()
-            return
-        self._sync_quiet = quiet
-
-        thread = QThread(self)
-        worker = SyncWorker(
-            self.config["immich_url"], self.config["immich_key"],
-            upload=bool(self.config["immich_upload"]),
-            fetch_people=bool(self.config["immich_people"]),
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._sync_progress)
-        worker.finished.connect(self._sync_finished)
-        worker.failed.connect(self._sync_failed)
-        thread.start()
-
-        self._sync_thread = thread
-        self._sync_worker = worker
-        self.sync_progress_bar.setRange(0, 0)   # unbestimmt, bis der erste Wert kommt
-        self.sync_progress_bar.setValue(0)
-        self.sync_progress_bar.setVisible(True)
-        self.sync_label.setText("Abgleich mit Immich läuft …")
-        self.sync_label.setVisible(True)
-
-    def _sync_progress(self, message: str, done: int, total: int) -> None:
-        self.sync_label.setText(message)
-        self.sync_label.setVisible(True)
-        if total > 0:
-            self.sync_progress_bar.setRange(0, total)
-            self.sync_progress_bar.setValue(min(done, total))
-        else:
-            # Kein Gesamtwert bekannt (z. B. beim Verbinden oder zwischen
-            # Alben/Personen) - unbestimmter Balken statt eingefrorener Wert.
-            self.sync_progress_bar.setRange(0, 0)
-
-    def _sync_finished(self, result) -> None:
-        self._teardown_sync()
-        self._reload_immich_tree()
-        self._refresh_view()
-        self._update_status()
-
-        parts = [f"{result.checked} geprüft"]
-        if result.uploaded:
-            parts.append(f"{result.uploaded} hochgeladen")
-        if result.already_there:
-            parts.append(f"{result.already_there} waren schon da")
-        if result.skipped:
-            parts.append(f"{result.skipped} übersprungen (Typ nicht angenommen)")
-        if result.failed:
-            parts.append(f"{result.failed} fehlgeschlagen")
-        self.sync_label.setText("Abgleich fertig: " + ", ".join(parts))
-        self.sync_label.setVisible(True)
-
-        self._apply_remote_client()
-        if result.errors and not self._sync_quiet:
-            QMessageBox.warning(
-                self, "Abgleich mit Fehlern",
-                "Diese Dateien konnten nicht übertragen werden:\n\n"
-                + "\n".join(result.errors[:10])
-                + ("\n…" if len(result.errors) > 10 else ""),
-            )
-        elif result.errors:
-            # Auch im stillen Modus darf ein dauerhaft scheiternder Abgleich
-            # nicht spurlos bleiben - sonst laeuft er wochenlang ins Leere.
-            self.statusBar().showMessage(
-                f"Abgleich mit {result.failed} Fehlern: {result.errors[0]}", 15000)
-
-    def _sync_failed(self, message: str) -> None:
-        quiet = self._sync_quiet
-        self._teardown_sync()
-        if quiet:
-            # Still weiterlaufen lassen: beim nächsten Durchlauf wird
-            # erneut versucht. Nur die Statuszeile sagt Bescheid.
-            self.sync_label.setText(f"Abgleich nicht möglich: {message}")
-            self.sync_label.setVisible(True)
-        else:
-            QMessageBox.critical(self, "Abgleich fehlgeschlagen", message)
-            self.statusBar().clearMessage()
-
-    def _teardown_sync(self) -> None:
-        if self._sync_thread is not None:
-            self._sync_thread.quit()
-            self._sync_thread.wait(5000)
-        self._sync_thread = None
-        self._sync_worker = None
-        # Balken noch kurz stehen lassen. Ein Abgleich, bei dem schon alles
-        # zugeordnet ist, ist in Sekundenbruchteilen vorbei - der Balken
-        # waere sonst nur ein unsichtbares Aufblitzen, und es sieht aus,
-        # als sei nie etwas passiert.
-        self.sync_progress_bar.setRange(0, 1)
-        self.sync_progress_bar.setValue(1)
-        QTimer.singleShot(2000, lambda: self.sync_progress_bar.setVisible(
-            self._sync_thread is not None))
-        # Das Ergebnis bleibt STEHEN, bis der naechste Abgleich es
-        # ersetzt. Frueher verschwand es nach 30 Sekunden - wer in der
-        # Zeit nicht hinsah, erfuhr nie, wie der Abgleich ausgegangen ist.
-
-    def _zeige_serverfehler(self, grund: str) -> None:
-        """Ausbleibende Server-Vorschauen sichtbar machen.
-
-        Vorher blieb die Kachel einfach grau - kein Hinweis, kein
-        Logeintrag, nichts zum Nachgehen. Der Text steht in der
-        Statuszeile, bis etwas anderes ihn ersetzt.
-        """
-        self.sync_label.setText(f"Server-Vorschau kommt nicht an — {grund}")
-        self.sync_label.setVisible(True)
-
     def _show_diagnose(self) -> None:
         """Sagt, woran es hängt, statt raten zu lassen.
 
@@ -3054,8 +2732,7 @@ class MainWindow(QMainWindow):
         oder schlicht ein noch nicht durchgelaufener Metadatenlauf.
         """
         import time
-        from . import previews, retouch as _r
-        from .exif import read_fast
+        from . import retouch as _r
 
         zeilen = [f"<b>Wimmich {__version__}</b><table cellpadding='4'>"]
 
@@ -3226,13 +2903,21 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         self.statusBar().showMessage(f"{removed} Vorschaubilder gelöscht", 4000)
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def closeEvent(self, event) -> None:
         if self._scan_worker is not None:
             self._scan_worker.cancel()
         self._sync_timer.stop()
         self._watch_delay.stop()
         if self._sync_worker is not None:
             self._sync_worker.cancel()
+        # Ein laufender Stapel-Export muss enden, bevor das Fenster
+        # abgeraeumt wird - sonst meldet sich der Faden ins Leere.
+        if self._export_worker is not None:
+            self._export_worker.abbrechen()
+        if self._export_thread is not None:
+            self._export_thread.quit()
+            self._export_thread.wait(5000)
+            self._export_thread = None
         self._teardown_scan()
         self._teardown_sync()
         # Laufende Kachelaufgaben abwarten: sie melden sich ueber
@@ -3241,6 +2926,10 @@ class MainWindow(QMainWindow):
         # deleted". Beim Beenden im Testlauf nachgestellt.
         from PyQt6.QtCore import QThreadPool
         QThreadPool.globalInstance().waitForDone(3000)
+        # Auch der eigene Pool fuer Server-Vorschauen - sonst meldet Qt
+        # beim Beenden „wrapped C/C++ object ... has been deleted".
+        self._remote_wartet = ""
+        self._pool.waitForDone(3000)
         self.exiftool.stop()
         self.db.close()
         super().closeEvent(event)
@@ -3259,19 +2948,6 @@ def _has_subfolders(path: Path) -> bool:
     except OSError:
         pass
     return False
-
-
-def _freier_name(pfad: Path) -> Path:
-    """Nie eine vorhandene Datei ueberschreiben - Wimmich loescht nichts."""
-    if not pfad.exists():
-        return pfad
-    stamm, endung = pfad.stem, pfad.suffix
-    nummer = 1
-    while True:
-        kandidat = pfad.with_name(f"{stamm} ({nummer}){endung}")
-        if not kandidat.exists():
-            return kandidat
-        nummer += 1
 
 
 def jahr_von(item: dict | None) -> str:

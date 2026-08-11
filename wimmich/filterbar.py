@@ -11,8 +11,7 @@ Ablehnung hat keine sinnvolle Sternzahl.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import QSize, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from . import marks, theme
@@ -113,9 +112,8 @@ class FilterBar(QWidget):
             return None
         texte = []
         for index in sorted(self._colors):
-            for satz in marks.LABEL_SETS.values():
-                if index < len(satz):
-                    texte.append(satz[index])
+            texte.extend(satz[index] for satz in marks.LABEL_SETS.values()
+                         if index < len(satz))
         return texte
 
     def include_unlabeled(self) -> bool:

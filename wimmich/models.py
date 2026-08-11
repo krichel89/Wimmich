@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from PyQt6.QtCore import (
     QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRectF, QRunnable,
     QSize, Qt, QThreadPool, pyqtSignal,
@@ -180,10 +182,10 @@ class PhotoModel(QAbstractListModel):
 
     # -- Nachschub ------------------------------------------------------
 
-    def canFetchMore(self, parent=QModelIndex()) -> bool:  # noqa: N802
+    def canFetchMore(self, parent=QModelIndex()) -> bool:
         return not parent.isValid() and not self._erschoepft
 
-    def fetchMore(self, parent=QModelIndex()) -> None:  # noqa: N802
+    def fetchMore(self, parent=QModelIndex()) -> None:
         if not parent.isValid():
             self._nachladen(self.CHUNK)
 
@@ -254,7 +256,7 @@ class PhotoModel(QAbstractListModel):
             return self._rows[row]
         return None
 
-    def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802 (Qt-Namen)
+    def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
@@ -311,7 +313,7 @@ class PhotoModel(QAbstractListModel):
             return item
         return None
 
-    def flags(self, index):  # noqa: N802
+    def flags(self, index):
         """Kopfzeilen sind nicht auswählbar."""
         base = super().flags(index)
         if index.isValid() and self.is_header(index.row()):
@@ -454,7 +456,7 @@ class PhotoDelegate(QStyledItemDelegate):
     # Grenzen der Kachelbreite im dichten Raster (Vielfache der Hoehe)
     MIN_VERHAELTNIS, MAX_VERHAELTNIS = 0.55, 2.2
 
-    VORGABEN = {
+    VORGABEN: ClassVar[dict] = {
         "packed": True,      # dicht an dicht, ohne Beschriftungsband
         "filenames": False,  # Dateiname unter der Kachel
         "stars": True,       # Sterne (im dichten Raster auf dem Bild)
@@ -469,6 +471,12 @@ class PhotoDelegate(QStyledItemDelegate):
         self.optionen = dict(self.VORGABEN)
         if optionen:
             self.optionen.update(optionen)
+        # Dicht an dicht ist keine Wahl mehr, sondern der Bauplan:
+        # gleich hohe Kachel, Breite nach Seitenverhaeltnis, eckig.
+        # Solange es ein Schalter war, stand er bei Harald aus - mit
+        # dem Ergebnis, das er zweimal gemeldet hat (gleich grosse,
+        # abgerundete Kacheln mit Luft daneben).
+        self.optionen["packed"] = True
         self._masse()
 
     def _masse(self) -> None:
@@ -483,10 +491,12 @@ class PhotoDelegate(QStyledItemDelegate):
         self.label_height = band
 
     def setze(self, name: str, wert: bool) -> None:
+        if name == "packed":
+            return          # nicht mehr abschaltbar, siehe __init__
         self.optionen[name] = bool(wert)
         self._masse()
 
-    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+    def sizeHint(self, option, index) -> QSize:
         if index is not None and index.isValid() and index.data(ROLE_HEADER):
             # Volle Breite, damit die Kopfzeile eine eigene Reihe bekommt
             width = self._viewport_width(option)
@@ -515,7 +525,7 @@ class PhotoDelegate(QStyledItemDelegate):
             verhaeltnis = 1.0     # ohne Massangaben quadratisch
         verhaeltnis = min(max(verhaeltnis, self.MIN_VERHAELTNIS),
                           self.MAX_VERHAELTNIS)
-        return int(round(self.tile * verhaeltnis))
+        return round(self.tile * verhaeltnis)
 
     @staticmethod
     def _viewport_width(option) -> int:

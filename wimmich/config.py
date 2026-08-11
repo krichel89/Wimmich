@@ -72,6 +72,10 @@ DEFAULTS = {
     # die fehlen sonst dem Bild. Das Stiftsymbol in der Kopfzeile holt
     # sie hervor.
     "edit_panel": False,
+    # Filterleiste ueber dem Raster. Vorgabe AUS - sie kostet eine Zeile
+    # ueber dem Bild und wird selten gebraucht.
+    "filter_bar": False,
+    "export_dir": "",         # zuletzt gewaehlter Zielordner des Stapel-Exports
     # Immich. Der Schlüssel liegt im Klartext in dieser Datei - sie steht
     # im Benutzerprofil und ist nur für den angemeldeten Benutzer lesbar,
     # aber sie ist keine Schlüsselverwaltung. Wer mehr will, vergibt in

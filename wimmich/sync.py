@@ -206,8 +206,9 @@ class SyncWorker(QObject):
                         pool.submit(self._upload_versuch, client, by_id[k]): k
                         for k in stapel
                     }
-                    for auftrag in as_completed(auftraege):
-                        ergebnisse.append((auftrag.result(), auftraege[auftrag]))
+                    ergebnisse.extend(
+                        (auftrag.result(), auftraege[auftrag])
+                        for auftrag in as_completed(auftraege))
 
                 for (asset_id, duplikat, fehler), key in ergebnisse:
                     row = by_id[key]
@@ -458,9 +459,9 @@ class SyncWorker(QObject):
     def _album_wartet(self, album_id: str) -> bool:
         """Steht noch ein Bild ohne Immich-Kennung im Album?"""
         for zeile in self._db.album_eintraege(album_id, entfernt=False):
-            if not zeile["immich_id"] and zeile["path"]:
-                if not self._db.immich_id_fuer_pfad(zeile["path"]):
-                    return True
+            if (not zeile["immich_id"] and zeile["path"]
+                    and not self._db.immich_id_fuer_pfad(zeile["path"])):
+                return True
         return False
 
     def _sync_people(self, client: ImmichClient) -> None:

@@ -14,6 +14,7 @@ oder später; siehe LICENSE. Ohne jede Gewährleistung.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 from .config import CACHE_DIR, Config
@@ -24,6 +25,16 @@ _sperre = threading.Lock()
 _client_sperre = threading.Lock()
 _ersatz_client = None
 _letzte_meldung = ""
+# Ist der Server nicht erreichbar, wird bis zu diesem Zeitpunkt gar
+# nicht mehr gefragt. Ohne diese Sperre wartet JEDE Kachel und jede
+# Lupe erneut die volle Zeitgrenze ab - das Fenster steht dann.
+_tot_bis = 0.0
+TOTPAUSE = 30.0
+
+
+def server_gilt_als_tot() -> bool:
+    """Wird der Server gerade uebersprungen? - fuer Meldung und Diagnose."""
+    return time.monotonic() < _tot_bis
 
 
 def letzte_meldung() -> str:
@@ -81,10 +92,13 @@ def fetch(client, immich_id: str, gross: bool = False) -> bytes | None:
     Liefert None, wenn der Server sie nicht hergibt. Das ist kein Fehler:
     die Kachel zeigt dann einen Platzhalter.
     """
-    global _letzte_meldung
+    global _letzte_meldung, _tot_bis
     vorhanden = cached(immich_id, gross)
     if vorhanden:
         return vorhanden
+
+    if time.monotonic() < _tot_bis:
+        return None          # Server gilt gerade als nicht erreichbar
 
     if client is None:
         client = _client_bei_bedarf()
@@ -95,10 +109,16 @@ def fetch(client, immich_id: str, gross: bool = False) -> bytes | None:
         daten = client.thumbnail(immich_id, gross=gross)
     except Exception as exc:                     # Netz, Zeitgrenze, alles
         _letzte_meldung = f"{immich_id}: {exc}"
+        _tot_bis = time.monotonic() + TOTPAUSE
         return None
     if not daten:
         _letzte_meldung = f"{immich_id}: Server lieferte keine Vorschau"
+        if getattr(client, "letzte_vorschauversuche", None) and any(
+                "nicht erreichbar" in v or "Verbindungsfehler" in v
+                for v in client.letzte_vorschauversuche):
+            _tot_bis = time.monotonic() + TOTPAUSE
         return None
+    _tot_bis = 0.0
 
     with _sperre:
         try:

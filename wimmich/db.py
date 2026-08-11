@@ -14,10 +14,10 @@ import time
 import uuid
 from pathlib import Path
 
-from .config import DB_PATH, CONFIG_DIR
+from .config import DB_PATH
 from .marks import REJECT, clamp_rating
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -267,6 +267,14 @@ class Database:
         # bei einer alten Datenbank (Lehre aus Schema 8)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_album_photos_path "
                      "ON album_photos(path)")
+
+        # Schema 11: Indizes fuer die beiden uebrigen Sortierungen.
+        # Gemessen an 60 000 Aufnahmen: „zuletzt geaendert" 49 ms ohne,
+        # 0,4 ms mit Index; „Dateiname" 3,4 ms ohne, 0,3 ms mit.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_filename "
+                     "ON photos(filename)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_mtime "
+                     "ON photos(mtime)")
 
         missing = conn.execute(
             "SELECT id, folder, filename FROM photos WHERE stack_key IS NULL"
@@ -764,6 +772,39 @@ class Database:
         ).fetchall()
         return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
 
+    def monate(self, roots: list[str], min_rating: int = 0,
+               stacked: bool = True, show_rejects: bool = True,
+               labels: list[str] | None = None,
+               unlabeled: bool = False) -> list[tuple[str, int]]:
+        """(Jahr-Monat, Anzahl) - derselbe Filtersatz wie jahre()."""
+        if not roots:
+            return []
+        where, params = _roots_where(roots)
+        where, params = _add_filters(where, params, min_rating,
+                                     show_rejects, labels, unlabeled)
+        spalte = "DISTINCT p.stack_key" if stacked else "*"
+        rows = self.conn.execute(
+            f"""SELECT substr(p.taken_at, 1, 7) AS monat, COUNT({spalte})
+                FROM photos p
+                WHERE {where} AND p.taken_at IS NOT NULL AND p.taken_at <> ''
+                GROUP BY monat ORDER BY monat""",
+            params,
+        ).fetchall()
+        return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
+
+    def remote_monate(self) -> list[tuple[str, int]]:
+        """Dasselbe fuer die Bilder, die nur auf dem Server liegen."""
+        rows = self.conn.execute(
+            """SELECT substr(r.taken_at, 1, 7) AS monat, COUNT(*)
+               FROM remote_assets r
+               WHERE r.taken_at IS NOT NULL AND r.taken_at <> ''
+                 AND NOT EXISTS (SELECT 1 FROM photos p
+                                 WHERE p.immich_id = r.immich_id
+                                   AND p.immich_id <> '')
+               GROUP BY monat ORDER BY monat"""
+        ).fetchall()
+        return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
+
     def remote_jahre(self) -> list[tuple[str, int]]:
         """Dasselbe fuer die Bilder, die nur auf dem Server liegen."""
         rows = self.conn.execute(
@@ -805,6 +846,8 @@ class Database:
         """Server-Bilder eines Albums oder einer Person ohne lokale Datei."""
         if table not in ("album_assets", "person_assets"):
             raise ValueError("unbekannte Tabelle")
+        if key_column not in ("album_id", "person_id"):
+            raise ValueError("unbekannte Spalte")
         return self.conn.execute(
             f"""SELECT r.* FROM remote_assets r
                 WHERE r.immich_id IN (SELECT immich_id FROM {table}
@@ -1043,6 +1086,8 @@ class Database:
         """
         if table not in ("album_assets", "person_assets"):
             raise ValueError("unbekannte Tabelle")
+        if key_column not in ("album_id", "person_id"):
+            raise ValueError("unbekannte Spalte")
         where = (f"p.immich_id IN (SELECT immich_id FROM {table} "
                  f"WHERE {key_column} = ?)")
         params: list = [key]
