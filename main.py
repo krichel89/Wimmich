@@ -16,6 +16,7 @@ from wimmich.config import Config
 from wimmich import crashlog
 from wimmich.icon import app_icon
 from wimmich.mainwindow import MainWindow
+from wimmich.splash import Startbild
 
 
 def main() -> int:
@@ -38,9 +39,19 @@ def main() -> int:
     fenster: list = []
     crashlog.install(__version__, lambda: fenster[0] if fenster else None)
 
-    window = MainWindow()
+    # Startbild, solange das Hauptfenster entsteht: Datenbank oeffnen,
+    # ggf. migrieren, Ordnerbaum aufbauen, exiftool starten - das dauert
+    # sichtbar lange, und vorher passierte auf dem Schirm gar nichts.
+    startbild = Startbild()
+    startbild.starte("Datenbank wird geöffnet …")
+    try:
+        window = MainWindow(melde=startbild.melde)
+    except Exception:
+        startbild.fertig(None)
+        raise
     fenster.append(window)
     window.show()
+    startbild.fertig(window)
     return app.exec()
 
 

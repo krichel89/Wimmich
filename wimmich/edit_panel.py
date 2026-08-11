@@ -69,6 +69,24 @@ class EditPanel(QWidget):
         layout.setContentsMargins(6, 4, 10, 4)
         layout.setSpacing(6)
 
+        # Steht nur da, wenn nichts geht - und sagt dann auch, warum.
+        # Ohne diese Zeile war eine gesperrte Leiste stumm: die Regler
+        # bewegten sich einfach nicht.
+        self.sperr_hinweis = QLabel("")
+        self.sperr_hinweis.setWordWrap(True)
+        self.sperr_hinweis.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; padding: 6px;"
+            f" border: 1px solid {theme.BORDER}; border-radius: 6px;")
+        self.sperr_hinweis.setVisible(False)
+        layout.addWidget(self.sperr_hinweis)
+
+        # Alles Bedienbare steckt in einem eigenen Behälter: so lässt es
+        # sich in einem Zug sperren, ohne den Hinweis mit auszugrauen.
+        self.inhalt = QWidget()
+        layout = QVBoxLayout(self.inhalt)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
         layout.addWidget(_heading("Grundeinstellungen"))
         form = QFormLayout()
         form.setSpacing(6)
@@ -202,6 +220,24 @@ class EditPanel(QWidget):
         export_button = QPushButton("Als Datei speichern …")
         export_button.clicked.connect(self.export)
         layout.addWidget(export_button)
+
+        self.layout().addWidget(self.inhalt)
+
+    # -- Sperren --------------------------------------------------------
+
+    def sperre(self, grund: str = "") -> None:
+        """Bearbeitung ausgrauen und den Grund darüber schreiben.
+
+        Ein leerer Grund gibt die Leiste wieder frei. Gesperrt wird nur
+        der Inhalt - der Hinweis selbst bleibt lesbar.
+        """
+        gesperrt = bool(grund)
+        self.inhalt.setEnabled(not gesperrt)
+        self.sperr_hinweis.setText(grund)
+        self.sperr_hinweis.setVisible(gesperrt)
+
+    def ist_gesperrt(self) -> bool:
+        return not self.inhalt.isEnabled()
 
     # -- Von außen befüllen --------------------------------------------
 

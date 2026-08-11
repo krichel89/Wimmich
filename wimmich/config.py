@@ -68,6 +68,10 @@ DEFAULTS = {
     "group_by": "month",      # "month", "day" oder "none" - Datumsgruppierung
     "year_bar": True,         # Jahresleiste rechts neben dem Raster
     "download_dir": "",       # zuletzt gewaehltes Ziel fuer geholte Originale
+    # Bearbeitungsspalte in der Lupe. Vorgabe AUS: sie ist 300 px breit,
+    # die fehlen sonst dem Bild. Das Stiftsymbol in der Kopfzeile holt
+    # sie hervor.
+    "edit_panel": False,
     # Immich. Der Schlüssel liegt im Klartext in dieser Datei - sie steht
     # im Benutzerprofil und ist nur für den angemeldeten Benutzer lesbar,
     # aber sie ist keine Schlüsselverwaltung. Wer mehr will, vergibt in

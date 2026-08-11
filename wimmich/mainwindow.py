@@ -21,10 +21,11 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox,
-    QFileDialog, QHBoxLayout, QInputDialog,
+    QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSplitter, QStackedWidget, QStatusBar,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QStackedWidget,
+    QStatusBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
@@ -113,12 +114,17 @@ class FolderTree(QTreeWidget):
 class MainWindow(QMainWindow):
     start_scan = pyqtSignal(list)
 
-    def __init__(self) -> None:
+    def __init__(self, melde=None) -> None:
         super().__init__()
+        # melde() schreibt eine Zeile aufs Startbild. Ohne Startbild
+        # (Tests, Aufruf ohne main.py) tut es schlicht nichts.
+        self._melde = melde if callable(melde) else (lambda _t: None)
         ensure_dirs()
         self.config = Config()
+        self._melde("Datenbank wird geöffnet …")
         self.db = Database(DB_PATH)
 
+        self._melde("exiftool wird gesucht …")
         exe = find_exiftool(self.config["exiftool"])
         self.exiftool = ExifTool(exe)
 
@@ -186,10 +192,11 @@ class MainWindow(QMainWindow):
         self._save_delay.timeout.connect(self._save_edits)
 
         self._chrome_visible = True
-        self._panel_hidden = False
+        self._panel_hidden = not bool(self.config["edit_panel"])
         self._gesamt = 0        # Aufnahmen in der aktuellen Ansicht
         self._scan_worker: ScanWorker | None = None
 
+        self._melde("Oberfläche wird aufgebaut …")
         self._build_ui()
         self._build_actions()
         # Erst jetzt anmelden - vorher gibt es die Bauteile nicht, auf
@@ -197,9 +204,10 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
-        self.panel.setVisible(False)
+        self.panel_box.setVisible(False)
         self.loupe_header.setVisible(False)
         self.loader.ready.connect(self._image_arrived)
+        self._melde("Ordner werden gelesen …")
         self._reload_folder_tree()
         self._update_status()
         self.grid.setFocus()
@@ -291,6 +299,7 @@ class MainWindow(QMainWindow):
             exiftool=self.exiftool, thumb_edge=self.config["thumb_size"]
         )
         self.model.serverfehler.connect(self._zeige_serverfehler)
+        self.model.masse_bekannt.connect(self._masse_bekannt)
         self.grid = QListView()
         self.grid.setModel(self.model)
         self.grid.setItemDelegate(
@@ -358,7 +367,22 @@ class MainWindow(QMainWindow):
         self.panel.reset_all.connect(self._reset_edits)
         self.panel.undo.connect(self._undo_edit)
         self.panel.export.connect(self._export_edited)
-        loupe_layout.addWidget(self.panel)
+        # Die Leiste ist hoch: alle Regler untereinander brauchen 846 px.
+        # Ohne Rollbereich zwingt sie dem GANZEN Fenster diese Hoehe als
+        # Mindestmass auf (gemessen 810 x 929) - auf einem kleineren
+        # Schirm laesst sich das Fenster dann nicht kleiner ziehen und
+        # das Bild passt nicht mehr hinein.
+        self.panel_box = QScrollArea()
+        self.panel_box.setWidget(self.panel)
+        self.panel_box.setWidgetResizable(True)
+        self.panel_box.setFrameShape(QFrame.Shape.NoFrame)
+        self.panel_box.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.panel_box.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.panel_box.setFixedWidth(self.panel.width() + 14)
+        self.panel_box.setMinimumHeight(80)
+        loupe_layout.addWidget(self.panel_box)
 
         # Formate für den Zuschnitt - erscheint nur im Zuschnitt-Modus
         self.crop_bar = QWidget()
@@ -399,6 +423,11 @@ class MainWindow(QMainWindow):
 
         self.loupe_title = QLabel("")
         self.loupe_title.setTextFormat(Qt.TextFormat.RichText)
+        # Der Titel darf schrumpfen. Sonst diktiert der Dateiname die
+        # Mindestbreite des ganzen Fensters.
+        self.loupe_title.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                       QSizePolicy.Policy.Preferred)
+        self.loupe_title.setMinimumWidth(0)
         header_layout.addWidget(self.loupe_title, 1)
 
         # Nur bei Serverbildern sichtbar: dort ist die Bearbeitungsleiste
@@ -419,10 +448,14 @@ class MainWindow(QMainWindow):
         self.remote_delete_button.setVisible(False)
         header_layout.addWidget(self.remote_delete_button)
 
-        self.panel_toggle = QPushButton("Bearbeitungsspalte")
+        self.panel_toggle = QPushButton("✎")
         self.panel_toggle.setCheckable(True)
-        self.panel_toggle.setChecked(True)
-        self.panel_toggle.setToolTip("Nur die Bearbeitungsspalte ein-/ausblenden")
+        self.panel_toggle.setChecked(bool(self.config["edit_panel"]))
+        self.panel_toggle.setFixedWidth(38)
+        self.panel_toggle.setToolTip(
+            "Bearbeiten: die Bearbeitungsspalte ein-/ausblenden.\n"
+            "Bei einem Bild, das nur auf dem Server liegt, holt Wimmich\n"
+            "dafür zuerst das Original.")
         self.panel_toggle.toggled.connect(self._toggle_panel_column)
         header_layout.addWidget(self.panel_toggle)
 
@@ -534,6 +567,16 @@ class MainWindow(QMainWindow):
         menu_ansicht.addAction(self.loupe_action)
         menu_ansicht.addAction(vollbild_action)
         menu_ansicht.addAction(leisten_action)
+
+        # Bearbeitungsspalte: derselbe Schalter wie der Stift in der
+        # Lupenkopfzeile, damit beide immer dasselbe zeigen.
+        self.panel_action = QAction("Bearbeitungsspalte  ✎", self)
+        self.panel_action.setCheckable(True)
+        self.panel_action.setChecked(bool(self.config["edit_panel"]))
+        self.panel_action.setShortcut("Ctrl+E")
+        self.panel_action.toggled.connect(self.panel_toggle.setChecked)
+        menu_ansicht.addAction(self.panel_action)
+        self.addAction(self.panel_action)
         menu_ansicht.addSeparator()
 
         # Gruppierung in „Alle Fotos" und „Nur auf dem Server"
@@ -1688,7 +1731,7 @@ class MainWindow(QMainWindow):
         self._set_tool(TOOL_NONE)
         self._crop_mode = False
         self.pages.setCurrentIndex(0)
-        self.panel.setVisible(False)
+        self.panel_box.setVisible(False)
         self.loupe_header.setVisible(False)
         self.crop_bar.setVisible(False)
         self.filter_bar.setVisible(self._chrome_visible)
@@ -1703,16 +1746,28 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= self.model.rowCount():
             return
         self.pages.setCurrentIndex(1)
-        self.panel.setVisible(self._chrome_visible and not self._panel_hidden)
+        self.panel_box.setVisible(self._chrome_visible and not self._panel_hidden)
         self.loupe_header.setVisible(self._chrome_visible)
         self.filter_bar.setVisible(False)
         self._load_loupe(row)
         self.canvas.setFocus()
 
     def _toggle_panel_column(self, checked: bool) -> None:
-        """Blendet NUR die Bearbeitungsspalte aus - Bild und Kopfzeile bleiben."""
+        """Blendet NUR die Bearbeitungsspalte aus - Bild und Kopfzeile bleiben.
+
+        Steht ein reines Serverbild in der Lupe, ist „Bearbeiten“ ohne
+        Datei sinnlos. Statt eine gesperrte Leiste aufzuklappen, holt
+        Wimmich hier gleich das Original - das ist genau der Griff, den
+        der Stift meint.
+        """
         self._panel_hidden = not checked
-        self.panel.setVisible(checked and self._chrome_visible and self.in_loupe)
+        self.config["edit_panel"] = bool(checked)
+        aktion = getattr(self, "panel_action", None)
+        if aktion is not None and aktion.isChecked() != bool(checked):
+            aktion.setChecked(bool(checked))
+        self.panel_box.setVisible(checked and self._chrome_visible and self.in_loupe)
+        if checked and self.in_loupe and self._remote_aktiv():
+            self._serverbild_bearbeiten(self._loupe_row)
 
     def _load_remote_loupe(self, row: int, item: dict) -> None:
         """Grossansicht eines Bildes, das nur auf dem Server liegt.
@@ -1727,7 +1782,10 @@ class MainWindow(QMainWindow):
         self._want_full = False
         self._show_before = False
         self._stroke = []
-        self.panel.setEnabled(False)
+        self.panel.sperre(
+            "Dieses Bild liegt nur auf dem Server. Bearbeiten braucht "
+            "eine Datei — mit „Original holen und bearbeiten“ (oder dem "
+            "Stift oben) holt Wimmich sie in deine Bibliothek.")
         self.remote_edit_button.setVisible(True)
         self.remote_delete_button.setVisible(True)
         # Reste des vorigen Bildes wegräumen. Sonst zeigen Zuschnitt,
@@ -1740,15 +1798,24 @@ class MainWindow(QMainWindow):
         self.crop_bar.setVisible(False)
         self._set_tool(TOOL_NONE)
 
-        daten = None
+        # Reihenfolge: grosse Vorschau (Cache oder Server), sonst die
+        # kleine aus dem Cache, sonst die Kachel, die schon im Fenster
+        # steht. Erst wenn NICHTS davon da ist, wird gemeckert - die
+        # Meldung „Vorschau vom Server nicht verfuegbar“ ueber einem
+        # Bild, das man sieht, ist nur Laerm.
+        kennung = item["immich_id"]
         client = getattr(self.model, "_immich_client", None)
-        try:
-            daten = remote_thumbs.fetch(client, item["immich_id"], gross=True)
-        except Exception:
-            daten = None
+        bild = None
+        for daten in self._vorschau_quellen(client, kennung):
+            versuch = previews.lade_qimage_aus_bytes(daten)
+            if not versuch.isNull():
+                bild = versuch
+                break
 
-        bild = previews.lade_qimage_aus_bytes(daten)
-        if bild.isNull():
+        if bild is None:
+            bild = self.model.kachel_bild(row)
+
+        if bild is None or bild.isNull():
             self.canvas.clear_image()
             self.canvas.set_info_overlay("Vorschau vom Server nicht verfügbar")
             self.canvas.show_info_overlay(True)
@@ -1763,6 +1830,24 @@ class MainWindow(QMainWindow):
             f"{APP_NAME} {__version__} — {item['filename']} (nur auf dem Server)")
         self.canvas.set_overlay("Nur auf dem Server")
 
+    @staticmethod
+    def _vorschau_quellen(client, kennung: str):
+        """Vorschaudaten eines Serverbildes, beste zuerst.
+
+        Liefert nacheinander: grosse Vorschau (Cache, sonst Server),
+        kleine Vorschau aus dem Cache. Jeder Schritt darf scheitern -
+        dann kommt der naechste dran.
+        """
+        for gross in (True, False):
+            try:
+                daten = remote_thumbs.fetch(client, kennung, gross=gross)
+            except Exception:
+                daten = None
+            if not daten and not gross:
+                daten = remote_thumbs.cached(kennung, gross=False)
+            if daten:
+                yield daten
+
     def _load_loupe(self, row: int) -> None:
         item = self.model.row_data(row)
         if item is None:
@@ -1774,7 +1859,7 @@ class MainWindow(QMainWindow):
         # RAW-Datei lässt sich nicht pixelweise verändern.
         self._loupe_row = row
         self._loupe_path = item.get("thumb_path") or item["path"]
-        self.panel.setEnabled(True)      # nach einem Serverbild wieder frei
+        self.panel.sperre("")            # nach einem Serverbild wieder frei
         self.remote_edit_button.setVisible(False)
         self.remote_delete_button.setVisible(False)
         self._want_full = False
@@ -1975,7 +2060,7 @@ class MainWindow(QMainWindow):
         self.tree.setVisible(visible)
         self.statusBar().setVisible(visible)
         self.loupe_header.setVisible(visible and self.in_loupe)
-        self.panel.setVisible(visible and self.in_loupe and not self._panel_hidden)
+        self.panel_box.setVisible(visible and self.in_loupe and not self._panel_hidden)
         self.crop_bar.setVisible(visible and self._crop_mode)
 
     def _toggle_chrome(self) -> None:
@@ -2073,6 +2158,16 @@ class MainWindow(QMainWindow):
             ix, iy = retouch.map_point(M, rx * out_w, ry * out_h)
             rx, ry = ix / max(width, 1), iy / max(height, 1)
         return rx, ry
+
+    def _masse_bekannt(self, index) -> None:
+        """Kachelbreite neu rechnen, sobald die Bildmasse feststehen.
+
+        Qt merkt von sich aus nichts davon: die Groesse kommt aus dem
+        Delegate, und der wird nur neu gefragt, wenn er es selbst meldet.
+        """
+        delegate = self.grid.itemDelegate()
+        if isinstance(delegate, PhotoDelegate) and self.config["grid_packed"]:
+            delegate.sizeHintChanged.emit(index)
 
     def _relative_radius(self) -> float:
         """Pinselradius in Anteilen der kürzeren Kante des GANZEN Bildes."""
@@ -3311,6 +3406,7 @@ gleiche Ziffer nochmal: hoch ⇄ quer</td></tr>
 <tr><td>B</td><td>Vorher / Nachher</td></tr>
 <tr><td>F</td><td>Vollbild — nur das Bild</td></tr>
 <tr><td>Tab</td><td>Leisten und Baum ein/aus</td></tr>
+<tr><td>Strg+E</td><td>Bearbeitungsspalte (✎ in der Lupe)</td></tr>
 <tr><td>I</td><td>Bildangaben</td></tr>
 <tr><td>Strg+A / Strg+D</td><td>alles wählen / Auswahl aufheben</td></tr>
 <tr><td>Strg+Z</td><td>Bearbeitungsschritt zurück</td></tr>

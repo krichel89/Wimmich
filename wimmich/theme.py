@@ -269,6 +269,51 @@ QToolTip {{
 }}
 
 QMessageBox {{ background: {PANEL}; }}
+
+/* Gesperrt: muss man SEHEN. Das Stylesheet oben faerbt sonst auch
+   abgeschaltete Bauteile voll ein - Qt kommt mit seiner eigenen
+   Grau-Palette dagegen nicht an. */
+QWidget:disabled {{ color: {TEXT_MUTED}; }}
+QLabel:disabled {{ color: {TEXT_MUTED}; }}
+QPushButton:disabled {{
+    background: {PANEL};
+    color: {TEXT_MUTED};
+    border-color: {BORDER};
+}}
+QCheckBox:disabled {{ color: {TEXT_MUTED}; }}
+QCheckBox::indicator:disabled {{ background: {PANEL}; border-color: {BORDER}; }}
+QSlider:disabled {{ background: transparent; }}
+QSlider::groove:horizontal:disabled {{ background: {BORDER}; }}
+QSlider::handle:horizontal:disabled {{
+    background: {BORDER};
+    border: 1px solid {BORDER};
+}}
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{
+    background: {PANEL};
+    color: {TEXT_MUTED};
+}}
+
+/* Regler: ohne eigene Regel zeichnet Fusion sie, und die :disabled-Regel
+   oben griffe ins Leere. */
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {BORDER};
+    border-radius: 2px;
+}}
+QSlider::sub-page:horizontal {{ background: {ACCENT_DIM}; border-radius: 2px; }}
+QSlider::sub-page:horizontal:disabled {{ background: {BORDER}; }}
+QSlider::handle:horizontal {{
+    width: 12px;
+    margin: -5px 0;
+    border-radius: 7px;
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+QSlider::handle:horizontal:hover {{ background: {TEXT}; border-color: {TEXT}; }}
+
+/* Bearbeitungsspalte im Rollbereich - kein zweiter Rahmen, kein
+   eigener Hintergrund. */
+QScrollArea {{ border: none; background: {BG}; }}
 """
 
 

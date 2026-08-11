@@ -117,6 +117,10 @@ class PhotoModel(QAbstractListModel):
     # Bleibt eine Server-Vorschau aus, soll das SICHTBAR werden statt
     # nur eine graue Kachel zu hinterlassen.
     serverfehler = pyqtSignal(str)
+    # Die Masse einer Aufnahme wurden erst mit der Vorschau bekannt -
+    # die Kachelbreite im dichten Raster haengt daran, also muss die
+    # Anordnung neu gerechnet werden.
+    masse_bekannt = pyqtSignal(QModelIndex)
 
     def __init__(self, exiftool=None, thumb_edge: int = 256, parent=None) -> None:
         super().__init__(parent)
@@ -364,8 +368,44 @@ class PhotoModel(QAbstractListModel):
         return self._placeholder
 
     def _thumb_ready(self, row: int, cache_file: str) -> None:
-        self._pixmaps[row] = previews.pixmap_aus_datei(cache_file)
+        pixmap = previews.pixmap_aus_datei(cache_file)
+        self._pixmaps[row] = pixmap
+        self._masse_nachtragen(row, pixmap)
         self._touch(row)
+
+    def _masse_nachtragen(self, row: int, pixmap: QPixmap) -> None:
+        """Fehlende Bildmasse aus der Vorschau uebernehmen.
+
+        Im dichten Raster bestimmt das Seitenverhaeltnis die Kachelbreite.
+        Steht es nicht im Index - RAW-Dateien gehen ueber exiftool, aeltere
+        Eintraege haben es womoeglich gar nicht -, waere JEDE Kachel
+        quadratisch, und ein Hochformat bekaeme wieder Luft links und
+        rechts. Die Vorschau kennt die Masse aber; sie werden hier
+        nachgetragen und die Anordnung neu angestossen.
+        """
+        if not (0 <= row < len(self._rows)):
+            return
+        item = self._rows[row]
+        if item.get("width") and item.get("height"):
+            return
+        if pixmap is None or pixmap.isNull():
+            return
+        if not pixmap.width() or not pixmap.height():
+            return
+        item["width"], item["height"] = pixmap.width(), pixmap.height()
+        self.masse_bekannt.emit(self.index(row, 0))
+
+    def kachel_bild(self, row: int):
+        """Die bereits geladene Kachel als QImage - oder None.
+
+        Wird in der Lupe als letzter Rueckfall benutzt: was im Raster zu
+        sehen ist, kann auch gross gezeigt werden, statt „keine Vorschau"
+        ueber ein vorhandenes Bild zu schreiben.
+        """
+        pixmap = self._pixmaps.get(row)
+        if pixmap is None or pixmap.isNull() or pixmap is self._placeholder:
+            return None
+        return pixmap.toImage()
 
     def _thumb_failed(self, row: int) -> None:
         item = self._rows[row] if 0 <= row < len(self._rows) else {}
