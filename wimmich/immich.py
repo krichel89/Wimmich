@@ -37,6 +37,11 @@ TIMEOUT = 60
 # beim Blaettern geholt, und vier Wege a 60 s waeren vier Minuten, in
 # denen das Fenster steht.
 VORSCHAU_TIMEOUT = 8
+# Vorabpruefung: nur die Frage „antwortet da ueberhaupt jemand?".
+# Sie laeuft beim Start und vor jedem Serverzugriff und darf deshalb
+# nicht lange dauern - nach vier Sekunden ist der Server fuer unsere
+# Zwecke weg.
+PING_TIMEOUT = 4
 
 # Dateiendung -> Inhaltstyp, wie Immich es selbst fuehrt
 # (server/src/utils/mime-types.ts). Der Server prueft den mitgeschickten
@@ -240,12 +245,31 @@ class ImmichClient:
 
     # -- Verbinden -----------------------------------------------------
 
-    def connect(self) -> ServerInfo:
+    def erreichbar(self, timeout: float = PING_TIMEOUT) -> tuple[bool, str]:
+        """Kurze Vorabpruefung: antwortet der Server?
+
+        Getrennt von connect(), weil das Verbinden die volle Zeitgrenze
+        von 60 s haben darf - diese Frage aber nicht. Sie wird gestellt,
+        BEVOR irgendetwas Langes angefangen wird, damit das Fenster
+        nicht steht.
+        """
+        if not self.configured:
+            return False, "Immich ist nicht eingerichtet"
+        try:
+            self._request("GET", "/server/ping", timeout=timeout)
+        except ImmichError as exc:
+            if getattr(exc, "status", 0) == 404:
+                return True, ""     # sehr alter Server, aber er antwortet
+            return False, str(exc)
+        return True, ""
+
+    def connect(self, timeout: float | None = None) -> ServerInfo:
         """Erreichbarkeit prüfen und die Eigenheiten des Servers feststellen."""
-        status, payload = self._request("GET", "/server/ping")
+        status, payload = self._request("GET", "/server/ping", timeout=timeout)
         if status == 404:
             # Sehr alte Server hatten /server-info/ping
-            status, payload = self._request("GET", "/server-info/ping")
+            status, payload = self._request("GET", "/server-info/ping",
+                                            timeout=timeout)
         if status >= 400:
             raise ImmichError(_error_text(status, payload), status)
 

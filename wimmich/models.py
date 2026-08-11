@@ -147,6 +147,9 @@ class PhotoModel(QAbstractListModel):
         self._streaming = False
         self._last_group = None
         self._erschoepft = True
+        self._zusatz: list[dict] = []
+        self._sortschluessel = None
+        self._desc = False
 
     # -- Daten ---------------------------------------------------------
 
@@ -156,17 +159,27 @@ class PhotoModel(QAbstractListModel):
         """Eine fertige Liste anzeigen - für Suche, Alben, Personen."""
         self._start(iter(rows), group_by, streaming=False)
 
-    def set_cursor(self, cursor, group_by: str | None = None) -> None:
+    def set_cursor(self, cursor, group_by: str | None = None,
+                   zusatz: list[dict] | None = None,
+                   sortschluessel=None, desc: bool = False) -> None:
         """Aus einem Datenbank-Cursor stückweise nachladen.
 
         Das ist das endlose Scrollen: es wird nur geholt, was die Ansicht
         gerade braucht. Bei 50.000 Bildern steht das erste Stück nach
         wenigen Millisekunden, statt dass die Oberfläche zwei Sekunden
         steht.
-        """
-        self._start(cursor, group_by, streaming=True)
 
-    def _start(self, quelle, group_by: str | None, streaming: bool) -> None:
+        `zusatz` sind Zeilen, die NICHT aus dem Cursor kommen - die
+        Bilder, die nur auf dem Server liegen. Sie sind bereits sortiert
+        und werden beim Nachladen an der richtigen Stelle eingefädelt,
+        damit sie nicht als Klumpen am Ende hängen.
+        """
+        self._start(cursor, group_by, streaming=True,
+                    zusatz=zusatz, sortschluessel=sortschluessel, desc=desc)
+
+    def _start(self, quelle, group_by: str | None, streaming: bool,
+               zusatz: list[dict] | None = None,
+               sortschluessel=None, desc: bool = False) -> None:
         self.beginResetModel()
         self._rows = []
         self._pixmaps.clear()
@@ -176,6 +189,9 @@ class PhotoModel(QAbstractListModel):
         self._streaming = streaming
         self._last_group = None
         self._erschoepft = False
+        self._zusatz = list(zusatz or [])
+        self._sortschluessel = sortschluessel
+        self._desc = bool(desc)
         self.endResetModel()
         # Ein erstes Stück sofort, damit die Ansicht nicht leer bleibt
         self._nachladen(self.CHUNK if streaming else None)
@@ -203,12 +219,15 @@ class PhotoModel(QAbstractListModel):
                    else list(itertools.islice(self._source, anzahl)))
         if not roh or (anzahl is not None and len(roh) < anzahl):
             self._erschoepft = True
-        if not roh:
+
+        posten = [dict(z) for z in roh]
+        if self._zusatz:
+            posten = self._einfaedeln(posten)
+        if not posten:
             return
 
         neue: list[dict] = []
-        for zeile in roh:
-            item = dict(zeile)
+        for item in posten:
             titel, zusatz = self._gruppe(item)
             if self._group_by and titel != self._last_group:
                 self._last_group = titel
@@ -220,6 +239,36 @@ class PhotoModel(QAbstractListModel):
         self.beginInsertRows(QModelIndex(), start, start + len(neue) - 1)
         self._rows.extend(neue)
         self.endInsertRows()
+
+    def _einfaedeln(self, posten: list[dict]) -> list[dict]:
+        """Zusatzzeilen an der Stelle einsortieren, an die sie gehören.
+
+        Der Cursor liefert sortiert, die Zusatzliste ist sortiert - also
+        wird verschmolzen wie bei zwei sortierten Stapeln. Alles, was vor
+        dem letzten Posten dieses Stücks liegt, kommt jetzt dran; der
+        Rest wartet auf das nächste Stück. Ist der Cursor erschöpft,
+        kommt der ganze Rest hinterher.
+        """
+        if self._sortschluessel is None:
+            if self._erschoepft:
+                posten = posten + self._zusatz
+                self._zusatz = []
+            return posten
+
+        def vor(a, b) -> bool:
+            return a > b if self._desc else a < b
+
+        ergebnis: list[dict] = []
+        for item in posten:
+            schluessel = self._sortschluessel(item)
+            while self._zusatz and vor(self._sortschluessel(self._zusatz[0]),
+                                       schluessel):
+                ergebnis.append(self._zusatz.pop(0))
+            ergebnis.append(item)
+        if self._erschoepft and self._zusatz:
+            ergebnis.extend(self._zusatz)
+            self._zusatz = []
+        return ergebnis
 
     def _gruppe(self, item: dict) -> tuple[str, str]:
         """Überschrift und Zusatz, unter denen eine Aufnahme einsortiert wird."""
@@ -570,6 +619,17 @@ class PhotoDelegate(QStyledItemDelegate):
             painter.setOpacity(0.38)
         self._draw_image(painter, image_rect, index)
         painter.setOpacity(1.0)
+
+        if selected:
+            # Deutlicher Rahmen UM das Bild. Die blasse Fuellung dahinter
+            # allein war bei dicht liegenden Kacheln kaum zu sehen -
+            # zwischen zwei ausgewaehlten Bildern gab es gar keine
+            # sichtbare Grenze mehr.
+            stift = QPen(QColor(theme.ACCENT), 3)
+            stift.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+            painter.setPen(stift)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(card.adjusted(1.5, 1.5, -1.5, -1.5))
 
         if not self.label_height:
             painter.restore()

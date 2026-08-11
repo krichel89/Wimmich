@@ -805,6 +805,36 @@ class Database:
         ).fetchall()
         return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
 
+    def photos_by_paths(self, paths: list[str], order: str = "taken_at",
+                        desc: bool = False, stacked: bool = True,
+                        prefer_raw: bool = True, min_rating: int = 0,
+                        show_rejects: bool = True,
+                        labels: list[str] | None = None,
+                        unlabeled: bool = False):
+        """Genau diese Dateien, in der gewaehlten Sortierung.
+
+        Fuer die vorlaeufige Sammlung: sie ist eine Liste von Pfaden,
+        keine Ordner- oder Albenzugehoerigkeit.
+        """
+        if not paths:
+            return []
+        platz = ",".join("?" for _ in paths)
+        where = f"p.path IN ({platz})"
+        params: list = list(paths)
+        where, params = _add_filters(where, params, min_rating,
+                                     show_rejects, labels, unlabeled)
+        return self._cursor(where, params, order, stacked, prefer_raw,
+                            desc=desc).fetchall()
+
+    def remote_by_ids(self, immich_ids: list[str]):
+        """Serverspiegel-Zeilen zu genau diesen Kennungen."""
+        if not immich_ids:
+            return []
+        platz = ",".join("?" for _ in immich_ids)
+        return self.conn.execute(
+            f"SELECT * FROM remote_assets WHERE immich_id IN ({platz})",
+            list(immich_ids)).fetchall()
+
     def remote_jahre(self) -> list[tuple[str, int]]:
         """Dasselbe fuer die Bilder, die nur auf dem Server liegen."""
         rows = self.conn.execute(

@@ -24,9 +24,9 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox, QDialog,
     QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget,
-    QStatusBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSplitter, QStackedWidget, QStatusBar, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
@@ -143,6 +143,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._pool.setMaxThreadCount(2)
         self._vorschau_signale = _VorschauSignale()
         self._vorschau_signale.fertig.connect(self._vorschau_da)
+        self._vorschau_signale.client_da.connect(self._client_da)
         self._remote_wartet = ""
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
@@ -182,6 +183,8 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._brush = 26
         self._stroke: list[tuple[float, float]] = []
         self._crop_mode = False
+        self._zoom_stumm = False
+        self._diashow_vollbild_vorher = False
         self._crop_aspect_key = None
         self._crop_portrait = False
         # Cammello-Eigenheit: die Ziffern setzen wahlweise Sterne oder Farben
@@ -222,6 +225,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             app.installEventFilter(self)
         self.panel_box.setVisible(False)
         self.loupe_header.setVisible(False)
+        self._toggle_zoomregler(bool(self.config["zoom_slider"]))
         # Die Filterleiste entsteht sichtbar - erst hier greift die
         # Vorgabe aus der Konfiguration.
         self._filterleiste_zeigen()
@@ -344,6 +348,9 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._jahr_verzoegerer.setSingleShot(True)
         self._jahr_verzoegerer.setInterval(120)
         self._jahr_verzoegerer.timeout.connect(self._jahr_der_ansicht)
+
+        self._diashow_timer = QTimer(self)
+        self._diashow_timer.timeout.connect(self._diashow_schritt)
         self.grid.verticalScrollBar().valueChanged.connect(
             lambda _v: self._jahr_verzoegerer.start())
 
@@ -366,6 +373,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.canvas = CanvasView(self)
         self.canvas.zoom_requested.connect(self._need_full)
         self.canvas.zoom_changed.connect(lambda _f: self._update_overlay())
+        self.canvas.zoom_changed.connect(self._zoom_anzeigen)
         self.canvas.fullscreen_requested.connect(self._toggle_fullscreen)
         self.canvas.clicked.connect(self._canvas_click)
         self.canvas.stroke_started.connect(self._stroke_start)
@@ -466,6 +474,41 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             lambda: self._serverbilder_loeschen([self._loupe_row]))
         self.remote_delete_button.setVisible(False)
         header_layout.addWidget(self.remote_delete_button)
+
+        # Zuschnitt: bisher nur ueber die Taste R erreichbar - unsichtbar,
+        # wenn man die Belegung nicht kennt.
+        self.crop_button = QPushButton("⛶")
+        self.crop_button.setCheckable(True)
+        self.crop_button.setFixedWidth(38)
+        self.crop_button.setToolTip("Zuschneiden (R)")
+        self.crop_button.toggled.connect(self._crop_button_geschaltet)
+        header_layout.addWidget(self.crop_button)
+
+        # Zoomregler: einblendbar, damit er in der Lupe keinen Platz
+        # kostet, wenn er nicht gebraucht wird.
+        self.zoom_toggle = QPushButton("🔍")
+        self.zoom_toggle.setCheckable(True)
+        self.zoom_toggle.setChecked(bool(self.config["zoom_slider"]))
+        self.zoom_toggle.setFixedWidth(38)
+        self.zoom_toggle.setToolTip("Zoomregler ein-/ausblenden")
+        self.zoom_toggle.toggled.connect(self._toggle_zoomregler)
+        header_layout.addWidget(self.zoom_toggle)
+
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setFixedWidth(140)
+        self.zoom_slider.setToolTip("Vergrößerung (Strg + / Strg −)")
+        # In Promille gerechnet: QSlider kann nur ganze Zahlen, und
+        # 50…200 % in Prozentschritten waere zu grob zum Feinstellen.
+        self.zoom_slider.setRange(int(self.canvas.MIN_ZOOM * 1000),
+                                  int(self.canvas.MAX_ZOOM * 1000))
+        self.zoom_slider.setValue(1000)
+        self.zoom_slider.valueChanged.connect(self._zoom_geregelt)
+        header_layout.addWidget(self.zoom_slider)
+
+        self.zoom_label = QLabel("100 %")
+        self.zoom_label.setFixedWidth(52)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(self.zoom_label)
 
         self.panel_toggle = QPushButton("✎")
         self.panel_toggle.setCheckable(True)
@@ -603,6 +646,12 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         menu_ansicht.addAction(self.panel_action)
         self.addAction(self.panel_action)
 
+        self.diashow_action = QAction("Diashow", self)
+        self.diashow_action.setShortcut("F5")
+        self.diashow_action.triggered.connect(self._diashow_umschalten)
+        menu_ansicht.addAction(self.diashow_action)
+        self.addAction(self.diashow_action)
+
         self.filter_action = QAction("Filterleiste", self)
         self.filter_action.setCheckable(True)
         self.filter_action.setChecked(bool(self.config["filter_bar"]))
@@ -702,15 +751,19 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._all_item = QTreeWidgetItem(["Alle Fotos"])
         self._all_item.setData(0, Qt.ItemDataRole.UserRole, ("all", ""))
         self._all_item.setToolTip(
-            0, "Alle Ordner untereinander, wie in Picasa")
+            0, "Alle Ordner untereinander, wie in Picasa.\n"
+               "Bilder, die nur auf dem Server liegen, stehen mit darin.")
         self.tree.addTopLevelItem(self._all_item)
 
-        self._remote_item = QTreeWidgetItem(["Nur auf dem Server"])
-        self._remote_item.setData(0, Qt.ItemDataRole.UserRole, ("remote", ""))
-        self._remote_item.setToolTip(
-            0, "Bilder, die auf Immich liegen, aber nicht in deinen Ordnern.\n"
-               "Vorschau kommt vom Server; das Original wird nur auf Wunsch geholt.")
-        self.tree.addTopLevelItem(self._remote_item)
+        anzahl = len(self.config["sammlung"]) + len(self.config["sammlung_remote"])
+        self._sammlung_item = QTreeWidgetItem(
+            [f"Vorläufige Sammlung ({anzahl})" if anzahl
+             else "Vorläufige Sammlung"])
+        self._sammlung_item.setData(0, Qt.ItemDataRole.UserRole, ("sammlung", ""))
+        self._sammlung_item.setToolTip(
+            0, "Von Hand zusammengetragene Bilder — zum Sichten und\n"
+               "Aussortieren. Kein Album: nichts davon geht auf den Server.")
+        self.tree.addTopLevelItem(self._sammlung_item)
 
         self._folders_root = QTreeWidgetItem(["Ordner"])
         self._folders_root.setData(0, Qt.ItemDataRole.UserRole, None)
@@ -721,7 +774,10 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             item.setToolTip(0, root)
             self._folders_root.addChild(item)
             self._add_children(item, root)
-        self._folders_root.setExpanded(True)
+        # Eingeklappt starten: bei vielen Bibliotheken war die Spalte
+        # sonst gleich voll und man musste erst zuklappen, um etwas zu
+        # finden. Aufklappen geht mit einem Klick.
+        self._folders_root.setExpanded(False)
 
         self._albums_root = QTreeWidgetItem(["Alben"])
         self._albums_root.setData(0, Qt.ItemDataRole.UserRole, None)
@@ -762,7 +818,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                 hint.setData(0, Qt.ItemDataRole.UserRole, None)
                 hint.setFlags(Qt.ItemFlag.NoItemFlags)
                 root.addChild(hint)
-            root.setExpanded(bool(rows))
+            root.setExpanded(False)
         self._auswahl_wiederherstellen(gewaehlt)
 
     def _auswahl_wiederherstellen(self, gewaehlt) -> None:
@@ -783,6 +839,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             if item.data(0, Qt.ItemDataRole.UserRole) == gewaehlt:
                 self._selection = gewaehlt
                 gesperrt = self.tree.blockSignals(True)
+                wurzel.setExpanded(True)   # sonst bliebe die Auswahl versteckt
                 self.tree.setCurrentItem(item)
                 self.tree.blockSignals(gesperrt)
                 return
@@ -994,6 +1051,88 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             elif item.get("path"):
                 pfade.append(item["path"])
         return pfade, kennungen
+
+    # -- Vorläufige Sammlung -------------------------------------------
+
+    def _sammlung_von_auswahl(self) -> None:
+        """Taste B und Menü: Auswahl aufnehmen - in der Sammlung: entfernen."""
+        rows = sorted({idx.row() for idx in self.grid.selectedIndexes()})
+        if not rows and self.in_loupe:
+            rows = [self._loupe_row]
+        if not rows:
+            return
+        if self._selection and self._selection[0] == "sammlung":
+            self._sammlung_entfernen(rows)
+        else:
+            self._sammlung_aufnehmen(rows)
+
+    def _sammlung_zahl(self) -> int:
+        return (len(self.config["sammlung"])
+                + len(self.config["sammlung_remote"]))
+
+    def _sammlung_beschriften(self) -> None:
+        """Zähler am Baumeintrag nachziehen."""
+        anzahl = self._sammlung_zahl()
+        self._sammlung_item.setText(
+            0, f"Vorläufige Sammlung ({anzahl})" if anzahl
+            else "Vorläufige Sammlung")
+
+    def _sammlung_aufnehmen(self, rows: list[int]) -> None:
+        """Ausgewählte Bilder in die vorläufige Sammlung legen.
+
+        Bewusst KEIN Album: nichts davon geht auf den Server, und
+        Doppelte werden stillschweigend übergangen.
+        """
+        pfade, kennungen = self._auswahl_schluessel(rows)
+        sammlung = list(self.config["sammlung"])
+        remote = list(self.config["sammlung_remote"])
+        neu = 0
+        for pfad in pfade:
+            if pfad not in sammlung:
+                sammlung.append(pfad)
+                neu += 1
+        for kennung in kennungen:
+            if kennung not in remote:
+                remote.append(kennung)
+                neu += 1
+        self.config["sammlung"] = sammlung
+        self.config["sammlung_remote"] = remote
+        self._sammlung_beschriften()
+        schon = len(pfade) + len(kennungen) - neu
+        text = f"{neu} Aufnahme(n) in die Sammlung übernommen"
+        if schon:
+            text += f", {schon} war(en) schon drin"
+        self.statusBar().showMessage(text, 5000)
+        if self._selection and self._selection[0] == "sammlung":
+            self._refresh_view()
+
+    def _sammlung_entfernen(self, rows: list[int]) -> None:
+        pfade, kennungen = self._auswahl_schluessel(rows)
+        self.config["sammlung"] = [p for p in self.config["sammlung"]
+                                   if p not in pfade]
+        self.config["sammlung_remote"] = [
+            k for k in self.config["sammlung_remote"] if k not in kennungen]
+        self._sammlung_beschriften()
+        self.statusBar().showMessage(
+            f"{len(pfade) + len(kennungen)} Aufnahme(n) aus der Sammlung "
+            "genommen", 5000)
+        if self._selection and self._selection[0] == "sammlung":
+            self._refresh_view()
+
+    def _sammlung_leeren(self) -> None:
+        if not self._sammlung_zahl():
+            return
+        antwort = QMessageBox.question(
+            self, "Sammlung leeren",
+            f"Die {self._sammlung_zahl()} Aufnahmen aus der Sammlung nehmen?\n"
+            "Die Dateien bleiben unangetastet.")
+        if antwort != QMessageBox.StandardButton.Yes:
+            return
+        self.config["sammlung"] = []
+        self.config["sammlung_remote"] = []
+        self._sammlung_beschriften()
+        if self._selection and self._selection[0] == "sammlung":
+            self._refresh_view()
 
     def _album_menu(self, menu: QMenu, rows: list[int]) -> None:
         """Untermenü „Zu Album hinzufügen" und ggf. „Aus Album entfernen"."""
@@ -1231,10 +1370,12 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             rows = []
         else:
             kind, key = self._selection
-            if kind == "remote":
-                rows = [_remote_zeile(r) for r in self.db.remote_only(
-                    order=self.sort_box.currentData(),
-                    desc=self.sort_desc_button.isChecked())]
+            if kind == "sammlung":
+                rows = list(self.db.photos_by_paths(
+                    list(self.config["sammlung"]),
+                    order=self.sort_box.currentData(), **richtung, **common))
+                rows += [_remote_zeile(r) for r in
+                         self.db.remote_by_ids(list(self.config["sammlung_remote"]))]
             elif kind == "all":
                 rows = []          # wird weiter unten als Cursor geholt
             elif kind == "folder":
@@ -1277,11 +1418,20 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         if alle and not query:
             cursor = self.db.all_photos_cursor(
                 self.config.libraries, order=sortierung, **richtung, **common)
-            self.model.set_cursor(cursor, group_by=gruppierung)
+            # Bilder, die nur auf dem Server liegen, gehoeren seit 0.3.37
+            # mit in „Alle Fotos" - ein eigener Eintrag dafuer war eine
+            # kuenstliche Trennung, die niemand sucht.
+            nur_server = [_remote_zeile(r) for r in self.db.remote_only(
+                order=sortierung, desc=self.sort_desc_button.isChecked())]
+            self.model.set_cursor(
+                cursor, group_by=gruppierung, zusatz=nur_server,
+                sortschluessel=_sortschluessel_fuer(sortierung),
+                desc=self.sort_desc_button.isChecked())
             gezeigt = self.db.count_photos(
                 self.config.libraries, min_rating=common["min_rating"],
                 stacked=common["stacked"], show_rejects=common["show_rejects"],
-                labels=common["labels"], unlabeled=common["unlabeled"])
+                labels=common["labels"], unlabeled=common["unlabeled"]
+            ) + len(nur_server)
         else:
             self.model.set_rows(rows, group_by=gruppierung)
             gezeigt = len([r for r in rows if "_header" not in r])
@@ -1384,6 +1534,8 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                     lambda: self._serverbild_bearbeiten(nur_server[0]))
             menu.addAction(f"{len(rows)} Original(e) herunterladen …",
                            lambda: self._download_remote(nur_server))
+            menu.addAction(f"In vorläufige Sammlung übernehmen ({len(rows)})\tS",
+                           self._sammlung_von_auswahl)
             menu.addSeparator()
             self._album_menu(menu, rows)
             menu.addSeparator()
@@ -1402,6 +1554,8 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         menu.addAction("In der Lupe öffnen …\tE", self._loupe_from_selection)
         menu.addAction(f"{count} Aufnahme(n) exportieren …\tStrg+Umsch+E",
                        self._export_auswahl)
+        menu.addAction(f"In vorläufige Sammlung übernehmen ({count})\tS",
+                       self._sammlung_von_auswahl)
         menu.addSeparator()
 
         stars = menu.addMenu("Bewertung")
@@ -1543,6 +1697,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self._loupe_from_selection()
 
     def _show_grid(self) -> None:
+        self._crop_knopf_setzen(False)
         self._remote_wartet = ""
         self._vorschau_signale.gewuenscht = ""
         self._set_tool(TOOL_NONE)
@@ -1583,6 +1738,40 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._filter_hidden = not checked
         self.config["filter_bar"] = bool(checked)
         self._filterleiste_zeigen()
+
+    def _toggle_zoomregler(self, checked: bool) -> None:
+        """Zoomregler ein- oder ausblenden und den Zustand merken."""
+        self.config["zoom_slider"] = bool(checked)
+        self.zoom_slider.setVisible(checked)
+        self.zoom_label.setVisible(checked)
+
+    def _zoom_geregelt(self, wert: int) -> None:
+        """Regler bewegt: Vergroesserung setzen.
+
+        Der Wert ist in Promille - QSlider kann nur ganze Zahlen, und
+        Prozentschritte waeren zum Feinstellen zu grob.
+        """
+        if self._zoom_stumm:
+            return
+        self.canvas.set_zoom(wert / 1000.0)
+
+    def _zoom_anzeigen(self, faktor: float) -> None:
+        """Regler und Beschriftung dem Bild nachfuehren.
+
+        Stumm geschaltet, sonst schickte der Regler die gerade
+        empfangene Vergroesserung sofort zurueck ans Bild.
+        """
+        self._zoom_stumm = True
+        try:
+            self.zoom_slider.setValue(round(faktor * 1000))
+        finally:
+            self._zoom_stumm = False
+        self.zoom_label.setText(f"{faktor * 100:.0f} %")
+
+    def _crop_button_geschaltet(self, an: bool) -> None:
+        """Knopf und Taste R sollen dasselbe tun."""
+        if an != self._crop_mode:
+            self._toggle_crop_mode(an)
 
     def _toggle_panel_column(self, checked: bool) -> None:
         """Blendet NUR die Bearbeitungsspalte aus - Bild und Kopfzeile bleiben.
@@ -1741,6 +1930,9 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self._render_loupe(keep_view=True)
 
     def _step_loupe(self, delta: int) -> None:
+        # Von Hand geblaettert heisst: die Diashow ist nicht mehr gewollt
+        if self._diashow_timer.isActive() and not self._diashow_eigener_schritt:
+            self._diashow_beenden()
         self._save_edits()
         new_row = self._loupe_row + delta
         if new_row < 0:
@@ -1829,6 +2021,69 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             # Vollbild heißt: nur das Bild
             self._set_chrome(False)
             self.showFullScreen()
+
+    # -- Diashow -------------------------------------------------------
+
+    def _diashow_umschalten(self) -> None:
+        if self._diashow_timer.isActive():
+            self._diashow_beenden()
+        else:
+            self._diashow_starten()
+
+    def _diashow_starten(self) -> None:
+        """Vollbild, Bild fuer Bild, im eingestellten Takt.
+
+        Losgelaufen wird bei dem Bild, das gerade dran ist - in der Lupe
+        das gezeigte, im Raster das ausgewaehlte, sonst das erste.
+        """
+        if not self.in_loupe:
+            self._loupe_from_selection()
+        if not self.in_loupe:
+            self.statusBar().showMessage(
+                "Für die Diashow wird mindestens ein Bild gebraucht.", 4000)
+            return
+        self._diashow_vollbild_vorher = self.isFullScreen()
+        self._set_chrome(False)
+        self.showFullScreen()
+        takt = max(1, int(self.config["diashow_sekunden"]))
+        self._diashow_timer.start(takt * 1000)
+        self.statusBar().showMessage(
+            f"Diashow: {takt} s je Bild — F5 oder Esc beendet sie", 5000)
+
+    def _diashow_beenden(self) -> None:
+        if not self._diashow_timer.isActive():
+            return
+        self._diashow_timer.stop()
+        # Das Vollbild nur zuruecknehmen, wenn die Diashow es angemacht
+        # hat - sonst risse sie einen laufenden Vollbildmodus mit.
+        if not getattr(self, "_diashow_vollbild_vorher", False):
+            self.showNormal()
+            self._set_chrome(True)
+        self.statusBar().showMessage("Diashow beendet.", 3000)
+
+    _diashow_eigener_schritt = False
+
+    def _diashow_schritt(self) -> None:
+        """Ein Bild weiter; am Ende von vorn.
+
+        Am Ende der Liste wird erst nachgeladen - bei „Alle Fotos" haengt
+        immer noch etwas im Cursor.
+        """
+        naechste = self._loupe_row + 1
+        while naechste >= self.model.rowCount() and self.model.canFetchMore():
+            self.model.fetchMore()
+        if naechste >= self.model.rowCount():
+            naechste = 0
+            zeilen = self.model.photo_rows()
+            if not zeilen:
+                self._diashow_beenden()
+                return
+            naechste = zeilen[0]
+        self._diashow_eigener_schritt = True
+        try:
+            self._show_loupe(naechste)
+        finally:
+            self._diashow_eigener_schritt = False
 
     # -- Werkzeuge -----------------------------------------------------
 
@@ -1988,10 +2243,18 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._render_loupe()
         self._save_edits()
 
+    def _crop_knopf_setzen(self, an: bool) -> None:
+        """Knopf nachziehen, ohne seinen eigenen Schalter auszuloesen."""
+        if self.crop_button.isChecked() != an:
+            gesperrt = self.crop_button.blockSignals(True)
+            self.crop_button.setChecked(an)
+            self.crop_button.blockSignals(gesperrt)
+
     def _toggle_crop_mode(self, on: bool | None = None) -> None:
         if self._remote_aktiv():
             return
         self._crop_mode = (not self._crop_mode) if on is None else bool(on)
+        self._crop_knopf_setzen(self._crop_mode)
         self._crop_aspect_key = None
         self._crop_portrait = False
         self.canvas.set_aspect(None)
@@ -2335,6 +2598,12 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         if self.search_box.hasFocus():
             return False
 
+        # Escape beendet ZUERST die Diashow. Sonst faengt sie der
+        # Zuschnitt ab, wenn der noch an war - gemessen im Testlauf.
+        if key == Qt.Key.Key_Escape and self._diashow_timer.isActive():
+            self._diashow_beenden()
+            return True
+
         # Zuschnitt-Modus schluckt die Tasten, die er braucht
         if self._crop_mode and self.in_loupe:
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -2377,6 +2646,16 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                 self.canvas.zoom_step(-1)
             elif self.in_loupe:
                 self.panel.step_exposure(-1)
+            return True
+
+        if key == Qt.Key.Key_S and not ctrl:
+            # NICHT B: das ist in der Lupe seit jeher „vorher/nachher"
+            self._sammlung_von_auswahl()
+            return True
+
+        if ctrl and key in (Qt.Key.Key_0, Qt.Key.Key_9):
+            if self.in_loupe:
+                self.canvas.fit()
             return True
 
         if ctrl and key == Qt.Key.Key_F:
@@ -2907,6 +3186,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         if self._scan_worker is not None:
             self._scan_worker.cancel()
         self._sync_timer.stop()
+        self._diashow_timer.stop()
         self._watch_delay.stop()
         if self._sync_worker is not None:
             self._sync_worker.cancel()
@@ -2953,6 +3233,20 @@ def _has_subfolders(path: Path) -> bool:
 def jahr_von(item: dict | None) -> str:
     """Jahr einer Modellzeile, leer wenn ohne Aufnahmedatum."""
     return str((item or {}).get("taken_at") or "")[:4]
+
+
+def _sortschluessel_fuer(sortierung: str):
+    """Womit wird verglichen, wenn Serverbilder eingefaedelt werden?
+
+    Muss zu der Sortierung passen, die die Datenbank benutzt - sonst
+    landen die Serverbilder an der falschen Stelle. Fuer Sortierungen,
+    die ein Serverbild gar nicht kennt (Ordner, Bewertung, Datei-
+    aenderung), wird das Aufnahmedatum genommen; das ist das Einzige,
+    was beide Seiten sicher haben.
+    """
+    if sortierung == "filename":
+        return lambda item: str(item.get("filename") or "").lower()
+    return lambda item: str(item.get("taken_at") or "")
 
 
 def _remote_zeile(row) -> dict:
@@ -3083,6 +3377,11 @@ gleiche Ziffer nochmal: hoch ⇄ quer</td></tr>
 <tr><td>F</td><td>Vollbild — nur das Bild</td></tr>
 <tr><td>Tab</td><td>Leisten und Baum ein/aus</td></tr>
 <tr><td>Strg+E</td><td>Bearbeitungsspalte (✎ in der Lupe)</td></tr>
+<tr><td>Strg+L</td><td>Filterleiste</td></tr>
+<tr><td>S</td><td>in die vorläufige Sammlung (dort: heraus)</td></tr>
+<tr><td>Strg + / Strg −</td><td>vergrößern / verkleinern</td></tr>
+<tr><td>Strg+0</td><td>einpassen</td></tr>
+<tr><td>F5</td><td>Diashow starten und beenden</td></tr>
 <tr><td>I</td><td>Bildangaben</td></tr>
 <tr><td>Strg+A / Strg+D</td><td>alles wählen / Auswahl aufheben</td></tr>
 <tr><td>Strg+Z</td><td>Bearbeitungsschritt zurück</td></tr>

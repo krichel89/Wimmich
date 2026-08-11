@@ -75,6 +75,13 @@ DEFAULTS = {
     # Filterleiste ueber dem Raster. Vorgabe AUS - sie kostet eine Zeile
     # ueber dem Bild und wird selten gebraucht.
     "filter_bar": False,
+    "zoom_slider": False,     # Zoomregler in der Lupe einblenden
+    # Vorlaeufige Sammlung: Pfade und Server-Kennungen, die per Hand
+    # zusammengetragen wurden. Bleibt ueber Neustarts erhalten, ist aber
+    # bewusst KEIN Album - nichts davon geht auf den Server.
+    "sammlung": [],
+    "sammlung_remote": [],
+    "diashow_sekunden": 4,     # Zoomregler in der Lupe einblenden
     "export_dir": "",         # zuletzt gewaehlter Zielordner des Stapel-Exports
     # Immich. Der Schlüssel liegt im Klartext in dieser Datei - sie steht
     # im Benutzerprofil und ist nur für den angemeldeten Benutzer lesbar,

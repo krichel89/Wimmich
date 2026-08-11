@@ -140,7 +140,6 @@ QTreeWidget {{
 }}
 QTreeWidget::item {{
     padding: 5px 4px;
-    border-radius: 6px;
     color: {TEXT_MUTED};
 }}
 QTreeWidget::item:hover {{ background: {HOVER}; color: {TEXT}; }}
@@ -160,21 +159,21 @@ QListView {{
 /* Bildlaufleisten - deutlich sichtbarer Griff, nicht nur bei Hover */
 QScrollBar:vertical {{
     background: transparent;
-    width: 12px;
+    width: 24px;
     margin: 2px;
 }}
 QScrollBar::handle:vertical {{
     background: {SCROLLBAR};
-    border-radius: 5px;
+    border-radius: 10px;
     min-height: 40px;
 }}
 QScrollBar::handle:vertical:hover {{ background: {SCROLLBAR_HOVER}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
-QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 2px; }}
+QScrollBar:horizontal {{ background: transparent; height: 24px; margin: 2px; }}
 QScrollBar::handle:horizontal {{
     background: {SCROLLBAR};
-    border-radius: 5px;
+    border-radius: 10px;
     min-width: 40px;
 }}
 QScrollBar::handle:horizontal:hover {{ background: {SCROLLBAR_HOVER}; }}

@@ -26,7 +26,7 @@ from .canvas import NONE as TOOL_NONE
 from .config import is_raw
 from .edits import EditStack
 from .exif import read_fast
-from .immich import ImmichClient, ImmichError
+from .immich import PING_TIMEOUT, ImmichClient, ImmichError
 from .sync import SyncWorker
 
 
@@ -40,10 +40,37 @@ class _VorschauSignale(QObject):
     """
 
     fertig = pyqtSignal(str, object)
+    client_da = pyqtSignal(object, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.gewuenscht = ""
+
+
+class _ClientTask(QRunnable):
+    """Prueft und verbindet den Server, ohne das Fenster anzuhalten."""
+
+    def __init__(self, url: str, key: str, signale: _VorschauSignale) -> None:
+        super().__init__()
+        self.url = url
+        self.key = key
+        self.signale = signale
+
+    def run(self) -> None:
+        client = ImmichClient(self.url, self.key)
+        grund = ""
+        try:
+            erreichbar, grund = client.erreichbar()
+            if erreichbar:
+                client.connect(timeout=PING_TIMEOUT * 3)
+            else:
+                client = None
+        except Exception as exc:
+            client, grund = None, str(exc)
+        try:
+            self.signale.client_da.emit(client, grund)
+        except RuntimeError:
+            pass          # Fenster ist inzwischen zu
 
 
 class _VorschauTask(QRunnable):
@@ -177,6 +204,19 @@ class ServerbilderMixin:
         if not client.configured:
             QMessageBox.information(self, "Immich",
                                     "Immich ist nicht eingerichtet.")
+            return None
+        # ERST die kurze Frage, ob ueberhaupt jemand antwortet. Ohne sie
+        # steht das Fenster bis zu 60 s in client.connect(), wenn der
+        # Server aus ist - genau das Einfrieren, das Harald gemeldet hat.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            erreichbar, grund = client.erreichbar()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not erreichbar:
+            QMessageBox.critical(
+                self, "Immich nicht erreichbar",
+                f"{self.config['immich_url']} antwortet nicht.\n\n{grund}")
             return None
         try:
             client.connect()
@@ -453,16 +493,23 @@ class ServerbilderMixin:
         _download_remote() auf ausdruecklichen Wunsch.
         """
         url, key = self.config["immich_url"], self.config["immich_key"]
-        if url and key:
-            client = ImmichClient(url, key)
-            try:
-                client.connect()
-            except ImmichError:
-                client = None       # spaeter erneut versuchen
-        else:
-            client = None
+        self.model._immich_client = None
+        if not (url and key):
+            return
+        # NICHT hier verbinden: das lief im Fensterfaden und hielt beim
+        # Start alles an, solange der Server nicht antwortete. Die
+        # Vorabpruefung und das Verbinden laufen im Hintergrund; bis sie
+        # durch sind, zeigt Wimmich einfach die lokalen Bilder.
+        self._pool.start(_ClientTask(url, key, self._vorschau_signale))
+
+    def _client_da(self, client, grund: str) -> None:
+        """Ergebnis der Hintergrundpruefung uebernehmen."""
         self.model._immich_client = client
-        self._remote_item.setHidden(client is None and not self.db.remote_count())
+        if client is None and grund:
+            self.sync_label.setText(f"Server nicht erreichbar: {grund}")
+            self.sync_label.setVisible(True)
+        elif client is not None:
+            self.sync_label.setVisible(False)
 
     def _apply_sync_settings(self) -> None:
         """Zeitgeber nach den Einstellungen an- oder abschalten."""
