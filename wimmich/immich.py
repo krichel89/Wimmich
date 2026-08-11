@@ -528,6 +528,34 @@ class ImmichClient:
         ) or []
         return sum(1 for entry in data if entry.get("success"))
 
+    def rename_album(self, album_id: str, name: str) -> bool:
+        """Albumnamen auf dem Server ändern."""
+        status, payload = self._request(
+            "PATCH", self._path(f"/albums/{album_id}", f"/album/{album_id}"),
+            body={"albumName": name})
+        if status >= 400:
+            raise ImmichError(_error_text(status, payload), status)
+        return True
+
+    def remove_from_album(self, album_id: str, asset_ids: list[str]) -> int:
+        """Bilder aus einem Album nehmen - das Bild selbst bleibt bestehen."""
+        if not asset_ids:
+            return 0
+        data = self._json(
+            "DELETE",
+            self._path(f"/albums/{album_id}/assets", f"/album/{album_id}/assets"),
+            body={"ids": asset_ids},
+        ) or []
+        return sum(1 for entry in data if entry.get("success"))
+
+    def delete_album(self, album_id: str) -> bool:
+        """Album auf dem Server löschen. Die Bilder bleiben erhalten."""
+        status, payload = self._request(
+            "DELETE", self._path(f"/albums/{album_id}", f"/album/{album_id}"))
+        if status >= 400:
+            raise ImmichError(_error_text(status, payload), status)
+        return True
+
     # -- Personen ------------------------------------------------------
 
     def people(self, with_hidden: bool = False) -> list[Person]:

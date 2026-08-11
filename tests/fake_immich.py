@@ -25,6 +25,8 @@ STATE = {
     "uploads": [],       # (filename, hat_sidecar)
     "albums": [{"id": "alb-1", "albumName": "Berlinale 2026", "assetCount": 2},
                {"id": "alb-2", "albumName": "Cannes", "assetCount": 0}],
+    # Inhalt je Album - so laesst sich pruefen, was Wimmich wirklich schiebt
+    "album_inhalt": {"alb-1": ["asset-alb-1-0", "asset-alb-1-1"], "alb-2": []},
     "people": [{"id": "per-1", "name": "Anna Beispiel", "isHidden": False},
                {"id": "per-2", "name": "", "isHidden": False}],
     "requests": [],
@@ -94,8 +96,13 @@ class Handler(BaseHTTPRequestHandler):
                 if prefix == "/api/albums/" and self._legacy():
                     return self._send(404, {"message": "Not found"})
                 album_id = path[len(prefix):]
-                assets = [{"id": f"asset-{album_id}-{i}"} for i in range(2)]
-                return self._send(200, {"id": album_id, "assets": assets})
+                if album_id not in STATE["album_inhalt"]:
+                    return self._send(404, {"message": "Not found"})
+                assets = [{"id": i} for i in STATE["album_inhalt"][album_id]]
+                name = next((a["albumName"] for a in STATE["albums"]
+                             if a["id"] == album_id), "")
+                return self._send(200, {"id": album_id, "albumName": name,
+                                        "assets": assets})
 
         if path in ("/api/people", "/api/person"):
             if path == "/api/people" and self._legacy():
@@ -134,6 +141,26 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return self._send(401, {"message": "Invalid API key"})
         body = self._read_body()
+
+        album_id = self._album_aus_pfad(path)
+        if album_id:
+            data = json.loads(body or b"{}")
+            inhalt = STATE["album_inhalt"].setdefault(album_id, [])
+            antwort = []
+            for kennung in data.get("ids") or []:
+                drin = kennung in inhalt
+                if drin:
+                    inhalt.remove(kennung)
+                antwort.append({"id": kennung, "success": drin})
+            return self._send(200, antwort)
+
+        for prefix in ("/api/albums/", "/api/album/"):
+            if path.startswith(prefix):
+                weg = path[len(prefix):]
+                STATE["albums"] = [a for a in STATE["albums"] if a["id"] != weg]
+                STATE["album_inhalt"].pop(weg, None)
+                return self._send(204)
+
         plural = path == "/api/assets"
         if path not in ("/api/assets", "/api/asset") or plural == self._legacy():
             return self._send(404, {"message": "Not found"})
@@ -178,6 +205,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"message": "Not found"})
             return self._handle_upload(body)
 
+        if path in ("/api/albums", "/api/album"):
+            plural = path == "/api/albums"
+            if plural == self._legacy():
+                return self._send(404, {"message": "Not found"})
+            data = json.loads(body or b"{}")
+            album_id = f"alb-{len(STATE['albums']) + 1}"
+            STATE["albums"].append({"id": album_id,
+                                    "albumName": data.get("albumName", ""),
+                                    "assetCount": len(data.get("assetIds") or [])})
+            STATE["album_inhalt"][album_id] = list(data.get("assetIds") or [])
+            return self._send(201, {"id": album_id,
+                                    "albumName": data.get("albumName", "")})
+
         if path == "/api/search/metadata":
             data = json.loads(body)
             person = (data.get("personIds") or ["?"])[0]
@@ -193,10 +233,45 @@ class Handler(BaseHTTPRequestHandler):
         STATE["requests"].append(("PUT", path))
         if not self._auth_ok():
             return self._send(401, {"message": "Invalid API key"})
-        self._read_body()
+        body = self._read_body()
+        album_id = self._album_aus_pfad(path)
+        if album_id:
+            data = json.loads(body or b"{}")
+            inhalt = STATE["album_inhalt"].setdefault(album_id, [])
+            antwort = []
+            for kennung in data.get("ids") or []:
+                neu = kennung not in inhalt
+                if neu:
+                    inhalt.append(kennung)
+                antwort.append({"id": kennung, "success": neu})
+            return self._send(200, antwort)
         if "/assets" in path or "/asset" in path:
             return self._send(200, [{"id": "x", "success": True}])
         return self._send(404, {"message": "Not found"})
+
+    def do_PATCH(self):
+        path = self._path()
+        STATE["requests"].append(("PATCH", path))
+        if not self._auth_ok():
+            return self._send(401, {"message": "Invalid API key"})
+        data = json.loads(self._read_body() or b"{}")
+        for prefix in ("/api/albums/", "/api/album/"):
+            if path.startswith(prefix):
+                album_id = path[len(prefix):]
+                for album in STATE["albums"]:
+                    if album["id"] == album_id:
+                        album["albumName"] = data.get("albumName",
+                                                      album["albumName"])
+                        return self._send(200, album)
+                return self._send(404, {"message": "Not found"})
+        return self._send(404, {"message": "Not found"})
+
+    def _album_aus_pfad(self, path: str) -> str:
+        """„/api/albums/<id>/assets" -> <id>, sonst leer."""
+        for prefix in ("/api/albums/", "/api/album/"):
+            if path.startswith(prefix) and path.endswith("/assets"):
+                return path[len(prefix):-len("/assets")]
+        return ""
 
     # -- Upload --------------------------------------------------------
 

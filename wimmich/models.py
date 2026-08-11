@@ -26,6 +26,7 @@ ROLE_LABEL = Qt.ItemDataRole.UserRole + 6
 ROLE_EDITED = Qt.ItemDataRole.UserRole + 7
 ROLE_HEADER = Qt.ItemDataRole.UserRole + 8
 ROLE_REMOTE = Qt.ItemDataRole.UserRole + 9   # liegt nur auf dem Server
+ROLE_ASPECT = Qt.ItemDataRole.UserRole + 10  # Breite/Hoehe der Aufnahme
 
 MONATE = {
     "01": "Januar", "02": "Februar", "03": "März", "04": "April",
@@ -279,6 +280,17 @@ class PhotoModel(QAbstractListModel):
             return _tooltip(item)
         if role == ROLE_REMOTE:
             return bool(item.get("_remote"))
+        if role == ROLE_ASPECT:
+            # Seitenverhaeltnis fuer die Kachelbreite im dichten Raster.
+            # Die Ausrichtung ist in width/height schon eingerechnet
+            # (exif.read_fast dreht 90°-Aufnahmen), deshalb reicht die
+            # rohe Rechnung.
+            breite = item.get("width") or 0
+            hoehe = item.get("height") or 0
+            try:
+                return float(breite) / float(hoehe) if breite and hoehe else 0.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                return 0.0
         if role == ROLE_PATH:
             return item.get("path") or ""
         if role == ROLE_ID:
@@ -399,6 +411,9 @@ class PhotoDelegate(QStyledItemDelegate):
     """Zeichnet Kachel, Dateiname, Sterne und Stapelabzeichen."""
 
     # Was auf der Kachel steht - alles einzeln abschaltbar (Menue Ansicht).
+    # Grenzen der Kachelbreite im dichten Raster (Vielfache der Hoehe)
+    MIN_VERHAELTNIS, MAX_VERHAELTNIS = 0.55, 2.2
+
     VORGABEN = {
         "packed": True,      # dicht an dicht, ohne Beschriftungsband
         "filenames": False,  # Dateiname unter der Kachel
@@ -436,8 +451,31 @@ class PhotoDelegate(QStyledItemDelegate):
             # Volle Breite, damit die Kopfzeile eine eigene Reihe bekommt
             width = self._viewport_width(option)
             return QSize(width, 40)
-        return QSize(self.tile + self.pad * 2,
+        if not self.optionen["packed"]:
+            return QSize(self.tile + self.pad * 2,
+                         self.tile + self.label_height + self.pad)
+
+        # Dicht an dicht: ALLE Kacheln gleich hoch, die Breite folgt dem
+        # Seitenverhaeltnis. Ein Hochformat bekommt dadurch eine schmale
+        # Kachel statt einer quadratischen mit Luft links und rechts.
+        return QSize(self._breite(index) + self.pad * 2,
                      self.tile + self.label_height + self.pad)
+
+    def _breite(self, index) -> int:
+        """Kachelbreite aus dem Seitenverhaeltnis, gedeckelt.
+
+        Ohne Deckel wuerde ein Panorama eine ganze Zeile fuellen und ein
+        extremes Hochformat zum Strich schrumpfen.
+        """
+        try:
+            verhaeltnis = float(index.data(ROLE_ASPECT) or 0.0)
+        except (TypeError, ValueError):
+            verhaeltnis = 0.0
+        if verhaeltnis <= 0:
+            verhaeltnis = 1.0     # ohne Massangaben quadratisch
+        verhaeltnis = min(max(verhaeltnis, self.MIN_VERHAELTNIS),
+                          self.MAX_VERHAELTNIS)
+        return int(round(self.tile * verhaeltnis))
 
     @staticmethod
     def _viewport_width(option) -> int:
@@ -463,14 +501,20 @@ class PhotoDelegate(QStyledItemDelegate):
         rand = 1 if packed else 3
         card = QRectF(rect.adjusted(rand, rand, -rand, -rand))
         if selected or hovered:
-            path = QPainterPath()
-            path.addRoundedRect(card, theme.RADIUS + 2, theme.RADIUS + 2)
-            painter.fillPath(
-                path, QBrush(QColor(theme.ACCENT_DIM if selected else theme.HOVER))
-            )
+            farbe = QBrush(QColor(theme.ACCENT_DIM if selected else theme.HOVER))
+            if packed:
+                # Dicht an dicht: eckig. Abgerundete Ecken lassen zwischen
+                # den Kacheln ueberall Hintergrund durchblitzen.
+                painter.fillRect(card, farbe)
+            else:
+                path = QPainterPath()
+                path.addRoundedRect(card, theme.RADIUS + 2, theme.RADIUS + 2)
+                painter.fillPath(path, farbe)
 
         innen = 1 if packed else 5
-        image_rect = QRectF(card.x() + innen, card.y() + innen, self.tile, self.tile)
+        breite = (self._breite(index) - 2 * (innen - 1)) if packed else self.tile
+        image_rect = QRectF(card.x() + innen, card.y() + innen,
+                            max(8.0, float(breite)), self.tile)
         rejected = marks.is_reject(int(index.data(ROLE_RATING) or 0))
         if rejected:
             painter.setOpacity(0.38)
@@ -559,10 +603,12 @@ class PhotoDelegate(QStyledItemDelegate):
     def _draw_image(self, painter: QPainter, area: QRectF, index) -> None:
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
 
+        radius = 0.0 if self.optionen["packed"] else float(theme.RADIUS)
+
         if not isinstance(pixmap, QPixmap) or pixmap.isNull():
             # Ruhiger Platzhalter, solange die Vorschau noch entsteht
             path = QPainterPath()
-            path.addRoundedRect(area, theme.RADIUS, theme.RADIUS)
+            path.addRoundedRect(area, radius, radius)
             painter.fillPath(path, QBrush(QColor(theme.ELEVATED)))
             return
 
@@ -575,9 +621,10 @@ class PhotoDelegate(QStyledItemDelegate):
         target.moveCenter(area.center())
 
         painter.save()
-        clip = QPainterPath()
-        clip.addRoundedRect(target, theme.RADIUS, theme.RADIUS)
-        painter.setClipPath(clip)
+        if radius:
+            clip = QPainterPath()
+            clip.addRoundedRect(target, radius, radius)
+            painter.setClipPath(clip)
         painter.drawPixmap(target.toRect(), scaled)
         painter.restore()
 
@@ -601,24 +648,29 @@ class PhotoDelegate(QStyledItemDelegate):
             self._draw_edited(painter, target)
 
     def _draw_remote(self, painter: QPainter, image_rect: QRectF) -> None:
-        """Wolkenzeichen fuer Bilder, die nur auf dem Server liegen."""
+        """Wolkenzeichen fuer Bilder, die nur auf dem Server liegen.
+
+        Bewusst zurueckhaltend: kleiner als frueher, ohne schwarzen Hof
+        und halbdurchsichtig. Es ist ein Hinweis, keine Auszeichnung -
+        in einer Ansicht voller Serverbilder saesse sonst auf jeder
+        Kachel ein Abzeichen.
+        """
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = 9.0
-        mitte = QPointF(image_rect.left() + r + 6, image_rect.top() + r + 6)
+        painter.setOpacity(0.55)
+        mitte = QPointF(image_rect.left() + 12, image_rect.top() + 11)
 
-        hof = QPainterPath()
-        hof.addEllipse(mitte, r + 3, r + 3)
-        painter.fillPath(hof, QBrush(QColor(0, 0, 0, 150)))
-
-        # Wolke aus drei Kreisen und einem Sockel - klein, aber eindeutig
         wolke = QPainterPath()
-        wolke.addEllipse(QPointF(mitte.x() - 3.5, mitte.y() + 0.5), 4.0, 4.0)
-        wolke.addEllipse(QPointF(mitte.x() + 0.5, mitte.y() - 2.0), 5.0, 5.0)
-        wolke.addEllipse(QPointF(mitte.x() + 4.0, mitte.y() + 1.0), 3.8, 3.8)
+        wolke.addEllipse(QPointF(mitte.x() - 2.6, mitte.y() + 0.4), 3.0, 3.0)
+        wolke.addEllipse(QPointF(mitte.x() + 0.4, mitte.y() - 1.5), 3.8, 3.8)
+        wolke.addEllipse(QPointF(mitte.x() + 3.0, mitte.y() + 0.8), 2.9, 2.9)
         wolke.addRoundedRect(
-            QRectF(mitte.x() - 6.0, mitte.y() + 1.0, 11.0, 4.5), 2.2, 2.2)
-        painter.fillPath(wolke, QBrush(QColor("#ffffff")))
+            QRectF(mitte.x() - 4.6, mitte.y() + 0.8, 8.4, 3.4), 1.7, 1.7)
+        # Dunkler Umriss statt Hof: die Wolke bleibt auch auf hellem
+        # Himmel erkennbar, ohne einen Fleck auf das Bild zu setzen.
+        painter.setPen(QPen(QColor(0, 0, 0, 130), 2.0))
+        painter.drawPath(wolke)
+        painter.fillPath(wolke, QBrush(QColor(255, 255, 255, 235)))
         painter.restore()
 
     def _draw_badge(self, painter: QPainter, image_rect: QRectF, text: str) -> None:

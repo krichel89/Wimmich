@@ -22,7 +22,7 @@ _READ_ARGS = [
     "-j",                    # JSON-Ausgabe
     "-n",                    # Rohwerte statt hübscher Umschreibungen
     "-charset", "filename=utf8",
-    "-ImageWidth", "-ImageHeight",
+    "-ImageWidth", "-ImageHeight", "-Orientation",
     "-DateTimeOriginal", "-CreateDate",
     "-Model", "-LensModel", "-LensID",
     "-Rating", "-XMP:Rating",
@@ -95,6 +95,7 @@ def read_fast(paths: list[str]) -> dict[str, dict]:
             with Image.open(pfad) as bild:
                 breite, hoehe = bild.size
                 exif = bild.getexif()
+                breite, hoehe = _gedreht(breite, hoehe, exif.get(274))
                 xmp = bild.info.get("xmp") or b""
         except Exception:
             continue
@@ -355,6 +356,21 @@ def _as_text(value) -> str | None:
     return str(value)
 
 
+def _gedreht(breite, hoehe, ausrichtung):
+    """Breite und Hoehe tauschen, wenn die Aufnahme quer gespeichert ist.
+
+    Exif-Ausrichtung 5-8 bedeutet 90°: die Datei enthaelt das Bild
+    liegend, angezeigt wird es stehend. Ohne den Tausch haelt Wimmich
+    ein Hochformat fuer ein Querformat - im dichten Raster bekaeme es
+    dann eine viel zu breite Kachel.
+    """
+    try:
+        wert = int(float(ausrichtung))
+    except (TypeError, ValueError):
+        return breite, hoehe
+    return (hoehe, breite) if wert in (5, 6, 7, 8) else (breite, hoehe)
+
+
 def _normalise(entry: dict) -> dict:
     taken = _first(entry, "DateTimeOriginal", "CreateDate")
     if isinstance(taken, str) and len(taken) >= 19:
@@ -366,9 +382,12 @@ def _normalise(entry: dict) -> dict:
     except (TypeError, ValueError):
         rating = 0
 
+    breite, hoehe = _gedreht(_first(entry, "ImageWidth"),
+                             _first(entry, "ImageHeight"),
+                             _first(entry, "Orientation"))
     return {
-        "width": _first(entry, "ImageWidth"),
-        "height": _first(entry, "ImageHeight"),
+        "width": breite,
+        "height": hoehe,
         "taken_at": taken,
         "camera": _as_text(_first(entry, "Model")),
         "lens": _as_text(_first(entry, "LensModel", "LensID")),

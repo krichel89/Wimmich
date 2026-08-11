@@ -102,6 +102,11 @@ class SyncWorker(QObject):
             self._db.commit()
             self._match_and_upload(client, result)
 
+            # Eigene Albenaenderungen ZULETZT: erst jetzt haben die
+            # gerade hochgeladenen Bilder eine Immich-Kennung.
+            if not self._cancel and self._fetch_albums:
+                self._push_albums(client, result)
+
             self._db.commit()
             self.finished.emit(result)
         except ImmichError as exc:
@@ -370,11 +375,93 @@ class SyncWorker(QObject):
             except ImmichError:
                 continue
             self._db.set_album_assets(
-                album.id, [a["id"] for a in assets if a.get("id")]
+                self._db.album_id_fuer_immich(album.id) or album.id,
+                [a["id"] for a in assets if a.get("id")]
             )
             self._report(f"Alben: {index} von {len(albums)}", index, len(albums))
         self._report(f"Alben fertig: {len(albums)} von {len(albums)}",
                      len(albums), len(albums), force=True)
+
+    def _push_albums(self, client: ImmichClient, result: SyncResult) -> None:
+        """Eigene Albenänderungen auf den Server schieben.
+
+        Läuft NACH den Bildern: erst dann haben frisch hochgeladene
+        Aufnahmen eine Immich-Kennung und können überhaupt in ein Album
+        gelegt werden. Was noch keine hat, bleibt vorgemerkt und geht
+        beim nächsten Abgleich mit - das Album bleibt deshalb „dirty".
+        """
+        offen = self._db.album_dirty()
+        if not offen:
+            return
+        self._report(f"Alben schieben: 0 von {len(offen)}", 0, len(offen),
+                     force=True)
+
+        for index, album in enumerate(offen, start=1):
+            if self._cancel:
+                return
+            album_id = album["id"]
+            immich_id = album["immich_id"] or ""
+            zugeordnet = self._album_kennungen(album_id, entfernt=False)
+            entfernt = self._album_kennungen(album_id, entfernt=True)
+            vollstaendig = not self._album_wartet(album_id)
+
+            try:
+                if not immich_id:
+                    immich_id = client.create_album(album["name"],
+                                                    sorted(zugeordnet))
+                    if not immich_id:
+                        continue
+                    self._report(f"Album angelegt: {album['name']}",
+                                 index, len(offen), force=True)
+                else:
+                    if album["dirty"]:
+                        client.rename_album(immich_id, album["name"])
+                    bekannt = set(self._db.album_asset_ids(album_id))
+                    neu = sorted(zugeordnet - bekannt)
+                    if neu:
+                        client.add_to_album(immich_id, neu)
+                    weg = sorted(entfernt & (bekannt | zugeordnet))
+                    if weg:
+                        client.remove_from_album(immich_id, weg)
+            except ImmichError as exc:
+                result.errors.append(f"Album {album['name']}: {exc}")
+                continue
+
+            # Spiegel nachziehen, damit der Baum sofort stimmt
+            self._db.set_album_assets(album_id, sorted(zugeordnet - entfernt))
+            if vollstaendig:
+                self._db.album_sauber(album_id, immich_id)
+            else:
+                # Es fehlen noch Uploads - Kennung merken, Rest bleibt offen
+                self._db.set_album_immich(album_id, immich_id)
+            self._report(f"Alben schieben: {index} von {len(offen)}",
+                         index, len(offen))
+        self._report(f"Alben geschoben: {len(offen)}", len(offen), len(offen),
+                     force=True)
+
+    def _album_kennungen(self, album_id: str, entfernt: bool) -> set[str]:
+        """Immich-Kennungen der lokalen Albumeinträge.
+
+        Lokale Dateien steuern ihre Kennung über photos.immich_id bei -
+        wer noch nicht hochgeladen ist, hat keine und fällt hier heraus.
+        """
+        ids: set[str] = set()
+        for zeile in self._db.album_eintraege(album_id, entfernt=entfernt):
+            if zeile["immich_id"]:
+                ids.add(zeile["immich_id"])
+            elif zeile["path"]:
+                kennung = self._db.immich_id_fuer_pfad(zeile["path"])
+                if kennung:
+                    ids.add(kennung)
+        return ids
+
+    def _album_wartet(self, album_id: str) -> bool:
+        """Steht noch ein Bild ohne Immich-Kennung im Album?"""
+        for zeile in self._db.album_eintraege(album_id, entfernt=False):
+            if not zeile["immich_id"] and zeile["path"]:
+                if not self._db.immich_id_fuer_pfad(zeile["path"]):
+                    return True
+        return False
 
     def _sync_people(self, client: ImmichClient) -> None:
         people = client.people()

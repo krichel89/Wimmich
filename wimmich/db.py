@@ -11,12 +11,13 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from .config import DB_PATH, CONFIG_DIR
 from .marks import REJECT, clamp_rating
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -75,10 +76,13 @@ CREATE TABLE IF NOT EXISTS remote_assets (
 CREATE INDEX IF NOT EXISTS idx_remote_taken ON remote_assets(taken_at);
 
 CREATE TABLE IF NOT EXISTS albums (
-    id          TEXT PRIMARY KEY,
+    id          TEXT PRIMARY KEY,   -- intern; bei Serveralben = immich_id
     name        TEXT NOT NULL,
     asset_count INTEGER NOT NULL DEFAULT 0,
-    synced_at   REAL
+    synced_at   REAL,
+    immich_id   TEXT NOT NULL DEFAULT '',  -- leer = noch nicht auf dem Server
+    local       INTEGER NOT NULL DEFAULT 0,  -- in Wimmich angelegt
+    dirty       INTEGER NOT NULL DEFAULT 0   -- lokal geaendert, noch nicht geschoben
 );
 CREATE TABLE IF NOT EXISTS people (
     id        TEXT PRIMARY KEY,
@@ -96,6 +100,22 @@ CREATE TABLE IF NOT EXISTS person_assets (
     immich_id TEXT NOT NULL,
     PRIMARY KEY (person_id, immich_id)
 );
+-- Lokale Albenzugehoerigkeit. album_assets ist der SPIEGEL des Servers
+-- und wird bei jedem Abgleich ueberschrieben; hier steht, was Harald in
+-- Wimmich selbst zugeordnet hat. Eine Zeile mit entfernt=1 ist ein
+-- Grabstein: das Bild wurde aus dem Album genommen und muss beim
+-- naechsten Abgleich auch auf dem Server heraus.
+-- Lokale Datei: path gesetzt, immich_id leer. Reines Serverbild:
+-- umgekehrt. So bleibt der Schluessel eindeutig.
+CREATE TABLE IF NOT EXISTS album_photos (
+    album_id  TEXT NOT NULL,
+    path      TEXT NOT NULL DEFAULT '',
+    immich_id TEXT NOT NULL DEFAULT '',
+    entfernt  INTEGER NOT NULL DEFAULT 0,
+    added     REAL,
+    PRIMARY KEY (album_id, path, immich_id)
+);
+CREATE INDEX IF NOT EXISTS idx_album_photos_path ON album_photos(path);
 CREATE INDEX IF NOT EXISTS idx_album_assets_asset  ON album_assets(immich_id);
 CREATE INDEX IF NOT EXISTS idx_person_assets_asset ON person_assets(immich_id);
 
@@ -223,6 +243,31 @@ class Database:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_stack ON photos(stack_key)"
         )
+        # Schema 10: eigene Alben in Wimmich
+        album_spalten = {row["name"]
+                         for row in conn.execute("PRAGMA table_info(albums)")}
+        if "immich_id" not in album_spalten:
+            conn.execute("ALTER TABLE albums ADD COLUMN immich_id TEXT "
+                         "NOT NULL DEFAULT ''")
+            # Alles, was bisher drinstand, kam vom Server - dort ist die
+            # Zeilenkennung zugleich die Immich-Kennung.
+            conn.execute("UPDATE albums SET immich_id = id")
+        if "local" not in album_spalten:
+            conn.execute("ALTER TABLE albums ADD COLUMN local INTEGER "
+                         "NOT NULL DEFAULT 0")
+        if "dirty" not in album_spalten:
+            conn.execute("ALTER TABLE albums ADD COLUMN dirty INTEGER "
+                         "NOT NULL DEFAULT 0")
+        conn.execute("""CREATE TABLE IF NOT EXISTS album_photos (
+            album_id TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',
+            immich_id TEXT NOT NULL DEFAULT '',
+            entfernt INTEGER NOT NULL DEFAULT 0, added REAL,
+            PRIMARY KEY (album_id, path, immich_id))""")
+        # Index erst NACH dem Anlegen der Tabelle - sonst scheitert er
+        # bei einer alten Datenbank (Lehre aus Schema 8)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_album_photos_path "
+                     "ON album_photos(path)")
+
         missing = conn.execute(
             "SELECT id, folder, filename FROM photos WHERE stack_key IS NULL"
         ).fetchall()
@@ -572,17 +617,47 @@ class Database:
                           (checksum, photo_id))
 
     def replace_albums(self, albums) -> None:
-        """Albenliste des Servers übernehmen. Was dort weg ist, fliegt hier raus."""
+        """Albenliste des Servers übernehmen. Was dort weg ist, fliegt hier raus.
+
+        EIGENE Alben bleiben dabei stehen: sie kennt der Server noch gar
+        nicht (immich_id leer) oder sie gehören zu einer Zeile, deren
+        Kennung anders lautet als die Immich-Kennung. Sonst hätte der
+        erste Abgleich jedes selbst angelegte Album weggeräumt.
+        """
         conn = self.conn
         keep = set()
         for album in albums:
+            # Gibt es dazu schon eine Zeile - auch eine hier angelegte,
+            # die inzwischen auf den Server geschoben wurde?
+            row = conn.execute(
+                "SELECT id, dirty FROM albums WHERE immich_id=? OR id=?",
+                (album.id, album.id)).fetchone()
+            if row:
+                keep.add(row["id"])
+                # Einen lokal geänderten Namen NICHT überschreiben - er
+                # geht beim nächsten Abgleich auf den Server.
+                if row["dirty"]:
+                    conn.execute(
+                        "UPDATE albums SET asset_count=?, synced_at=?, "
+                        "immich_id=? WHERE id=?",
+                        (album.asset_count, time.time(), album.id, row["id"]))
+                else:
+                    conn.execute(
+                        "UPDATE albums SET name=?, asset_count=?, synced_at=?, "
+                        "immich_id=? WHERE id=?",
+                        (album.name, album.asset_count, time.time(),
+                         album.id, row["id"]))
+                continue
             keep.add(album.id)
             conn.execute(
-                "INSERT INTO albums(id, name, asset_count, synced_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
-                "asset_count=excluded.asset_count, synced_at=excluded.synced_at",
-                (album.id, album.name, album.asset_count, time.time()),
+                "INSERT INTO albums(id, name, asset_count, synced_at, "
+                "immich_id, local, dirty) VALUES(?,?,?,?,?,0,0)",
+                (album.id, album.name, album.asset_count, time.time(), album.id),
             )
+        # Eigene Alben nie wegräumen, auch wenn der Server sie nicht kennt
+        for row in conn.execute(
+                "SELECT id FROM albums WHERE local=1 OR immich_id=''"):
+            keep.add(row["id"])
         _prune(conn, "albums", "album_assets", "album_id", keep)
         conn.commit()
 
@@ -740,6 +815,207 @@ class Database:
                 ORDER BY r.taken_at DESC""",
             (key,),
         ).fetchall()
+
+    # -- Eigene Alben --------------------------------------------------
+
+    def create_album_local(self, name: str) -> str:
+        """Album in Wimmich anlegen - noch ohne Gegenstück auf dem Server.
+
+        Die Kennung beginnt mit „lok-", damit sie sich nie mit einer
+        Immich-Kennung überschneidet. Sie bleibt auch nach dem ersten
+        Abgleich erhalten; die Serverkennung kommt daneben in immich_id.
+        """
+        album_id = "lok-" + uuid.uuid4().hex[:16]
+        self.conn.execute(
+            "INSERT INTO albums(id, name, asset_count, synced_at, "
+            "immich_id, local, dirty) VALUES(?,?,0,NULL,'',1,1)",
+            (album_id, name.strip() or "Ohne Namen"),
+        )
+        self.conn.commit()
+        return album_id
+
+    def rename_album(self, album_id: str, name: str) -> None:
+        self.conn.execute(
+            "UPDATE albums SET name=?, dirty=1 WHERE id=?",
+            (name.strip() or "Ohne Namen", album_id))
+        self.conn.commit()
+
+    def delete_album(self, album_id: str) -> None:
+        """Album samt Zuordnungen aus dem Index nehmen.
+
+        Bilder werden dabei nicht angefasst - ein Album ist nur eine
+        Zusammenstellung.
+        """
+        for sql in ("DELETE FROM albums WHERE id=?",
+                    "DELETE FROM album_assets WHERE album_id=?",
+                    "DELETE FROM album_photos WHERE album_id=?"):
+            self.conn.execute(sql, (album_id,))
+        self.conn.commit()
+
+    def album(self, album_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM albums WHERE id=?", (album_id,)).fetchone()
+
+    def album_add(self, album_id: str, paths: list[str],
+                  immich_ids: list[str] | None = None) -> int:
+        """Bilder einem Album zuordnen. Ergebnis: Anzahl der Neuzugänge.
+
+        Ein etwaiger Grabstein (früher entfernt) wird dabei wieder
+        aufgehoben - sonst käme das Bild beim nächsten Abgleich sofort
+        wieder heraus.
+        """
+        jetzt = time.time()
+        eintraege = [(album_id, p, "", jetzt) for p in paths if p]
+        eintraege += [(album_id, "", i, jetzt) for i in (immich_ids or []) if i]
+        if not eintraege:
+            return 0
+        self.conn.executemany(
+            "INSERT INTO album_photos(album_id, path, immich_id, entfernt, added) "
+            "VALUES(?,?,?,0,?) ON CONFLICT(album_id, path, immich_id) "
+            "DO UPDATE SET entfernt=0, added=excluded.added",
+            eintraege)
+        self.conn.execute("UPDATE albums SET dirty=1 WHERE id=?", (album_id,))
+        self.conn.commit()
+        return len(eintraege)
+
+    def album_remove(self, album_id: str, paths: list[str],
+                     immich_ids: list[str] | None = None) -> int:
+        """Bilder aus einem Album nehmen.
+
+        Steht das Bild im Serverspiegel, bleibt ein Grabstein
+        (entfernt=1) stehen, damit der nächste Abgleich es auch auf dem
+        Server aus dem Album nimmt. Sonst reicht das Löschen der Zeile.
+        """
+        jetzt = time.time()
+        eintraege = [(album_id, p, "", jetzt) for p in paths if p]
+        eintraege += [(album_id, "", i, jetzt) for i in (immich_ids or []) if i]
+        if not eintraege:
+            return 0
+        self.conn.executemany(
+            "INSERT INTO album_photos(album_id, path, immich_id, entfernt, added) "
+            "VALUES(?,?,?,1,?) ON CONFLICT(album_id, path, immich_id) "
+            "DO UPDATE SET entfernt=1, added=excluded.added",
+            eintraege)
+        self.conn.execute("UPDATE albums SET dirty=1 WHERE id=?", (album_id,))
+        self.conn.commit()
+        return len(eintraege)
+
+    def album_eintraege(self, album_id: str, entfernt: bool = False) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT path, immich_id FROM album_photos "
+            "WHERE album_id=? AND entfernt=?",
+            (album_id, 1 if entfernt else 0)).fetchall()
+
+    def album_dirty(self) -> list[sqlite3.Row]:
+        """Alben mit lokalen Änderungen, die auf den Server sollen."""
+        return self.conn.execute(
+            "SELECT * FROM albums WHERE dirty=1 OR (local=1 AND immich_id='')"
+        ).fetchall()
+
+    def album_sauber(self, album_id: str, immich_id: str = "") -> None:
+        if immich_id:
+            self.conn.execute(
+                "UPDATE albums SET immich_id=?, dirty=0, synced_at=? WHERE id=?",
+                (immich_id, time.time(), album_id))
+        else:
+            self.conn.execute(
+                "UPDATE albums SET dirty=0, synced_at=? WHERE id=?",
+                (time.time(), album_id))
+        # Erledigte Grabsteine wegräumen: das Bild ist auf dem Server
+        # aus dem Album heraus, es gibt nichts mehr zu tun.
+        self.conn.execute(
+            "DELETE FROM album_photos WHERE album_id=? AND entfernt=1",
+            (album_id,))
+        self.conn.commit()
+
+    def album_count(self, album_id: str) -> int:
+        """Wie viele Bilder das Album in Wimmich zeigt (lokal + Server)."""
+        row = self.conn.execute(
+            """SELECT COUNT(*) FROM (
+                 SELECT p.path AS k FROM photos p
+                  WHERE (p.path IN (SELECT path FROM album_photos
+                                    WHERE album_id=:a AND entfernt=0 AND path<>'')
+                     OR (p.immich_id <> '' AND p.immich_id IN
+                         (SELECT immich_id FROM album_assets WHERE album_id=:a)))
+                    AND p.path NOT IN (SELECT path FROM album_photos
+                                       WHERE album_id=:a AND entfernt=1 AND path<>'')
+                 UNION
+                 SELECT r.immich_id AS k FROM remote_assets r
+                  WHERE (r.immich_id IN (SELECT immich_id FROM album_assets
+                                         WHERE album_id=:a)
+                     OR r.immich_id IN (SELECT immich_id FROM album_photos
+                                        WHERE album_id=:a AND entfernt=0
+                                          AND immich_id<>''))
+                    AND r.immich_id NOT IN (SELECT immich_id FROM album_photos
+                                            WHERE album_id=:a AND entfernt=1
+                                              AND immich_id<>'')
+                    AND NOT EXISTS (SELECT 1 FROM photos p2
+                                    WHERE p2.immich_id = r.immich_id
+                                      AND p2.immich_id <> ''))""",
+            {"a": album_id}).fetchone()
+        return int(row[0] or 0)
+
+    def photos_in_album(self, album_id: str, min_rating: int = 0,
+                        order: str = "taken_at", desc: bool = False,
+                        stacked: bool = True, prefer_raw: bool = True,
+                        show_rejects: bool = True,
+                        labels: list[str] | None = None,
+                        unlabeled: bool = False) -> list[sqlite3.Row]:
+        """Lokale Bilder eines Albums - eigene Zuordnung UND Serverspiegel.
+
+        Anders als photos_by_immich() setzt das nicht voraus, dass ein
+        Bild schon hochgeladen ist: was Harald in Wimmich zuordnet,
+        steht sofort im Album.
+        """
+        where = ("(p.path IN (SELECT path FROM album_photos "
+                 " WHERE album_id=? AND entfernt=0 AND path<>'')"
+                 " OR (p.immich_id <> '' AND p.immich_id IN "
+                 "     (SELECT immich_id FROM album_assets WHERE album_id=?)))"
+                 " AND p.path NOT IN (SELECT path FROM album_photos "
+                 "     WHERE album_id=? AND entfernt=1 AND path<>'')")
+        params: list = [album_id, album_id, album_id]
+        where, params = _add_filters(where, params, min_rating,
+                                     show_rejects, labels, unlabeled)
+        return self._select(where, params, order, stacked, prefer_raw, desc=desc)
+
+    def remote_in_album(self, album_id: str) -> list[sqlite3.Row]:
+        """Serverbilder eines Albums, zu denen es keine lokale Datei gibt."""
+        return self.conn.execute(
+            """SELECT r.* FROM remote_assets r
+               WHERE (r.immich_id IN (SELECT immich_id FROM album_assets
+                                      WHERE album_id=:a)
+                  OR r.immich_id IN (SELECT immich_id FROM album_photos
+                                     WHERE album_id=:a AND entfernt=0
+                                       AND immich_id<>''))
+                 AND r.immich_id NOT IN (SELECT immich_id FROM album_photos
+                                         WHERE album_id=:a AND entfernt=1
+                                           AND immich_id<>'')
+                 AND NOT EXISTS (SELECT 1 FROM photos p
+                                 WHERE p.immich_id = r.immich_id
+                                   AND p.immich_id <> '')
+               ORDER BY r.taken_at DESC""",
+            {"a": album_id}).fetchall()
+
+    def album_asset_ids(self, album_id: str) -> list[str]:
+        """Was der Server laut Spiegel in diesem Album hat."""
+        return [str(r[0]) for r in self.conn.execute(
+            "SELECT immich_id FROM album_assets WHERE album_id=?", (album_id,))]
+
+    def set_album_immich(self, album_id: str, immich_id: str) -> None:
+        """Serverkennung eintragen, ohne die Änderung als erledigt zu buchen."""
+        self.conn.execute("UPDATE albums SET immich_id=? WHERE id=?",
+                          (immich_id, album_id))
+        self.conn.commit()
+
+    def immich_id_fuer_pfad(self, path: str) -> str:
+        row = self.conn.execute(
+            "SELECT immich_id FROM photos WHERE path=?", (path,)).fetchone()
+        return str(row[0] or "") if row else ""
+
+    def album_id_fuer_immich(self, immich_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT id FROM albums WHERE immich_id=?", (immich_id,)).fetchone()
+        return str(row[0]) if row else ""
 
     def albums(self) -> list[sqlite3.Row]:
         return self.conn.execute(

@@ -21,7 +21,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox,
-    QFileDialog, QHBoxLayout,
+    QFileDialog, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QStackedWidget, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -297,7 +297,7 @@ class MainWindow(QMainWindow):
             PhotoDelegate(self.config["grid_size"], self._kachel_optionen()))
         self.grid.setViewMode(QListView.ViewMode.IconMode)
         self.grid.setResizeMode(QListView.ResizeMode.Adjust)
-        self.grid.setUniformItemSizes(True)
+        self.grid.setUniformItemSizes(not self.config["grid_packed"])
         self.grid.setSpacing(2 if self.config["grid_packed"] else 6)
         self.grid.setMouseTracking(True)   # damit die Kachel beim Ueberfahren reagiert
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -575,6 +575,8 @@ class MainWindow(QMainWindow):
 
         menu_immich = leiste.addMenu("&Immich")
         menu_immich.addAction(immich_action)
+        menu_immich.addSeparator()
+        menu_immich.addAction("Neues Album …", self._album_neu)
 
         menu_extras = leiste.addMenu("E&xtras")
         menu_extras.addAction(clear_action)
@@ -658,6 +660,9 @@ class MainWindow(QMainWindow):
 
     def _reload_immich_tree(self) -> None:
         """Alben und Personen aus dem lokalen Spiegel nachtragen."""
+        # Vor dem Abraeumen merken: takeChildren() loescht den gerade
+        # gewaehlten Eintrag, danach ist er nicht mehr zu finden.
+        gewaehlt = self._selection
         for root, rows, kind in (
             (self._albums_root, self.db.albums(), "album"),
             (self._people_root, self.db.people(), "person"),
@@ -665,17 +670,49 @@ class MainWindow(QMainWindow):
             root.takeChildren()
             for row in rows:
                 name = row["name"] or "(ohne Namen)"
-                label = (f"{name}  ({row['asset_count']})"
-                         if kind == "album" else name)
+                if kind == "album":
+                    label = f"{name}  ({self.db.album_count(row['id'])})"
+                else:
+                    label = name
                 item = QTreeWidgetItem([label])
                 item.setData(0, Qt.ItemDataRole.UserRole, (kind, row["id"]))
+                if kind == "album" and not row["immich_id"]:
+                    # Noch nicht auf dem Server - beim Abgleich geht es hin
+                    item.setToolTip(0, "Nur in Wimmich; wird beim nächsten "
+                                       "Immich-Abgleich angelegt")
+                    item.setText(0, label + "  \u2022")
                 root.addChild(item)
             if not rows:
-                hint = QTreeWidgetItem(["— noch nicht abgeglichen —"])
+                hint = QTreeWidgetItem(
+                    ["— noch keins (Rechtsklick: Neues Album) —"]
+                    if kind == "album" else ["— noch nicht abgeglichen —"])
                 hint.setData(0, Qt.ItemDataRole.UserRole, None)
                 hint.setFlags(Qt.ItemFlag.NoItemFlags)
                 root.addChild(hint)
             root.setExpanded(bool(rows))
+        self._auswahl_wiederherstellen(gewaehlt)
+
+    def _auswahl_wiederherstellen(self, gewaehlt) -> None:
+        """Nach dem Neuaufbau wieder auf denselben Eintrag stellen.
+
+        _reload_immich_tree() wirft die Baumeintraege weg und legt sie neu
+        an - damit verliert der Baum seine Auswahl und die Ansicht fiel
+        auf „Alle Fotos" zurueck. Beim Zuordnen eines Bildes sprang
+        Wimmich dadurch mitten in der Arbeit aus dem Album heraus.
+        Gemessen: nach dem Entfernen standen 5 statt 3 Bildern da.
+        """
+        if not gewaehlt or gewaehlt[0] not in ("album", "person"):
+            return
+        wurzel = (self._albums_root if gewaehlt[0] == "album"
+                  else self._people_root)
+        for i in range(wurzel.childCount()):
+            item = wurzel.child(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == gewaehlt:
+                self._selection = gewaehlt
+                gesperrt = self.tree.blockSignals(True)
+                self.tree.setCurrentItem(item)
+                self.tree.blockSignals(gesperrt)
+                return
 
     def _add_children(self, parent: QTreeWidgetItem, path: str) -> None:
         """Legt die Unterordner an, aber nur eine Ebene tief (lazy)."""
@@ -747,13 +784,25 @@ class MainWindow(QMainWindow):
         self._folders_root.setExpanded(True)
 
     def _tree_menu(self, position) -> None:
-        """Rechtsklick im Baum: aufklappen/zuklappen, Ordner aus-/einschließen."""
+        """Rechtsklick im Baum: Alben verwalten, Ordner aus-/einschließen."""
         menu = QMenu(self)
+        item = self.tree.itemAt(position)
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+
+        if item is self._albums_root or (data and data[0] == "album"):
+            menu.addAction("Neues Album …", self._album_neu)
+            if data and data[0] == "album":
+                album_id = data[1]
+                menu.addSeparator()
+                menu.addAction("Umbenennen …",
+                               lambda: self._album_umbenennen(album_id))
+                menu.addAction("Album löschen …",
+                               lambda: self._album_loeschen(album_id))
+            menu.addSeparator()
+
         menu.addAction("Baum ganz aufklappen", self._expand_all_folders)
         menu.addAction("Baum wieder zuklappen", self._collapse_all_folders)
 
-        item = self.tree.itemAt(position)
-        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
         if data and data[0] == "folder":
             folder = data[1]
             menu.addSeparator()
@@ -764,6 +813,132 @@ class MainWindow(QMainWindow):
                 menu.addAction("Ordner ausschließen",
                                lambda: self._exclude_folder(folder))
         menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    # -- Eigene Alben --------------------------------------------------
+
+    def _album_neu(self, pfade: list[str] | None = None,
+                   immich_ids: list[str] | None = None) -> str:
+        """Album anlegen; wahlweise gleich mit den ausgewählten Bildern."""
+        name, ok = QInputDialog.getText(self, "Neues Album", "Name des Albums:")
+        if not ok or not name.strip():
+            return ""
+        album_id = self.db.create_album_local(name.strip())
+        if pfade or immich_ids:
+            self.db.album_add(album_id, pfade or [], immich_ids or [])
+        self._reload_immich_tree()
+        self.statusBar().showMessage(
+            f"Album \u201e{name.strip()}\u201c angelegt \u2013 geht beim "
+            "n\u00e4chsten Immich-Abgleich auf den Server", 8000)
+        return album_id
+
+    def _album_umbenennen(self, album_id: str) -> None:
+        album = self.db.album(album_id)
+        if album is None:
+            return
+        name, ok = QInputDialog.getText(self, "Album umbenennen",
+                                        "Neuer Name:", text=album["name"])
+        if not ok or not name.strip():
+            return
+        self.db.rename_album(album_id, name.strip())
+        self._reload_immich_tree()
+
+    def _album_loeschen(self, album_id: str) -> None:
+        """Album entfernen - die Bilder bleiben in jedem Fall erhalten."""
+        album = self.db.album(album_id)
+        if album is None:
+            return
+        auf_server = bool(album["immich_id"])
+        text = (f"Album \u201e{album['name']}\u201c l\u00f6schen?\n\n"
+                "Die Bilder bleiben unangetastet — es verschwindet nur die "
+                "Zusammenstellung.")
+        if auf_server:
+            text += ("\n\nDas Album gibt es auch auf dem Server. Soll es dort "
+                     "ebenfalls gelöscht werden?")
+            antwort = QMessageBox.question(
+                self, "Album löschen", text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if antwort == QMessageBox.StandardButton.Cancel:
+                return
+            if antwort == QMessageBox.StandardButton.Yes:
+                client = self._immich_verbunden()
+                if client is None:
+                    return
+                try:
+                    client.delete_album(album["immich_id"])
+                except ImmichError as exc:
+                    QMessageBox.critical(self, "Nicht gelöscht", str(exc))
+                    return
+            else:
+                QMessageBox.information(
+                    self, "Hinweis",
+                    "Das Album bleibt auf dem Server und taucht beim nächsten "
+                    "Abgleich wieder auf.")
+        else:
+            antwort = QMessageBox.question(
+                self, "Album löschen", text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if antwort != QMessageBox.StandardButton.Yes:
+                return
+
+        self.db.delete_album(album_id)
+        if self._selection and self._selection == ("album", album_id):
+            self.tree.setCurrentItem(self._all_item)
+        self._reload_immich_tree()
+        self._refresh_view()
+
+    def _album_zuordnen(self, rows: list[int], album_id: str) -> None:
+        """Ausgewählte Bilder in ein Album legen."""
+        pfade, kennungen = self._auswahl_schluessel(rows)
+        anzahl = self.db.album_add(album_id, pfade, kennungen)
+        album = self.db.album(album_id)
+        self._reload_immich_tree()
+        if self._selection and self._selection[0] == "album":
+            self._refresh_view()
+        self.statusBar().showMessage(
+            f"{anzahl} Bild(er) zu \u201e{album['name'] if album else ''}"
+            "\u201c hinzugef\u00fcgt", 6000)
+
+    def _album_entfernen(self, rows: list[int], album_id: str) -> None:
+        pfade, kennungen = self._auswahl_schluessel(rows)
+        anzahl = self.db.album_remove(album_id, pfade, kennungen)
+        self._reload_immich_tree()
+        self._refresh_view()
+        self.statusBar().showMessage(
+            f"{anzahl} Bild(er) aus dem Album genommen — auf dem Server beim "
+            "nächsten Abgleich", 6000)
+
+    def _auswahl_schluessel(self, rows: list[int]) -> tuple[list[str], list[str]]:
+        """Pfade lokaler Dateien und Kennungen reiner Serverbilder trennen."""
+        pfade, kennungen = [], []
+        for row in rows:
+            item = self.model.row_data(row) or {}
+            if item.get("_remote"):
+                if item.get("immich_id"):
+                    kennungen.append(item["immich_id"])
+            elif item.get("path"):
+                pfade.append(item["path"])
+        return pfade, kennungen
+
+    def _album_menu(self, menu: QMenu, rows: list[int]) -> None:
+        """Untermenü „Zu Album hinzufügen" und ggf. „Aus Album entfernen"."""
+        alben = self.db.albums()
+        unter = menu.addMenu("Zu Album hinzufügen")
+        unter.addAction("Neues Album …",
+                        lambda: self._album_neu(*self._auswahl_schluessel(rows)))
+        if alben:
+            unter.addSeparator()
+        for album in alben:
+            album_id = album["id"]
+            unter.addAction(album["name"],
+                            lambda _c=False, a=album_id:
+                            self._album_zuordnen(rows, a))
+        if self._selection and self._selection[0] == "album":
+            aktuell = self._selection[1]
+            menu.addAction(f"Aus diesem Album entfernen ({len(rows)})",
+                           lambda: self._album_entfernen(rows, aktuell))
 
     def _exclude_folder(self, folder: str) -> None:
         """Ordner samt Unterordnern übergehen.
@@ -826,6 +1001,7 @@ class MainWindow(QMainWindow):
             delegate.setze(name, an)
         if name == "packed":
             self.grid.setSpacing(2 if an else 6)
+            self.grid.setUniformItemSizes(not an)
         # Die Kachelgroesse aendert sich mit - Qt muss die Anordnung neu
         # rechnen, sonst bleiben die alten Kaesten stehen.
         self.grid.doItemsLayout()
@@ -982,13 +1158,15 @@ class MainWindow(QMainWindow):
                     order=self.sort_box.currentData(), **richtung, **common,
                 )
             elif kind == "album":
-                rows = self.db.photos_by_immich(
-                    "album_assets", "album_id", key,
-                    order=self.sort_box.currentData(), **richtung, **common,
+                # Eigene Zuordnung UND Serverspiegel - ein selbst
+                # angelegtes Album zeigt seine Bilder sofort, auch wenn
+                # noch nichts hochgeladen ist.
+                rows = self.db.photos_in_album(
+                    key, order=self.sort_box.currentData(),
+                    **richtung, **common,
                 )
                 rows = list(rows) + [
-                    _remote_zeile(r) for r in
-                    self.db.remote_by_link("album_assets", "album_id", key)]
+                    _remote_zeile(r) for r in self.db.remote_in_album(key)]
             else:
                 rows = self.db.photos_by_immich(
                     "person_assets", "person_id", key,
@@ -1007,7 +1185,10 @@ class MainWindow(QMainWindow):
         if self._selection and not query:
             gruppierung = self._gruppierung_fuer(self._selection[0], sortierung)
 
-        self.grid.setUniformItemSizes(gruppierung is None)
+        # Im dichten Raster ist jede Kachel anders BREIT (gleich hoch) -
+        # dann darf Qt nicht mit einer Einheitsgroesse rechnen.
+        self.grid.setUniformItemSizes(
+            gruppierung is None and not self.config["grid_packed"])
         if alle and not query:
             cursor = self.db.all_photos_cursor(
                 self.config.libraries, order=sortierung, **richtung, **common)
@@ -1348,12 +1529,16 @@ class MainWindow(QMainWindow):
             menu.addAction(f"{len(rows)} Original(e) herunterladen …",
                            lambda: self._download_remote(nur_server))
             menu.addSeparator()
+            self._album_menu(menu, rows)
+            menu.addSeparator()
             menu.addAction(f"{len(rows)} Aufnahme(n) auf dem Server löschen …",
                            lambda: self._serverbilder_loeschen(nur_server))
             menu.exec(self.grid.viewport().mapToGlobal(position))
             return
 
         menu = self._build_grid_menu(len(rows))
+        menu.addSeparator()
+        self._album_menu(menu, rows)
         menu.exec(self.grid.viewport().mapToGlobal(position))
 
     def _build_grid_menu(self, count: int) -> QMenu:
