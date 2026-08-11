@@ -805,6 +805,28 @@ class Database:
         ).fetchall()
         return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
 
+    def masse_pruefliste(self) -> list:
+        """Alle Aufnahmen mit Pfad und eingetragener Groesse.
+
+        Fuer den Reparaturlauf: er muss jeden Eintrag gegen die Datei
+        halten koennen, auch die, die nie angesehen wurden.
+        """
+        return self.conn.execute(
+            "SELECT path, is_raw, width, height FROM photos "
+            "WHERE path IS NOT NULL AND path <> '' ORDER BY path"
+        ).fetchall()
+
+    def masse_berichtigen(self, path: str, width: int, height: int) -> None:
+        """Nur Breite und Hoehe einer Aufnahme richtigstellen.
+
+        Getrennt von store_metadata(), weil hier NICHTS anderes
+        angefasst werden darf: Bewertung, Marke und Aufnahmedatum
+        bleiben, wie sie sind.
+        """
+        self.conn.execute(
+            "UPDATE photos SET width=?, height=? WHERE path=?",
+            (int(width), int(height), path))
+
     def photos_by_paths(self, paths: list[str], order: str = "taken_at",
                         desc: bool = False, stacked: bool = True,
                         prefer_raw: bool = True, min_rating: int = 0,

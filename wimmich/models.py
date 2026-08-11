@@ -123,6 +123,8 @@ class PhotoModel(QAbstractListModel):
     # die Kachelbreite im dichten Raster haengt daran, also muss die
     # Anordnung neu gerechnet werden.
     masse_bekannt = pyqtSignal(QModelIndex)
+    # Pfad, richtige Breite, richtige Hoehe - fuer den Eintrag im Index
+    masse_berichtigt = pyqtSignal(str, int, int)
 
     def __init__(self, exiftool=None, thumb_edge: int = 256, parent=None) -> None:
         super().__init__(parent)
@@ -425,25 +427,47 @@ class PhotoModel(QAbstractListModel):
         self._touch(row)
 
     def _masse_nachtragen(self, row: int, pixmap: QPixmap) -> None:
-        """Fehlende Bildmasse aus der Vorschau uebernehmen.
+        """Bildmasse aus der Vorschau nachtragen ODER richtigstellen.
 
-        Im dichten Raster bestimmt das Seitenverhaeltnis die Kachelbreite.
-        Steht es nicht im Index - RAW-Dateien gehen ueber exiftool, aeltere
-        Eintraege haben es womoeglich gar nicht -, waere JEDE Kachel
-        quadratisch, und ein Hochformat bekaeme wieder Luft links und
-        rechts. Die Vorschau kennt die Masse aber; sie werden hier
-        nachgetragen und die Anordnung neu angestossen.
+        Zwei Faelle, beide sichtbar als zu breite Kachel mit Balken:
+
+        1. Die Masse FEHLEN im Index - dann waere jede Kachel quadratisch.
+        2. Die Masse stehen QUER, obwohl das Bild hochkant ist. Das
+           betrifft Eintraege, die eine aeltere Fassung geschrieben hat:
+           die hat die Exif-Ausrichtung nicht beachtet. Ein einmal
+           gelesener Eintrag wird nie wieder gelesen (meta_read=1),
+           solange sich die Datei nicht aendert - deshalb blieb der
+           Fehler stehen und sah zufaellig verteilt aus.
+
+        Die Vorschau ist AUSGERICHTET, ihr Seitenverhaeltnis ist also die
+        Wahrheit. Widerspricht der Index ihr in der Ausrichtung, wird er
+        berichtigt - auch in der Datenbank, sonst zeigen die Metadaten
+        weiter die falsche Groesse.
         """
         if not (0 <= row < len(self._rows)):
-            return
-        item = self._rows[row]
-        if item.get("width") and item.get("height"):
             return
         if pixmap is None or pixmap.isNull():
             return
         if not pixmap.width() or not pixmap.height():
             return
-        item["width"], item["height"] = pixmap.width(), pixmap.height()
+
+        item = self._rows[row]
+        breite, hoehe = item.get("width"), item.get("height")
+        hochkant_vorschau = pixmap.height() > pixmap.width()
+
+        if breite and hoehe:
+            # Nur eingreifen, wenn die AUSRICHTUNG widerspricht. Kleine
+            # Abweichungen sind normal: die Vorschau ist skaliert, und
+            # ein Zuschnitt aendert das Verhaeltnis ohnehin.
+            if pixmap.width() == pixmap.height():
+                return
+            if (hoehe > breite) == hochkant_vorschau:
+                return
+            item["width"], item["height"] = hoehe, breite     # tauschen
+            self.masse_berichtigt.emit(str(item.get("path") or ""),
+                                       int(hoehe), int(breite))
+        else:
+            item["width"], item["height"] = pixmap.width(), pixmap.height()
         self.masse_bekannt.emit(self.index(row, 0))
 
     def kachel_bild(self, row: int):

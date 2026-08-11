@@ -49,6 +49,7 @@ from .edits import (
 )
 from .previews import decode as decode_image
 from .export import ExportDialog, ExportWorker
+from .masse import MasseWorker
 from .serverbilder import ServerbilderMixin, _VorschauSignale
 from .settings import SettingsDialog
 from .sync import SyncWorker
@@ -147,6 +148,8 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._remote_wartet = ""
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
+        self._masse_thread: QThread | None = None
+        self._masse_worker: MasseWorker | None = None
         self._scan_thread: QThread | None = None
         self._sync_thread: QThread | None = None
         self._sync_worker: SyncWorker | None = None
@@ -323,6 +326,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         )
         self.model.serverfehler.connect(self._zeige_serverfehler)
         self.model.masse_bekannt.connect(self._masse_bekannt)
+        self.model.masse_berichtigt.connect(self._masse_berichtigt)
         self.grid = QListView()
         self.grid.setModel(self.model)
         self.grid.setItemDelegate(
@@ -351,6 +355,12 @@ class MainWindow(ServerbilderMixin, QMainWindow):
 
         self._diashow_timer = QTimer(self)
         self._diashow_timer.timeout.connect(self._diashow_schritt)
+
+        self._masse_berichtigt_zahl = 0
+        self._masse_speichern = QTimer(self)
+        self._masse_speichern.setSingleShot(True)
+        self._masse_speichern.setInterval(1500)
+        self._masse_speichern.timeout.connect(self._masse_sichern)
         self.grid.verticalScrollBar().valueChanged.connect(
             lambda _v: self._jahr_verzoegerer.start())
 
@@ -626,6 +636,13 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.export_action.triggered.connect(self._export_auswahl)
         menu_datei.addAction(self.export_action)
         self.addAction(self.export_action)
+        menu_datei.addSeparator()
+        masse_action = QAction("Bildmaße prüfen und richtigstellen …", self)
+        masse_action.setToolTip(
+            "Prüft den ganzen Index gegen die Dateien und dreht falsch "
+            "herum eingetragene Maße um.")
+        masse_action.triggered.connect(self._masse_pruefen)
+        menu_datei.addAction(masse_action)
         menu_datei.addSeparator()
         menu_datei.addAction(settings_action)
         menu_datei.addSeparator()
@@ -2175,6 +2192,97 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         if isinstance(delegate, PhotoDelegate) and self.config["grid_packed"]:
             delegate.sizeHintChanged.emit(index)
 
+    def _masse_berichtigt(self, pfad: str, breite: int, hoehe: int) -> None:
+        """Falsche Bildmasse im Index richtigstellen.
+
+        Passiert waehrend des Blaetterns, sobald die Vorschau zeigt, dass
+        der Eintrag quer steht, obwohl das Bild hochkant ist. Ohne den
+        Eintrag in der Datenbank waere es beim naechsten Start wieder
+        falsch, und die Metadatenanzeige zeigte weiter Querformat.
+        """
+        if not pfad:
+            return
+        try:
+            self.db.masse_berichtigen(pfad, breite, hoehe)
+            self._masse_berichtigt_zahl = getattr(
+                self, "_masse_berichtigt_zahl", 0) + 1
+            self._masse_speichern.start()
+        except Exception:
+            crashlog.protokolliere("Bildmaße berichtigen")
+
+    def _masse_pruefen(self) -> None:
+        """Den ganzen Index gegen die Dateien halten.
+
+        Nötig, weil das Nachbessern beim Blättern nur heilt, was man
+        auch ansieht. Wer die falsche Größe in den Metadaten stört,
+        will nicht erst durch die halbe Bibliothek scrollen.
+        """
+        if self._masse_thread is not None:
+            self.statusBar().showMessage("Die Prüfung läuft bereits.", 4000)
+            return
+        zeilen = self.db.masse_pruefliste()
+        if not zeilen:
+            QMessageBox.information(self, "Bildmaße", "Der Index ist leer.")
+            return
+        antwort = QMessageBox.question(
+            self, "Bildmaße prüfen",
+            f"{len(zeilen)} Einträge gegen die Dateien halten?\n\n"
+            "Falsch herum eingetragene Maße werden umgedreht. An den "
+            "Dateien selbst ändert sich nichts, Bewertungen und Marken "
+            "bleiben unberührt.")
+        if antwort != QMessageBox.StandardButton.Yes:
+            return
+
+        self.sync_progress_bar.setRange(0, len(zeilen))
+        self.sync_progress_bar.setValue(0)
+        self.sync_progress_bar.setVisible(True)
+        self.sync_label.setText("Bildmaße werden geprüft …")
+        self.sync_label.setVisible(True)
+
+        self._masse_thread = QThread(self)
+        self._masse_worker = MasseWorker([tuple(z) for z in zeilen],
+                                         str(DB_PATH))
+        self._masse_worker.moveToThread(self._masse_thread)
+        self._masse_thread.started.connect(self._masse_worker.run)
+        self._masse_worker.fortschritt.connect(self._masse_fortschritt)
+        self._masse_worker.fertig.connect(self._masse_fertig)
+        self._masse_thread.start()
+
+    def _masse_fortschritt(self, fertig: int, gesamt: int) -> None:
+        self.sync_progress_bar.setValue(fertig)
+        self.sync_label.setText(f"Bildmaße: {fertig}/{gesamt} geprüft")
+
+    def _masse_fertig(self, berichtigt: int, uebersprungen: int,
+                      gesamt: int) -> None:
+        if self._masse_thread is not None:
+            self._masse_thread.quit()
+            self._masse_thread.wait(5000)
+        self._masse_thread = None
+        self._masse_worker = None
+        self.sync_progress_bar.setVisible(False)
+        self.sync_label.setText(
+            f"{berichtigt} von {gesamt} Bildmaßen richtiggestellt"
+            + (f", {uebersprungen} übersprungen" if uebersprungen else ""))
+        self.sync_label.setVisible(True)
+        if berichtigt:
+            self._refresh_view()
+
+    def _masse_sichern(self) -> None:
+        """Gesammelte Berichtigungen in einem Zug festschreiben.
+
+        Nicht nach jedem Bild: beim Blaettern durch einen Ordner mit
+        vielen falschen Eintraegen waere das ein Schreibvorgang je
+        Kachel.
+        """
+        anzahl = getattr(self, "_masse_berichtigt_zahl", 0)
+        if not anzahl:
+            return
+        self._masse_berichtigt_zahl = 0
+        self.db.commit()
+        self.statusBar().showMessage(
+            f"{anzahl} Bildgröße(n) richtiggestellt (Hochformat war quer "
+            "eingetragen)", 6000)
+
     def _relative_radius(self) -> float:
         """Pinselradius in Anteilen der kürzeren Kante des GANZEN Bildes."""
         size = self.canvas.image_size()
@@ -3192,6 +3300,12 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self._sync_worker.cancel()
         # Ein laufender Stapel-Export muss enden, bevor das Fenster
         # abgeraeumt wird - sonst meldet sich der Faden ins Leere.
+        if self._masse_worker is not None:
+            self._masse_worker.abbrechen()
+        if self._masse_thread is not None:
+            self._masse_thread.quit()
+            self._masse_thread.wait(5000)
+            self._masse_thread = None
         if self._export_worker is not None:
             self._export_worker.abbrechen()
         if self._export_thread is not None:
