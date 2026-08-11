@@ -433,8 +433,16 @@ class ImmichClient:
                 self.letzte_vorschauversuche.append(f"{pfad}: {exc}")
                 letzter = exc
                 continue
+            # Den ANTWORTTEXT mitschreiben, nicht nur Status und Groesse.
+            # Bei 403 standen dort 117 Bytes, die das fehlende Recht
+            # sofort benannt haetten - sie wurden bisher weggeworfen und
+            # haben sechs Fassungen Fehlersuche gekostet.
+            grund = ""
+            if status >= 400:
+                grund = _antworttext(payload)
             self.letzte_vorschauversuche.append(
-                f"{pfad}: HTTP {status}, {len(payload or b'')} B")
+                f"{pfad}: HTTP {status}, {len(payload or b'')} B"
+                + (f" – {grund}" if grund else ""))
             if status < 400 and _sieht_nach_bild_aus(payload):
                 return payload
             if status < 400 and payload:
@@ -448,6 +456,30 @@ class ImmichClient:
         if letzter is not None:
             self.letzter_vorschaufehler = str(letzter)
         return None
+
+    def delete_assets(self, asset_ids: list[str], endgueltig: bool = False) -> int:
+        """Bilder auf dem Server loeschen.
+
+        Vorgabe ist der PAPIERKORB von Immich (force=false): dort laesst
+        sich das Bild zurueckholen, hier gibt es kein Rueckgaengig. Nur
+        wenn der Server damit nichts anfangen kann (aeltere Fassungen
+        ohne Papierkorb, HTTP 400), wird endgueltig geloescht.
+
+        Rueckgabe: Anzahl der uebergebenen Kennungen bei Erfolg.
+        """
+        if not asset_ids:
+            return 0
+        koerper = {"ids": list(asset_ids), "force": bool(endgueltig)}
+        letzter: ImmichError | None = None
+        for pfad in ("/assets", "/asset"):
+            status, payload = self._request("DELETE", pfad, body=koerper)
+            if status < 400:
+                return len(asset_ids)
+            if status == 400 and not endgueltig:
+                # Server kennt den Papierkorb nicht -> endgueltig fragen
+                return self.delete_assets(asset_ids, endgueltig=True)
+            letzter = ImmichError(_error_text(status, payload), status)
+        raise letzter or ImmichError("Löschen fehlgeschlagen")
 
     def download_original(self, asset_id: str) -> bytes | None:
         """Originaldatei vom Server holen - nur auf ausdruecklichen Wunsch."""
@@ -561,6 +593,22 @@ def _sieht_nach_bild_aus(payload: bytes | None) -> bool:
             or payload[:6] in (b"GIF87a", b"GIF89a")
             or payload[:2] in (b"II", b"MM")                   # TIFF
             or (payload[:4] == b"RIFF" and payload[8:12] == b"WEBP"))
+
+
+def _antworttext(payload: bytes | None) -> str:
+    """Klartext aus einer Fehlerantwort - ohne die Statuszeile davor."""
+    if not payload:
+        return ""
+    try:
+        data = json.loads(payload)
+        if isinstance(data, dict):
+            wert = data.get("message") or data.get("error") or ""
+            if isinstance(wert, list):
+                wert = "; ".join(str(w) for w in wert)
+            return str(wert)[:200]
+    except (ValueError, TypeError):
+        pass
+    return payload[:200].decode("utf-8", errors="replace").strip()
 
 
 def _error_text(status: int, payload: bytes) -> str:

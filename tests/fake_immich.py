@@ -29,6 +29,10 @@ STATE = {
                {"id": "per-2", "name": "", "isHidden": False}],
     "requests": [],
     "api_key": "geheim",
+    # Bilddaten je Kennung: {"thumb": bytes, "original": bytes, "name": str}
+    "bilder": {},
+    "geloescht": [],     # Kennungen, die ueber DELETE weggeraeumt wurden
+    "papierkorb": True,  # False = Server kennt force=false nicht (HTTP 400)
 }
 
 
@@ -99,7 +103,49 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"people": STATE["people"], "total": 2,
                                     "hidden": 0, "hasNextPage": False})
 
+        # Vorschau und Original. Der Weg in Mehrzahl ist der heutige,
+        # der in Einzahl der alte - genau wie beim Rest.
+        if path.startswith("/api/assets/") or path.startswith("/api/asset/"):
+            teile = path.split("/")
+            if path.endswith("/thumbnail") and len(teile) == 5:
+                return self._bild(teile[3], "thumb")
+            if path.endswith("/original") and len(teile) == 5:
+                return self._bild(teile[3], "original")
+            if teile[2] == "asset" and teile[3] in ("thumbnail", "file"):
+                return self._bild(teile[4],
+                                  "thumb" if teile[3] == "thumbnail" else "original")
+
         return self._send(404, {"message": "Not found"})
+
+    def _bild(self, asset_id: str, art: str):
+        eintrag = STATE["bilder"].get(asset_id)
+        if not eintrag or asset_id in STATE["geloescht"]:
+            return self._send(404, {"message": "Not found"})
+        daten = eintrag.get(art) or b""
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(daten)))
+        self.end_headers()
+        self.wfile.write(daten)
+
+    def do_DELETE(self):
+        path = self._path()
+        STATE["requests"].append(("DELETE", path))
+        if not self._auth_ok():
+            return self._send(401, {"message": "Invalid API key"})
+        body = self._read_body()
+        plural = path == "/api/assets"
+        if path not in ("/api/assets", "/api/asset") or plural == self._legacy():
+            return self._send(404, {"message": "Not found"})
+        try:
+            data = json.loads(body or b"{}")
+        except ValueError:
+            return self._send(400, {"message": "kein JSON"})
+        if not data.get("force") and not STATE["papierkorb"]:
+            # Aeltere Fassungen ohne Papierkorb kennen force=false nicht
+            return self._send(400, {"message": "force must be true"})
+        STATE["geloescht"].extend(data.get("ids") or [])
+        return self._send(204)
 
     # -- POST/PUT ------------------------------------------------------
 

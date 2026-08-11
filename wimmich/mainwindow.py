@@ -20,7 +20,8 @@ from PyQt6.QtGui import (
     QPainterPath, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox,
+    QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QStackedWidget, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -28,9 +29,9 @@ from PyQt6.QtWidgets import (
 
 from . import (APP_NAME, LICENSE_SHORT, __version__, crashlog, marks,
                previews, retouch, theme, thumbs)
-from .config import Config, DB_PATH, ensure_dirs, find_exiftool
+from .config import Config, DB_PATH, ensure_dirs, find_exiftool, is_raw
 from .db import Database
-from .exif import ExifTool, ExifToolError
+from .exif import ExifTool, ExifToolError, read_fast
 from .immich import ImmichClient, ImmichError
 from .models import PhotoDelegate, PhotoModel, ROLE_ID, ROLE_PATH, ROLE_REMOTE
 from .previews import PreviewLoader
@@ -38,6 +39,7 @@ from .canvas import CanvasView, NONE as TOOL_NONE, PIPETTE
 from .edit_panel import EditPanel
 from .filterbar import FilterBar
 from .icon import app_icon
+from .jahresleiste import Jahresleiste
 from . import remote_thumbs
 from .edits import (
     CROP, EditStack, FADED, GEOMETRY, RED_EYE, SPOT, STROKE, Step, TONE,
@@ -53,6 +55,15 @@ ASPECT_PRESETS = {1: None, 2: 3 / 2, 3: 4 / 3, 4: 1.0, 5: 16 / 9, 6: 5 / 4}
 ASPECT_NAMES = {1: "frei", 2: "3:2", 3: "4:3", 4: "1:1", 5: "16:9", 6: "5:4"}
 
 PREVIEW_EDGE = 800      # Kantenlänge der Fassung, auf der beim Ziehen gerechnet wird
+
+# Kachel-Option im Delegate -> Schlüssel in der Konfiguration
+_KACHEL_KEYS = {
+    "packed": "grid_packed",
+    "filenames": "show_filenames",
+    "stars": "show_stars",
+    "labels": "show_labels",
+    "stack": "show_stack_badge",
+}
 
 SORT_OPTIONS = [
     ("Aufnahmedatum", "taken_at"),
@@ -181,6 +192,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_actions()
+        # Erst jetzt anmelden - vorher gibt es die Bauteile nicht, auf
+        # die _handle_key zugreift.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.panel.setVisible(False)
         self.loupe_header.setVisible(False)
         self.loader.ready.connect(self._image_arrived)
@@ -277,20 +293,42 @@ class MainWindow(QMainWindow):
         self.model.serverfehler.connect(self._zeige_serverfehler)
         self.grid = QListView()
         self.grid.setModel(self.model)
-        self.grid.setItemDelegate(PhotoDelegate(self.config["grid_size"]))
+        self.grid.setItemDelegate(
+            PhotoDelegate(self.config["grid_size"], self._kachel_optionen()))
         self.grid.setViewMode(QListView.ViewMode.IconMode)
         self.grid.setResizeMode(QListView.ResizeMode.Adjust)
         self.grid.setUniformItemSizes(True)
-        self.grid.setSpacing(6)
+        self.grid.setSpacing(2 if self.config["grid_packed"] else 6)
         self.grid.setMouseTracking(True)   # damit die Kachel beim Ueberfahren reagiert
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.grid.doubleClicked.connect(lambda idx: self._show_loupe(idx.row()))
         self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._grid_menu)
+
+        # Jahresleiste rechts neben dem Raster. Sie zeigt sich nur, wo
+        # sie etwas nuetzt: in „Alle Fotos" und „Nur auf dem Server",
+        # nach Aufnahmedatum sortiert.
+        self.jahresleiste = Jahresleiste(self)
+        self.jahresleiste.jahr_gewaehlt.connect(self._springe_zu_jahr)
+        self.jahresleiste.setVisible(False)
+        self._jahr_verzoegerer = QTimer(self)
+        self._jahr_verzoegerer.setSingleShot(True)
+        self._jahr_verzoegerer.setInterval(120)
+        self._jahr_verzoegerer.timeout.connect(self._jahr_der_ansicht)
+        self.grid.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._jahr_verzoegerer.start())
+
+        raster_seite = QWidget()
+        raster_layout = QHBoxLayout(raster_seite)
+        raster_layout.setContentsMargins(0, 0, 0, 0)
+        raster_layout.setSpacing(0)
+        raster_layout.addWidget(self.grid, 1)
+        raster_layout.addWidget(self.jahresleiste)
+
         # Rechts: Raster ODER Lupe, im selben Fenster
         self.pages = QStackedWidget()
-        self.pages.addWidget(self.grid)          # Seite 0
+        self.pages.addWidget(raster_seite)       # Seite 0
 
         loupe = QWidget()
         loupe_layout = QHBoxLayout(loupe)
@@ -346,10 +384,13 @@ class MainWindow(QMainWindow):
         # Kopfzeile der Lupe: zurück ins Raster, Dateiname + Verzeichnis,
         # rechts ein Schalter nur für die Bearbeitungsspalte (unabhängig
         # von Tab/F, die die ganze Oberfläche ausblenden).
+        # Bewusst flach gehalten: jede Zeile hier ist Platz, der dem Bild
+        # fehlt. Gemessen in 0.3.29 standen ueber der Bildflaeche 122 px
+        # Leisten - Menue, Filterleiste und diese Kopfzeile.
         self.loupe_header = QWidget()
         header_layout = QHBoxLayout(self.loupe_header)
-        header_layout.setContentsMargins(10, 6, 10, 6)
-        header_layout.setSpacing(10)
+        header_layout.setContentsMargins(8, 1, 8, 1)
+        header_layout.setSpacing(8)
 
         back_button = QPushButton("←  Raster")
         back_button.setToolTip("Zurück zur Rasteransicht (G)")
@@ -359,6 +400,24 @@ class MainWindow(QMainWindow):
         self.loupe_title = QLabel("")
         self.loupe_title.setTextFormat(Qt.TextFormat.RichText)
         header_layout.addWidget(self.loupe_title, 1)
+
+        # Nur bei Serverbildern sichtbar: dort ist die Bearbeitungsleiste
+        # gesperrt, weil es keine Datei gibt. Diese beiden Knoepfe sagen,
+        # was stattdessen geht.
+        self.remote_edit_button = QPushButton("Original holen und bearbeiten")
+        self.remote_edit_button.setToolTip(
+            "Holt die Datei vom Server in deine Bibliothek und öffnet sie\n"
+            "als normales, bearbeitbares Bild.")
+        self.remote_edit_button.clicked.connect(
+            lambda: self._serverbild_bearbeiten(self._loupe_row))
+        self.remote_edit_button.setVisible(False)
+        header_layout.addWidget(self.remote_edit_button)
+
+        self.remote_delete_button = QPushButton("Auf dem Server löschen")
+        self.remote_delete_button.clicked.connect(
+            lambda: self._serverbilder_loeschen([self._loupe_row]))
+        self.remote_delete_button.setVisible(False)
+        header_layout.addWidget(self.remote_delete_button)
 
         self.panel_toggle = QPushButton("Bearbeitungsspalte")
         self.panel_toggle.setCheckable(True)
@@ -370,7 +429,7 @@ class MainWindow(QMainWindow):
         loupe_column = QWidget()
         column_layout = QVBoxLayout(loupe_column)
         column_layout.setContentsMargins(0, 0, 0, 0)
-        column_layout.setSpacing(4)
+        column_layout.setSpacing(0)
         column_layout.addWidget(self.loupe_header)
         column_layout.addWidget(self.crop_bar)
         column_layout.addWidget(loupe, 1)
@@ -476,6 +535,41 @@ class MainWindow(QMainWindow):
         menu_ansicht.addAction(vollbild_action)
         menu_ansicht.addAction(leisten_action)
         menu_ansicht.addSeparator()
+
+        # Gruppierung in „Alle Fotos" und „Nur auf dem Server"
+        menu_gruppe = menu_ansicht.addMenu("Gruppieren nach")
+        self._gruppe_actions: dict[str, QAction] = {}
+        for schluessel, text in (("month", "Monat"), ("day", "Tag"),
+                                 ("none", "gar nicht")):
+            aktion = QAction(text, self)
+            aktion.setCheckable(True)
+            aktion.setChecked(str(self.config["group_by"]) == schluessel)
+            aktion.triggered.connect(
+                lambda _c=False, s=schluessel: self._set_gruppierung(s))
+            menu_gruppe.addAction(aktion)
+            self._gruppe_actions[schluessel] = aktion
+
+        # Was auf der Kachel steht - alles einzeln abschaltbar
+        menu_kachel = menu_ansicht.addMenu("Kacheln")
+        for name, text in (("packed", "Dicht an dicht"),
+                           ("filenames", "Dateinamen"),
+                           ("stars", "Bewertung"),
+                           ("labels", "Farbmarkierung"),
+                           ("stack", "RAW+JPG-Abzeichen")):
+            aktion = QAction(text, self)
+            aktion.setCheckable(True)
+            aktion.setChecked(bool(self.config[_KACHEL_KEYS[name]]))
+            aktion.toggled.connect(
+                lambda an, n=name: self._set_kachel_option(n, an))
+            menu_kachel.addAction(aktion)
+
+        self.jahr_action = QAction("Jahresleiste rechts", self)
+        self.jahr_action.setCheckable(True)
+        self.jahr_action.setChecked(bool(self.config["year_bar"]))
+        self.jahr_action.toggled.connect(self._set_jahresleiste)
+        menu_ansicht.addAction(self.jahr_action)
+
+        menu_ansicht.addSeparator()
         menu_ansicht.addAction(baum_auf)
         menu_ansicht.addAction(baum_zu)
 
@@ -495,6 +589,16 @@ class MainWindow(QMainWindow):
         # Keine Werkzeugleiste mehr: seit 0.3.24 steht alles im Menue,
         # und die drei verbliebenen Knoepfe haben nur Platz gekostet.
         # Die Tastenkuerzel (F5, F6, E/G) bleiben unveraendert.
+
+        # WICHTIG: im Vollbild wird die Menueleiste ausgeblendet - und
+        # eine versteckte Menueleiste schaltet ihre Tastenkuerzel ab.
+        # Nachgemessen: F5 loeste danach nicht mehr aus. Deshalb haengen
+        # die Aktionen zusaetzlich am Fenster selbst.
+        for aktion in (scan_action, immich_action, self.loupe_action,
+                       keys_action, settings_action, beenden_action,
+                       vollbild_action, leisten_action, diag_action,
+                       clear_action, fehler_action):
+            self.addAction(aktion)
 
     def _first_run_hint(self) -> None:
         QMessageBox.information(
@@ -708,6 +812,122 @@ class MainWindow(QMainWindow):
         self.recursive_button.setEnabled(data[0] == "folder")
         self._refresh_view()
 
+    # -- Kacheln, Gruppierung, Jahresleiste ----------------------------
+
+    def _kachel_optionen(self) -> dict:
+        return {name: bool(self.config[key])
+                for name, key in _KACHEL_KEYS.items()}
+
+    def _set_kachel_option(self, name: str, an: bool) -> None:
+        """Eine Beschriftung auf der Kachel ein- oder ausschalten."""
+        self.config[_KACHEL_KEYS[name]] = bool(an)
+        delegate = self.grid.itemDelegate()
+        if isinstance(delegate, PhotoDelegate):
+            delegate.setze(name, an)
+        if name == "packed":
+            self.grid.setSpacing(2 if an else 6)
+        # Die Kachelgroesse aendert sich mit - Qt muss die Anordnung neu
+        # rechnen, sonst bleiben die alten Kaesten stehen.
+        self.grid.doItemsLayout()
+        self.grid.viewport().update()
+
+    def _set_gruppierung(self, schluessel: str) -> None:
+        self.config["group_by"] = schluessel
+        for key, aktion in self._gruppe_actions.items():
+            aktion.setChecked(key == schluessel)
+        self._refresh_view()
+
+    def _set_jahresleiste(self, an: bool) -> None:
+        self.config["year_bar"] = bool(an)
+        self._jahresleiste_fuellen()
+
+    def _gruppierung_fuer(self, kind: str, sortierung: str) -> str | None:
+        """Wonach in dieser Ansicht Kopfzeilen gesetzt werden.
+
+        Nach Ordner gruppiert nur „Alle Fotos"; nach Datum beide
+        Datumsansichten, sobald auch danach sortiert wird.
+        """
+        wahl = str(self.config["group_by"] or "month")
+        if kind == "all" and sortierung == "folder":
+            return "folder"
+        if sortierung != "taken_at" or wahl == "none":
+            return None
+        if kind not in ("all", "remote"):
+            return None
+        return "day" if wahl == "day" else "date"
+
+    def _jahresleiste_fuellen(self) -> None:
+        """Jahre der aktuellen Ansicht in die Leiste rechts schreiben."""
+        if not bool(self.config["year_bar"]) or self._selection is None \
+                or self.search_box.text().strip():
+            self.jahresleiste.setze_jahre([])
+            self.jahresleiste.setVisible(False)
+            return
+        kind = self._selection[0]
+        if kind == "remote":
+            jahre = self.db.remote_jahre()
+        elif kind == "all":
+            jahre = self.db.jahre(
+                self.config.libraries,
+                min_rating=self._current_min_rating(),
+                stacked=self.stack_button.isChecked(),
+                show_rejects=self.filters.show_rejects(),
+                labels=self._current_labels(),
+                unlabeled=self.filters.include_unlabeled())
+        else:
+            jahre = []
+        if self.sort_desc_button.isChecked():
+            jahre = list(reversed(jahre))
+        self.jahresleiste.setze_jahre(jahre)
+        self._jahr_der_ansicht()
+
+    def _jahr_der_ansicht(self) -> None:
+        """Welches Jahr steht gerade oben? - hebt es in der Leiste hervor."""
+        if not self.jahresleiste.isVisible():
+            return
+        index = self.grid.indexAt(self.grid.viewport().rect().topLeft())
+        row = index.row() if index.isValid() else -1
+        for kandidat in (row, row + 1):
+            item = self.model.row_data(kandidat) or {}
+            taken = str(item.get("taken_at") or "")
+            if len(taken) >= 4 and "_header" not in item:
+                self.jahresleiste.setze_aktuell(taken[:4])
+                return
+
+    def _springe_zu_jahr(self, jahr: str) -> None:
+        """Zum ersten Bild dieses Jahres blättern.
+
+        Die Ansicht laedt stueckweise nach; das Ziel kann also noch gar
+        nicht geholt sein. Deshalb wird nachgeschoben, bis es auftaucht
+        oder nichts mehr kommt.
+        """
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            geprueft = 0
+            while True:
+                for row in range(geprueft, self.model.rowCount()):
+                    item = self.model.row_data(row) or {}
+                    if "_header" in item:
+                        continue
+                    if str(item.get("taken_at") or "")[:4] == jahr:
+                        self._go_to_jahr(row)
+                        return
+                geprueft = self.model.rowCount()
+                if not self.model.canFetchMore():
+                    break
+                self.model.fetchMore()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"{jahr}: nichts gefunden", 4000)
+
+    def _go_to_jahr(self, row: int) -> None:
+        # Die Kopfzeile ueber dem ersten Bild soll mit ins Bild kommen
+        ziel = row - 1 if row > 0 and self.model.is_header(row - 1) else row
+        index = self.model.index(ziel, 0)
+        self.grid.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtTop)
+        self.grid.setCurrentIndex(self.model.index(row, 0))
+        self.jahresleiste.setze_aktuell(jahr_von(self.model.row_data(row)))
+
     def _toggle_subfolders(self, checked: bool) -> None:
         self.config["show_subfolders"] = checked
         self._refresh_view()
@@ -784,9 +1004,8 @@ class MainWindow(QMainWindow):
         alle = bool(self._selection and self._selection[0] == "all")
         sortierung = self.sort_box.currentData()
         gruppierung = None
-        if alle and not query:
-            gruppierung = "folder" if sortierung == "folder" else (
-                "date" if sortierung == "taken_at" else None)
+        if self._selection and not query:
+            gruppierung = self._gruppierung_fuer(self._selection[0], sortierung)
 
         self.grid.setUniformItemSizes(gruppierung is None)
         if alle and not query:
@@ -798,10 +1017,11 @@ class MainWindow(QMainWindow):
                 stacked=common["stacked"], show_rejects=common["show_rejects"],
                 labels=common["labels"], unlabeled=common["unlabeled"])
         else:
-            self.model.set_rows(rows)
-            gezeigt = len(rows)
+            self.model.set_rows(rows, group_by=gruppierung)
+            gezeigt = len([r for r in rows if "_header" not in r])
 
         self.model.set_edited(self.db.edited_paths())
+        self._jahresleiste_fuellen()
         self._gesamt = gezeigt
         if self.in_loupe:
             # Die Liste hat sich unter der Lupe verändert - zurück ins Raster
@@ -896,6 +1116,212 @@ class MainWindow(QMainWindow):
                 self, "Nicht alles geholt",
                 "\n".join(fehler[:10]) + ("\n…" if len(fehler) > 10 else ""))
 
+    # -- Serverbilder: bearbeiten und löschen ---------------------------
+
+    def _immich_verbunden(self) -> ImmichClient | None:
+        """Verbundener Client oder None samt Meldung an den Benutzer."""
+        client = ImmichClient(self.config["immich_url"], self.config["immich_key"])
+        if not client.configured:
+            QMessageBox.information(self, "Immich",
+                                    "Immich ist nicht eingerichtet.")
+            return None
+        try:
+            client.connect()
+        except ImmichError as exc:
+            QMessageBox.critical(self, "Immich nicht erreichbar", str(exc))
+            return None
+        return client
+
+    def _zielordner(self) -> str | None:
+        """Wohin geholte Originale kommen - einmal wählen, dann gemerkt.
+
+        Liegt der Ordner in keiner Bibliothek, taucht das Bild nachher
+        nirgends auf. Deshalb wird angeboten, ihn aufzunehmen.
+        """
+        ziel = str(self.config["download_dir"] or "")
+        if not ziel or not Path(ziel).is_dir():
+            start = self.config.libraries[0] if self.config.libraries else ""
+            ziel = QFileDialog.getExistingDirectory(
+                self, "Wohin sollen geholte Originale?", start)
+            if not ziel:
+                return None
+            self.config["download_dir"] = ziel
+
+        if not any(str(Path(ziel)).startswith(str(Path(lib)))
+                   for lib in self.config.libraries):
+            antwort = QMessageBox.question(
+                self, "Ordner gehört nicht zur Bibliothek",
+                f"{ziel}\n\nDieser Ordner ist keine Bibliothek von Wimmich. "
+                "Ohne ihn erscheint das geholte Bild in keiner Ansicht.\n\n"
+                "Ordner jetzt aufnehmen?")
+            if antwort == QMessageBox.StandardButton.Yes:
+                self.config.add_library(ziel)
+                self._reload_folder_tree()
+                self._apply_watch_settings()
+        return ziel
+
+    def _original_holen(self, item: dict, client: ImmichClient) -> Path | None:
+        """Ein Original vom Server holen, ablegen und einlesen."""
+        ziel = self._zielordner()
+        if not ziel:
+            return None
+        try:
+            daten = client.download_original(item["immich_id"])
+        except ImmichError as exc:
+            QMessageBox.critical(self, "Nicht geholt", str(exc))
+            return None
+        if not daten:
+            QMessageBox.warning(self, "Nicht geholt",
+                                f"{item['filename']}: nichts erhalten")
+            return None
+
+        pfad = _freier_name(Path(ziel) / item["filename"])
+        try:
+            pfad.write_bytes(daten)
+        except OSError as exc:
+            QMessageBox.critical(self, "Nicht gespeichert", str(exc))
+            return None
+        self._indiziere(pfad, item["immich_id"])
+        return pfad
+
+    def _indiziere(self, pfad: Path, immich_id: str) -> None:
+        """Frisch geholte Datei sofort in den Index aufnehmen.
+
+        Ohne das müsste erst F5 laufen, bevor das Bild sichtbar wird.
+        Die Immich-Kennung wird gleich mit eingetragen - dadurch fällt
+        das Bild aus „Nur auf dem Server" heraus (dort steht nur, wozu
+        es KEINE lokale Datei gibt) und wird beim nächsten Abgleich
+        nicht erneut hochgeladen.
+        """
+        st = pfad.stat()
+        photo_id, _neu = self.db.upsert_file(
+            str(pfad), str(pfad.parent), pfad.name, pfad.suffix.lower(),
+            is_raw(pfad), st.st_size, st.st_mtime)
+
+        meta: dict = {}
+        if not is_raw(pfad):
+            try:
+                meta = read_fast([str(pfad)]).get(str(pfad), {})
+            except Exception:
+                meta = {}
+        if not meta and self.exiftool.available:
+            try:
+                meta = self.exiftool.read_batch([str(pfad)]).get(str(pfad), {})
+            except Exception:
+                meta = {}
+        self.db.store_metadata(photo_id, meta or {})
+        self.db.set_immich(photo_id, immich_id)
+        self.db.commit()
+
+    def _zeile_mit_pfad(self, pfad: str) -> int:
+        """Zeilennummer einer Datei in der aktuellen Ansicht, sonst -1."""
+        geprueft = 0
+        while True:
+            for row in range(geprueft, self.model.rowCount()):
+                item = self.model.row_data(row) or {}
+                if item.get("path") == pfad:
+                    return row
+            geprueft = self.model.rowCount()
+            if not self.model.canFetchMore():
+                return -1
+            self.model.fetchMore()
+
+    def _zeige_ordner(self, ordner: Path) -> None:
+        """Im Baum den Knoten dieses Ordners auswählen.
+
+        Gibt es ihn nicht (Ordner gehört zu keiner Bibliothek oder ist
+        noch nicht aufgeklappt), fällt es auf „Alle Fotos" zurück - dort
+        steht die Datei auf jeden Fall, sobald sie im Index ist.
+        """
+        gesucht = str(ordner)
+        stapel = [self.tree.topLevelItem(i)
+                  for i in range(self.tree.topLevelItemCount())]
+        while stapel:
+            item = stapel.pop()
+            if item is None:
+                continue
+            daten = item.data(0, Qt.ItemDataRole.UserRole)
+            if daten and daten[0] == "folder" and str(daten[1]) == gesucht:
+                self.tree.setCurrentItem(item)   # loest _folder_selected aus
+                return
+            stapel.extend(item.child(i) for i in range(item.childCount()))
+        self.tree.setCurrentItem(self._all_item)
+
+    def _serverbild_bearbeiten(self, row: int) -> None:
+        """Serverbild bearbeitbar machen: Original holen, dann lokal öffnen.
+
+        Bearbeitet wird bei Wimmich immer eine DATEI - die Schrittfolge
+        hängt am Pfad, und die Ausgabe rechnet in voller Auflösung neu.
+        Ein Bild, das nur auf dem Server liegt, hat beides nicht. Statt
+        die Vorschau zu verbiegen, wird deshalb das Original geholt,
+        eingelesen und ganz normal als lokales Bild geöffnet.
+        """
+        item = self.model.row_data(row) or {}
+        if not item.get("_remote"):
+            return
+        client = self._immich_verbunden()
+        if client is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage(f"Hole Original: {item['filename']} …")
+        try:
+            pfad = self._original_holen(item, client)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if pfad is None:
+            return
+
+        self._refresh_view()
+        ziel = self._zeile_mit_pfad(str(pfad))
+        if ziel < 0:
+            # Wir stehen noch in „Nur auf dem Server" - dort taucht die
+            # frisch geholte Datei naturgemaess nicht auf. Also in den
+            # Ordner wechseln, in dem sie jetzt liegt.
+            self._zeige_ordner(pfad.parent)
+            ziel = self._zeile_mit_pfad(str(pfad))
+        self.statusBar().showMessage(
+            f"{pfad.name} liegt jetzt in {pfad.parent} und ist bearbeitbar", 8000)
+        if ziel >= 0:
+            self._show_loupe(ziel)
+
+    def _serverbilder_loeschen(self, rows: list[int]) -> None:
+        """Bilder auf dem Immich-Server löschen - nach Rückfrage.
+
+        Lokale Dateien rührt Wimmich weiterhin nicht an; hier geht es
+        ausschließlich um Aufnahmen, die es NUR auf dem Server gibt.
+        """
+        eintraege = [self.model.row_data(r) or {} for r in rows]
+        ids = [e["immich_id"] for e in eintraege if e.get("_remote")]
+        if not ids:
+            return
+        namen = ", ".join(e["filename"] for e in eintraege[:5] if e.get("_remote"))
+        antwort = QMessageBox.question(
+            self, "Auf dem Server löschen",
+            f"{len(ids)} Aufnahme(n) auf dem Immich-Server löschen?\n\n"
+            f"{namen}{' …' if len(ids) > 5 else ''}\n\n"
+            "Sie landen im Papierkorb von Immich und lassen sich dort "
+            "zurückholen. Lokale Dateien sind nicht betroffen.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if antwort != QMessageBox.StandardButton.Yes:
+            return
+
+        client = self._immich_verbunden()
+        if client is None:
+            return
+        try:
+            client.delete_assets(ids)
+        except ImmichError as exc:
+            QMessageBox.critical(self, "Nicht gelöscht", str(exc))
+            return
+        self.db.forget_remote(ids)
+        if self.in_loupe:
+            self._show_grid()
+        self._refresh_view()
+        self.statusBar().showMessage(
+            f"{len(ids)} Aufnahme(n) auf dem Server gelöscht "
+            "(Papierkorb von Immich)", 8000)
+
     def _grid_menu(self, position) -> None:
         """Rechtsklick auf eine Kachel.
 
@@ -915,8 +1341,15 @@ class MainWindow(QMainWindow):
             # Reine Serverbilder: Bewerten und Bearbeiten geht nicht,
             # dafuer gibt es hier das Herunterladen.
             menu = QMenu(self)
+            if len(nur_server) == 1:
+                menu.addAction(
+                    "Original holen und bearbeiten …",
+                    lambda: self._serverbild_bearbeiten(nur_server[0]))
             menu.addAction(f"{len(rows)} Original(e) herunterladen …",
                            lambda: self._download_remote(nur_server))
+            menu.addSeparator()
+            menu.addAction(f"{len(rows)} Aufnahme(n) auf dem Server löschen …",
+                           lambda: self._serverbilder_loeschen(nur_server))
             menu.exec(self.grid.viewport().mapToGlobal(position))
             return
 
@@ -1073,6 +1506,7 @@ class MainWindow(QMainWindow):
         self.panel.setVisible(False)
         self.loupe_header.setVisible(False)
         self.crop_bar.setVisible(False)
+        self.filter_bar.setVisible(self._chrome_visible)
         self.grid.setFocus()
         if 0 <= self._loupe_row < self.model.rowCount():
             index = self.model.index(self._loupe_row, 0)
@@ -1086,6 +1520,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(1)
         self.panel.setVisible(self._chrome_visible and not self._panel_hidden)
         self.loupe_header.setVisible(self._chrome_visible)
+        self.filter_bar.setVisible(False)
         self._load_loupe(row)
         self.canvas.setFocus()
 
@@ -1108,6 +1543,8 @@ class MainWindow(QMainWindow):
         self._show_before = False
         self._stroke = []
         self.panel.setEnabled(False)
+        self.remote_edit_button.setVisible(True)
+        self.remote_delete_button.setVisible(True)
         # Reste des vorigen Bildes wegräumen. Sonst zeigen Zuschnitt,
         # Vorher/Nachher und die Regler noch auf dessen Daten - genau
         # daran sind Aktionen wie „Zuschnitt aufheben" abgestürzt.
@@ -1153,6 +1590,8 @@ class MainWindow(QMainWindow):
         self._loupe_row = row
         self._loupe_path = item.get("thumb_path") or item["path"]
         self.panel.setEnabled(True)      # nach einem Serverbild wieder frei
+        self.remote_edit_button.setVisible(False)
+        self.remote_delete_button.setVisible(False)
         self._want_full = False
         self._show_before = False
         self._stroke = []
@@ -1337,10 +1776,17 @@ class MainWindow(QMainWindow):
         """Leisten, Baum und Panel ein- oder ausblenden.
 
         Im Vollbild und mit Tab bleibt nur das Bild stehen - alles, was
-        nicht das Foto ist, verschwindet.
+        nicht das Foto ist, verschwindet. Dazu gehoert seit 0.3.30 auch
+        die MENUELEISTE: sie blieb bisher stehen und hat im Vollbild
+        24 px ueber dem Bild belegt. Die Tastenkuerzel ueberleben das,
+        weil die Aktionen zusaetzlich am Fenster haengen (_build_actions).
+
+        Die Filterleiste gehoert zum Raster; in der Lupe sucht und
+        sortiert niemand, sie waere dort nur Rand ueber dem Bild.
         """
         self._chrome_visible = visible
-        self.filter_bar.setVisible(visible)
+        self.menuBar().setVisible(visible)
+        self.filter_bar.setVisible(visible and not self.in_loupe)
         self.tree.setVisible(visible)
         self.statusBar().setVisible(visible)
         self.loupe_header.setVisible(visible and self.in_loupe)
@@ -1707,11 +2153,37 @@ class MainWindow(QMainWindow):
     # -- Tasten --------------------------------------------------------
 
     def eventFilter(self, obj, event):  # noqa: N802
-        """Tasten aus Raster, Lupe und Baum zentral behandeln."""
-        if event.type() == QEvent.Type.KeyPress:
+        """Tasten aus Raster, Lupe und Baum zentral behandeln.
+
+        Bis 0.3.29 stand diese Methode zwar da, war aber NIRGENDS
+        angemeldet - installEventFilter fehlte. Folge (nachgemessen):
+        die Pfeiltasten kamen nie im Fenster an. In der Lupe hat der
+        QGraphicsView sie zum Scrollen verbraucht, im Raster hat die
+        Liste sie fuer ihre eigene Auswahl genommen und aus Ziffern eine
+        Namenssuche gemacht - „3" setzte also keine Bewertung.
+        """
+        if event.type() == QEvent.Type.KeyPress and self._tasten_hier(obj):
             if self._handle_key(event):
                 return True
         return super().eventFilter(obj, event)
+
+    def _tasten_hier(self, obj) -> bool:
+        """Darf das Fenster diese Taste an sich ziehen?
+
+        Nein, solange ein eigenes Fenster (Einstellungen, Meldung) offen
+        ist oder in einem Eingabefeld getippt wird - sonst liesse sich
+        kein Suchwort und kein Serverpfad mehr eintippen.
+        """
+        if QApplication.activeModalWidget() is not None:
+            return False
+        if isinstance(obj, QWidget) and obj.window() is not self:
+            return False
+        fokus = QApplication.focusWidget()
+        if isinstance(fokus, (QLineEdit, QComboBox, QAbstractSpinBox)):
+            return False
+        if isinstance(fokus, QWidget) and fokus.window() is not self:
+            return False
+        return True
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if not self._handle_key(event):
@@ -2054,7 +2526,8 @@ class MainWindow(QMainWindow):
             entfernt += self.db.delete_under(folder)
 
         if old_grid != values["grid_size"]:
-            self.grid.setItemDelegate(PhotoDelegate(values["grid_size"]))
+            self.grid.setItemDelegate(
+                PhotoDelegate(values["grid_size"], self._kachel_optionen()))
 
         if old_theme != values["theme"]:
             self._apply_theme(values["theme"])
@@ -2482,6 +2955,12 @@ class MainWindow(QMainWindow):
             self._sync_worker.cancel()
         self._teardown_scan()
         self._teardown_sync()
+        # Laufende Kachelaufgaben abwarten: sie melden sich ueber
+        # Signale zurueck: kommt die Meldung, nachdem das Fenster schon
+        # abgeraeumt ist, wirft Qt „wrapped C/C++ object has been
+        # deleted". Beim Beenden im Testlauf nachgestellt.
+        from PyQt6.QtCore import QThreadPool
+        QThreadPool.globalInstance().waitForDone(3000)
         self.exiftool.stop()
         self.db.close()
         super().closeEvent(event)
@@ -2513,6 +2992,11 @@ def _freier_name(pfad: Path) -> Path:
         if not kandidat.exists():
             return kandidat
         nummer += 1
+
+
+def jahr_von(item: dict | None) -> str:
+    """Jahr einer Modellzeile, leer wenn ohne Aufnahmedatum."""
+    return str((item or {}).get("taken_at") or "")[:4]
 
 
 def _remote_zeile(row) -> dict:
@@ -2630,6 +3114,7 @@ KEY_HELP = """<b>Belegung wie in Cammello</b><table cellpadding="3">
 <tr><td>G</td><td>Raster ein/aus</td></tr>
 <tr><td>Z</td><td>Zoom umschalten</td></tr>
 <tr><td>Strg + / −</td><td>Zoom stufenweise</td></tr>
+<tr><td>Mausrad</td><td>stufenlos zoomen (Einpassen bzw. 50 % bis 200 %)</td></tr>
 <tr><td>+ / −</td><td>Belichtung</td></tr>
 <tr><td>W</td><td>Pipette (Weißabgleich)</td></tr>
 <tr><td>R</td><td>90° drehen (Umschalt+R andersherum)</td></tr>

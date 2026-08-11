@@ -665,6 +665,58 @@ class Database:
                 ORDER BY {spalte} {richtung}{grenze}"""
         ).fetchall()
 
+    def jahre(self, roots: list[str], min_rating: int = 0,
+              stacked: bool = True, show_rejects: bool = True,
+              labels: list[str] | None = None,
+              unlabeled: bool = False) -> list[tuple[str, int]]:
+        """(Jahr, Anzahl) fuer die Jahresleiste - aufsteigend.
+
+        Laeuft ueber denselben Filtersatz wie die Ansicht, sonst zeigt
+        die Leiste Jahre an, in denen gerade gar nichts steht.
+        """
+        if not roots:
+            return []
+        where, params = _roots_where(roots)
+        where, params = _add_filters(where, params, min_rating,
+                                     show_rejects, labels, unlabeled)
+        spalte = "DISTINCT p.stack_key" if stacked else "*"
+        rows = self.conn.execute(
+            f"""SELECT substr(p.taken_at, 1, 4) AS jahr, COUNT({spalte})
+                FROM photos p
+                WHERE {where} AND p.taken_at IS NOT NULL AND p.taken_at <> ''
+                GROUP BY jahr ORDER BY jahr""",
+            params,
+        ).fetchall()
+        return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
+
+    def remote_jahre(self) -> list[tuple[str, int]]:
+        """Dasselbe fuer die Bilder, die nur auf dem Server liegen."""
+        rows = self.conn.execute(
+            """SELECT substr(r.taken_at, 1, 4) AS jahr, COUNT(*)
+               FROM remote_assets r
+               WHERE r.taken_at IS NOT NULL AND r.taken_at <> ''
+                 AND NOT EXISTS (SELECT 1 FROM photos p
+                                 WHERE p.immich_id = r.immich_id
+                                   AND p.immich_id <> '')
+               GROUP BY jahr ORDER BY jahr"""
+        ).fetchall()
+        return [(str(r[0]), int(r[1] or 0)) for r in rows if r[0]]
+
+    def forget_remote(self, immich_ids: list[str]) -> int:
+        """Eintraege aus dem Serverspiegel entfernen.
+
+        Wird gebraucht, nachdem Bilder auf dem Server geloescht wurden -
+        sonst stuenden sie bis zum naechsten Abgleich noch im Baum.
+        """
+        if not immich_ids:
+            return 0
+        platzhalter = ",".join("?" for _ in immich_ids)
+        cur = self.conn.execute(
+            f"DELETE FROM remote_assets WHERE immich_id IN ({platzhalter})",
+            list(immich_ids))
+        self.conn.commit()
+        return cur.rowcount or 0
+
     def remote_count(self) -> int:
         row = self.conn.execute(
             """SELECT COUNT(*) FROM remote_assets r

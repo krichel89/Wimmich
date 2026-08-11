@@ -33,6 +33,25 @@ MONATE = {
     "09": "September", "10": "Oktober", "11": "November", "12": "Dezember",
 }
 
+WOCHENTAGE = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag",
+              "Samstag", "Sonntag")
+
+
+def tagestitel(taken: str) -> str:
+    """„Donnerstag, 13. August 2026" aus „2026-08-13 …".
+
+    Bewusst ohne locale: die Namen sind hier fest deutsch, sonst haengt
+    die Ueberschrift von den Spracheinstellungen des Rechners ab.
+    """
+    jahr, monat, tag = taken[:4], taken[5:7], taken[8:10]
+    name = ""
+    try:
+        from datetime import date
+        name = WOCHENTAGE[date(int(jahr), int(monat), int(tag)).weekday()] + ", "
+    except (ValueError, IndexError):
+        name = ""
+    return f"{name}{int(tag)}. {MONATE.get(monat, monat)} {jahr}"
+
 
 class _ThumbSignals(QObject):
     done = pyqtSignal(int, str)   # Zeilennummer, Cache-Pfad
@@ -205,6 +224,11 @@ class PhotoModel(QAbstractListModel):
             if len(taken) >= 7:
                 return f"{MONATE.get(taken[5:7], taken[5:7])} {taken[:4]}", ""
             return "ohne Aufnahmedatum", ""
+        if self._group_by == "day":
+            taken = item.get("taken_at") or ""
+            if len(taken) >= 10:
+                return tagestitel(taken), ""
+            return "ohne Aufnahmedatum", ""
         return "", ""
 
     def photo_rows(self) -> list[int]:
@@ -374,11 +398,38 @@ class PhotoModel(QAbstractListModel):
 class PhotoDelegate(QStyledItemDelegate):
     """Zeichnet Kachel, Dateiname, Sterne und Stapelabzeichen."""
 
-    def __init__(self, tile: int = 180, parent=None) -> None:
+    # Was auf der Kachel steht - alles einzeln abschaltbar (Menue Ansicht).
+    VORGABEN = {
+        "packed": True,      # dicht an dicht, ohne Beschriftungsband
+        "filenames": False,  # Dateiname unter der Kachel
+        "stars": True,       # Sterne (im dichten Raster auf dem Bild)
+        "labels": True,      # Farbmarkierung
+        "stack": True,       # RAW+JPG-Abzeichen
+    }
+
+    def __init__(self, tile: int = 180, optionen: dict | None = None,
+                 parent=None) -> None:
         super().__init__(parent)
         self.tile = tile
-        self.label_height = 46
-        self.pad = 8
+        self.optionen = dict(self.VORGABEN)
+        if optionen:
+            self.optionen.update(optionen)
+        self._masse()
+
+    def _masse(self) -> None:
+        """Raender und Beschriftungsband aus den Optionen ableiten."""
+        packed = self.optionen["packed"]
+        self.pad = 2 if packed else 8
+        band = 0
+        if self.optionen["filenames"]:
+            band += 20 if packed else 24
+        if not packed and self.optionen["stars"]:
+            band += 18          # klassisch: Sterne unter dem Bild
+        self.label_height = band
+
+    def setze(self, name: str, wert: bool) -> None:
+        self.optionen[name] = bool(wert)
+        self._masse()
 
     def sizeHint(self, option, index) -> QSize:  # noqa: N802
         if index is not None and index.isValid() and index.data(ROLE_HEADER):
@@ -405,10 +456,12 @@ class PhotoDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         rect = option.rect
+        packed = self.optionen["packed"]
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
-        card = QRectF(rect.adjusted(3, 3, -3, -3))
+        rand = 1 if packed else 3
+        card = QRectF(rect.adjusted(rand, rand, -rand, -rand))
         if selected or hovered:
             path = QPainterPath()
             path.addRoundedRect(card, theme.RADIUS + 2, theme.RADIUS + 2)
@@ -416,43 +469,55 @@ class PhotoDelegate(QStyledItemDelegate):
                 path, QBrush(QColor(theme.ACCENT_DIM if selected else theme.HOVER))
             )
 
-        image_rect = QRectF(card.x() + 5, card.y() + 5, self.tile, self.tile)
+        innen = 1 if packed else 5
+        image_rect = QRectF(card.x() + innen, card.y() + innen, self.tile, self.tile)
         rejected = marks.is_reject(int(index.data(ROLE_RATING) or 0))
         if rejected:
             painter.setOpacity(0.38)
         self._draw_image(painter, image_rect, index)
         painter.setOpacity(1.0)
 
+        if not self.label_height:
+            painter.restore()
+            return
+
         painter.setPen(QPen(QColor("#ffffff" if selected else theme.TEXT_MUTED)))
         font = QFont(option.font)
         font.setPointSizeF(max(9.0, font.pointSizeF() - 1.8))
         painter.setFont(font)
 
-        name_rect = QRect(int(card.x()) + 4, int(image_rect.bottom()) + 5,
-                          int(card.width()) - 8, 18)
-        elided = painter.fontMetrics().elidedText(
-            str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
-            Qt.TextElideMode.ElideMiddle, name_rect.width(),
-        )
-        painter.drawText(name_rect, int(Qt.AlignmentFlag.AlignHCenter), elided)
+        unten = int(image_rect.bottom()) + (2 if packed else 5)
+        if self.optionen["filenames"]:
+            name_rect = QRect(int(card.x()) + 4, unten,
+                              int(card.width()) - 8, 18)
+            elided = painter.fontMetrics().elidedText(
+                str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+                Qt.TextElideMode.ElideMiddle, name_rect.width(),
+            )
+            painter.drawText(name_rect, int(Qt.AlignmentFlag.AlignHCenter), elided)
+            unten = name_rect.bottom() + 1
 
-        rating = int(index.data(ROLE_RATING) or 0)
-        mark_rect = QRect(name_rect.x(), name_rect.bottom() + 1,
-                          name_rect.width(), 17)
-        if marks.is_reject(rating):
-            painter.setPen(QPen(QColor("#ff6b6b")))
-            painter.drawText(
-                mark_rect,
-                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                "\u2715",
-            )
-        elif rating > 0:
-            painter.setPen(QPen(QColor(theme.STAR)))
-            painter.drawText(
-                mark_rect,
-                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                "\u2605" * rating,
-            )
+        # Klassische Ansicht: Sterne unter dem Bild. Im dichten Raster
+        # sitzen sie auf dem Bild (siehe _draw_stars).
+        if not packed and self.optionen["stars"]:
+            rating = int(index.data(ROLE_RATING) or 0)
+            mark_rect = QRect(int(card.x()) + 4, unten, int(card.width()) - 8, 17)
+            if marks.is_reject(rating):
+                painter.setPen(QPen(QColor("#ff6b6b")))
+                painter.drawText(
+                    mark_rect,
+                    int(Qt.AlignmentFlag.AlignHCenter
+                        | Qt.AlignmentFlag.AlignVCenter),
+                    "\u2715",
+                )
+            elif rating > 0:
+                painter.setPen(QPen(QColor(theme.STAR)))
+                painter.drawText(
+                    mark_rect,
+                    int(Qt.AlignmentFlag.AlignHCenter
+                        | Qt.AlignmentFlag.AlignVCenter),
+                    "\u2605" * rating,
+                )
         painter.restore()
 
     def _paint_header(self, painter: QPainter, option, index) -> None:
@@ -517,7 +582,7 @@ class PhotoDelegate(QStyledItemDelegate):
         painter.restore()
 
         badge = index.data(ROLE_STACK)
-        if badge:
+        if badge and self.optionen["stack"]:
             self._draw_badge(painter, target, badge)
 
         if index.data(ROLE_REMOTE):
@@ -526,8 +591,11 @@ class PhotoDelegate(QStyledItemDelegate):
             self._draw_remote(painter, target)
 
         colour = index.data(ROLE_LABEL)
-        if colour:
+        if colour and self.optionen["labels"]:
             self._draw_dot(painter, target, colour)
+
+        if self.optionen["packed"] and self.optionen["stars"]:
+            self._draw_stars(painter, target, int(index.data(ROLE_RATING) or 0))
 
         if index.data(ROLE_EDITED):
             self._draw_edited(painter, target)
@@ -554,46 +622,77 @@ class PhotoDelegate(QStyledItemDelegate):
         painter.restore()
 
     def _draw_badge(self, painter: QPainter, image_rect: QRectF, text: str) -> None:
+        """RAW+JPG oben rechts - klein und zurueckhaltend.
+
+        Das Abzeichen soll die Aufnahme nicht zudecken: kleine Schrift,
+        halbdurchsichtiger Grund, gedaempftes Weiss.
+        """
         painter.save()
         font = QFont(painter.font())
-        font.setPointSizeF(9.0)
-        font.setBold(True)
+        font.setPointSizeF(7.5)
+        font.setBold(False)
         painter.setFont(font)
 
-        width = painter.fontMetrics().horizontalAdvance(text) + 12
-        badge = QRectF(image_rect.right() - width - 5, image_rect.top() + 5,
-                       width, 16)
+        width = painter.fontMetrics().horizontalAdvance(text) + 8
+        badge = QRectF(image_rect.right() - width - 4, image_rect.top() + 4,
+                       width, 13)
         path = QPainterPath()
-        path.addRoundedRect(badge, 5, 5)
-        painter.fillPath(path, QBrush(QColor(0, 0, 0, 170)))
-        painter.setPen(QPen(QColor("#ffffff")))
+        path.addRoundedRect(badge, 3, 3)
+        painter.fillPath(path, QBrush(QColor(0, 0, 0, 110)))
+        painter.setPen(QPen(QColor(255, 255, 255, 190)))
         painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), text)
         painter.restore()
 
+    def _draw_stars(self, painter: QPainter, image_rect: QRectF,
+                    rating: int) -> None:
+        """Bewertung unten links AUF dem Bild.
+
+        Im dichten Raster gibt es kein Band unter der Kachel mehr. Damit
+        die Sterne trotzdem auf hellen Aufnahmen lesbar bleiben, sitzen
+        sie auf einem dunklen, halbdurchsichtigen Streifen.
+        """
+        if not rating:
+            return
+        text = "\u2715" if marks.is_reject(rating) else "\u2605" * rating
+        painter.save()
+        font = QFont(painter.font())
+        font.setPointSizeF(8.0)
+        painter.setFont(font)
+        breite = painter.fontMetrics().horizontalAdvance(text) + 8
+        feld = QRectF(image_rect.left() + 4, image_rect.bottom() - 17,
+                      breite, 13)
+        path = QPainterPath()
+        path.addRoundedRect(feld, 3, 3)
+        painter.fillPath(path, QBrush(QColor(0, 0, 0, 110)))
+        painter.setPen(QPen(QColor("#ff6b6b") if marks.is_reject(rating)
+                            else QColor(theme.STAR)))
+        painter.drawText(feld, int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.restore()
 
     def _draw_dot(self, painter: QPainter, image_rect: QRectF, colour: str) -> None:
-        """Farbmarkierung oben links.
+        """Farbmarkierung unten rechts.
 
-        Deutlich größer als ein Punkt: bei einem Raster voller Bilder
-        muss die Farbe im Vorbeischauen erkennbar sein, nicht erst beim
-        Hinsehen. Heller Ring darum, damit sie auch auf farbigem Grund
-        steht.
+        Kleiner als frueher (22 px waren im dichten Raster eine Plakette
+        auf jedem zweiten Bild) und unten rechts, damit sie sich nicht
+        mit dem Wolkenzeichen oben links stapelt. Heller Ring bleibt,
+        sonst verschwindet Blau auf blauem Grund.
         """
         painter.save()
-        size = 22.0
-        dot = QRectF(image_rect.left() + 7, image_rect.top() + 7, size, size)
-        painter.setPen(QPen(QColor(255, 255, 255, 210), 2.0))
+        size = 13.0
+        dot = QRectF(image_rect.right() - size - 5,
+                     image_rect.bottom() - size - 5, size, size)
+        painter.setPen(QPen(QColor(255, 255, 255, 180), 1.4))
         painter.setBrush(QBrush(QColor(colour)))
         painter.drawEllipse(dot)
         painter.restore()
 
-
     def _draw_edited(self, painter: QPainter, image_rect: QRectF) -> None:
         """Zeigt an, dass für dieses Bild Retuschen gespeichert sind."""
         painter.save()
-        size = 16.0
-        badge = QRectF(image_rect.left() + 5, image_rect.bottom() - size - 5,
-                       size, size)
+        size = 14.0
+        rechts = 24.0 if self.optionen["labels"] else 5.0
+        badge = QRectF(image_rect.right() - size - rechts,
+                       image_rect.bottom() - size - 4, size, size)
         path = QPainterPath()
         path.addRoundedRect(badge, 5, 5)
         painter.fillPath(path, QBrush(QColor(0, 0, 0, 170)))

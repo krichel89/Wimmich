@@ -28,7 +28,15 @@ class ImageView(QGraphicsView):
     zoom_changed = pyqtSignal(float)     # aktueller Faktor, 1.0 = 100 %
     fullscreen_requested = pyqtSignal()
 
-    MIN_ZOOM, MAX_ZOOM = 0.05, 8.0
+    # Zoombereich: nach unten die Einpassung bzw. 50 % - je nachdem, was
+    # kleiner ist -, nach oben 200 %. Frueher waren 5 % bis 800 % erlaubt;
+    # damit liess sich das Bild zu einem Punkt schrumpfen oder so weit
+    # vergroessern, dass man die Orientierung verlor.
+    MIN_ZOOM, MAX_ZOOM = 0.5, 2.0
+    # Ein Mausrad-Rastpunkt (120 Einheiten) aendert die Vergroesserung um
+    # diesen Faktor. Vorher waren es 1,25 bzw. 0,8 - bei Maeusen, die
+    # mehrere Rastpunkte je Bewegung melden, sprang das Bild dadurch.
+    WHEEL_STEP = 1.10
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -136,17 +144,61 @@ class ImageView(QGraphicsView):
             self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
         self.zoom_changed.emit(self.zoom_factor())
 
+    def min_zoom(self) -> float:
+        """Kleinste erlaubte Vergroesserung.
+
+        Die Einpassung muss immer erreichbar bleiben - bei einem grossen
+        Bild in einem kleinen Fenster liegt sie unter 50 %. Bei einem
+        kleinen Bild ist 50 % die Grenze.
+        """
+        return min(self.MIN_ZOOM, self.fit_factor())
+
     def set_zoom(self, factor: float, anchor=None) -> None:
         """Stufenloser Zoom. 1.0 bedeutet 1:1 in Pixeln."""
-        factor = max(self.MIN_ZOOM, min(self.MAX_ZOOM, factor))
+        untergrenze = self.min_zoom()
+        einpassung = self.fit_factor()
+        # Bei einem Bild, das GROESSER ist als das Fenster (jedes Foto),
+        # gibt es unterhalb der Einpassung nichts mehr zu sehen - dort
+        # wird eingepasst statt weiter zu verkleinern. Ein kleines Bild
+        # wird dagegen zum Einpassen vergroessert; dann bleiben die
+        # 50 % die Untergrenze, sonst liesse es sich nie verkleinern.
+        if einpassung <= 1.0 and factor <= einpassung * 1.001:
+            self.fit()
+            return
+        factor = max(untergrenze, min(self.MAX_ZOOM, factor))
         self._fit = False
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         center = (anchor if anchor is not None
                   else self.mapToScene(self.viewport().rect().center()))
         self.resetTransform()
         self.scale(factor, factor)
-        self.centerOn(center)
+        self.centerOn(self._gehalten(center, factor))
         self.zoom_changed.emit(factor)
+
+    def _gehalten(self, center: QPointF, factor: float) -> QPointF:
+        """Mittelpunkt so beschneiden, dass das Bild im Fenster bleibt.
+
+        Ohne das wandert das Bild beim Zoomen an der Mausposition aus dem
+        Sichtfenster heraus und man sucht es mit gedruecktem Mausknopf
+        wieder zusammen. Passt eine Achse ganz ins Fenster, wird auf
+        dieser Achse mittig gestellt.
+        """
+        pixmap = self._item.pixmap()
+        if pixmap.isNull() or not factor:
+            return center
+        breite, hoehe = pixmap.width(), pixmap.height()
+        sicht_b = self.viewport().width() / factor
+        sicht_h = self.viewport().height() / factor
+
+        if sicht_b >= breite:
+            x = breite / 2
+        else:
+            x = min(max(center.x(), sicht_b / 2), breite - sicht_b / 2)
+        if sicht_h >= hoehe:
+            y = hoehe / 2
+        else:
+            y = min(max(center.y(), sicht_h / 2), hoehe - sicht_h / 2)
+        return QPointF(x, y)
 
     def zoom_step(self, direction: int) -> None:
         """Ein Schritt wie in Lightroom (Faktor 1,25)."""
@@ -194,6 +246,10 @@ class ImageView(QGraphicsView):
         super().resizeEvent(event)
         if self._fit:
             self.fit()
+        elif self.has_image():
+            # Wird das Fenster groesser, waere sonst plaetzlich Rand
+            # neben dem Bild sichtbar.
+            self.set_zoom(self.zoom_factor())
         self._place_overlay()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
@@ -203,11 +259,14 @@ class ImageView(QGraphicsView):
         if not delta:
             return
         anchor = self.mapToScene(event.position().toPoint())
+        # Stufenlos ueber die tatsaechlich gemeldete Radbewegung: ein
+        # Rastpunkt sind 120 Einheiten, ein Trackpad meldet weniger.
+        schritt = self.WHEEL_STEP ** (delta / 120.0)
         if self._fit:
             self.zoom_requested.emit()
-            self.set_zoom(self.fit_factor() * (1.25 if delta > 0 else 0.8), anchor)
+            self.set_zoom(self.fit_factor() * schritt, anchor)
         else:
-            self.set_zoom(self.zoom_factor() * (1.25 if delta > 0 else 0.8), anchor)
+            self.set_zoom(self.zoom_factor() * schritt, anchor)
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802

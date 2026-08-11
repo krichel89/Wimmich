@@ -59,6 +59,15 @@ DEFAULTS = {
     "sort_desc": False,       # Sortierrichtung merken (↓ absteigend)
     "show_subfolders": True,  # Ordneransicht zeigt Unterordner mit an
     "theme": "dunkel",        # "dunkel" oder "hell"
+    # Rasteransicht: dichte Kacheln, und was darauf steht
+    "grid_packed": True,      # Kacheln dicht an dicht, ohne Beschriftungsband
+    "show_filenames": False,  # Dateiname unter der Kachel
+    "show_stars": True,       # Bewertung auf der Kachel
+    "show_labels": True,      # Farbmarkierung auf der Kachel
+    "show_stack_badge": True,  # RAW+JPG-Abzeichen
+    "group_by": "month",      # "month", "day" oder "none" - Datumsgruppierung
+    "year_bar": True,         # Jahresleiste rechts neben dem Raster
+    "download_dir": "",       # zuletzt gewaehltes Ziel fuer geholte Originale
     # Immich. Der Schlüssel liegt im Klartext in dieser Datei - sie steht
     # im Benutzerprofil und ist nur für den angemeldeten Benutzer lesbar,
     # aber sie ist keine Schlüsselverwaltung. Wer mehr will, vergibt in
