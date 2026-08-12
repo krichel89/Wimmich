@@ -685,9 +685,27 @@ Nicht getestet, weil in dieser Umgebung kein echtes Material vorlag:
 ## Immich
 
 Einrichten über „Immich einrichten": Serveradresse und API-Schlüssel
-(Immich → Kontoeinstellungen → API-Schlüssel). Nötige Rechte:
-`asset.read`, `asset.upload`, `album.read`, `person.read`. Der Knopf
-„Verbindung prüfen" sagt sofort, ob es klappt. Abgleich mit F6.
+(Immich → Kontoeinstellungen → API-Schlüssel). Der Knopf „Verbindung
+prüfen" sagt sofort, ob es klappt. Abgleich mit F6.
+
+**Nötige Rechte am Schlüssel (14).** Sie stehen seit 0.3.41 auch im
+Einstellungsfenster, in Immichs eigener Gruppierung und zum Abhaken —
+Immich bietet dort nur Kreuzchen, ein Kopierblock nützt also nichts:
+
+| Gruppe | Rechte |
+| --- | --- |
+| `asset` | read, view, download, upload, delete |
+| `album` | read, create, update, delete |
+| `albumAsset` | create, delete |
+| `person` | read |
+| `user` | read |
+| `server` | about |
+
+`asset.view` ist von `asset.read` und `asset.download` getrennt und wird
+leicht übersehen: ohne dieses Recht antwortet der Server bei jeder
+Vorschau mit 403 (das war die Ursache der leeren Serverkacheln bis
+0.3.29). Die Kreuzchen in Wimmich sind eine reine Merkliste — Wimmich
+kann in Immich keine Rechte setzen.
 
 **Ablauf:** Für lokale Bilder ohne Serverkennung wird die SHA-1-Prüfsumme
 gebildet und stapelweise angefragt, was schon auf dem Server liegt
@@ -746,4 +764,4 @@ Asset-Kennung — es erscheint also nur, was schon abgeglichen ist.
 liegt im Klartext in der `config.json` im Benutzerprofil. Die Datei ist
 nur für den angemeldeten Benutzer lesbar, aber das ist keine
 Schlüsselverwaltung. Wer das ungern hat, legt in Immich einen eigenen
-Schlüssel nur für Wimmich an, mit den vier Rechten oben.
+Schlüssel nur für Wimmich an, mit genau den Rechten oben.

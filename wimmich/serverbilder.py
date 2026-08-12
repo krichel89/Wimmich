@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QMessageBox,
+    QApplication, QFileDialog, QMessageBox, QTreeWidgetItem,
 )
 
 from . import APP_NAME, __version__, crashlog, previews, remote_thumbs, theme
@@ -71,6 +71,78 @@ class _ClientTask(QRunnable):
             self.signale.client_da.emit(client, grund)
         except RuntimeError:
             pass          # Fenster ist inzwischen zu
+
+
+class _ServerSignale(QObject):
+    """Antworten der Serversuche zurueck ins Fenster."""
+
+    orte_da = pyqtSignal(list, str)        # Staedte, Fehlergrund
+    treffer_da = pyqtSignal(str, list, str)  # Anlass, Kennungen, Fehlergrund
+
+
+class _OrteTask(QRunnable):
+    """Holt die Ortsliste, ohne das Fenster anzuhalten."""
+
+    def __init__(self, client, signale: _ServerSignale) -> None:
+        super().__init__()
+        self.client = client
+        self.signale = signale
+
+    def run(self) -> None:
+        orte, grund = [], ""
+        try:
+            orte = self.client.vorschlaege("city")
+        except ImmichError as exc:
+            # Erwartbar: alte Server kennen den Endpunkt nicht, oder dem
+            # Schluessel fehlt ein Recht. Das gehoert NICHT ins
+            # fehler.log - dort stehen Abstuerze.
+            grund = ("Server kennt keine Ortssuche"
+                     if getattr(exc, "status", 0) == 404 else str(exc))
+        except Exception as exc:
+            grund = str(exc)
+            crashlog.protokolliere("Ortsliste")
+        try:
+            self.signale.orte_da.emit(orte, grund)
+        except RuntimeError:
+            pass
+
+
+class _SucheTask(QRunnable):
+    """Fragt den Server und meldet die gefundenen Kennungen zurueck.
+
+    `anlass` sagt dem Fenster, wozu die Antwort gehoert - kommt
+    inzwischen eine andere Frage, wird die alte Antwort verworfen.
+    """
+
+    def __init__(self, client, anlass: str, art: str, wert: str,
+                 signale: _ServerSignale) -> None:
+        super().__init__()
+        self.client = client
+        self.anlass = anlass
+        self.art = art
+        self.wert = wert
+        self.signale = signale
+
+    def run(self) -> None:
+        kennungen, grund = [], ""
+        try:
+            if self.art == "ort":
+                treffer = self.client.suche_metadaten(city=self.wert)
+            else:
+                treffer = self.client.suche_klug(self.wert)
+            kennungen = [t["id"] for t in treffer if t.get("id")]
+        except ImmichError as exc:
+            # Auch hier erwartbar: 404 heisst, der Server kann die kluge
+            # Suche nicht (kein ML-Dienst), 403 heisst fehlendes Recht.
+            grund = ("Dieser Server kann die Suche in normaler Sprache nicht"
+                     if getattr(exc, "status", 0) == 404 else str(exc))
+        except Exception as exc:
+            grund = str(exc)
+            crashlog.protokolliere("Serversuche")
+        try:
+            self.signale.treffer_da.emit(self.anlass, kennungen, grund)
+        except RuntimeError:
+            pass
 
 
 class _VorschauTask(QRunnable):
@@ -510,6 +582,94 @@ class ServerbilderMixin:
             self.sync_label.setVisible(True)
         elif client is not None:
             self.sync_label.setVisible(False)
+        self._serversuche_freigeben(client is not None)
+        if client is not None:
+            self._orte_holen()
+
+    # -- Serversuche ----------------------------------------------------
+
+    def _serversuche_freigeben(self, an: bool) -> None:
+        """Suchfeld und Erkunden-Zweig sperren, wenn kein Server da ist.
+
+        Ausgrauen statt still leer lassen: eine leere Ortsliste sieht
+        sonst aus, als gaebe es keine Aufnahmen aus Cannes.
+        """
+        self.server_suche.setEnabled(an)
+        self.server_suche.setPlaceholderText(
+            "Auf dem Server suchen …" if an
+            else "Serversuche: kein Server erreichbar")
+        self._explore_root.setDisabled(not an)
+        if not an:
+            self._places_root.takeChildren()
+            hinweis = QTreeWidgetItem(["— Server nicht erreichbar —"])
+            hinweis.setData(0, Qt.ItemDataRole.UserRole, None)
+            hinweis.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._places_root.addChild(hinweis)
+
+    def _orte_holen(self) -> None:
+        client = getattr(self.model, "_immich_client", None)
+        if client is None:
+            return
+        self._pool.start(_OrteTask(client, self._server_signale))
+
+    def _orte_da(self, orte: list, grund: str) -> None:
+        """Ortsliste in den Baum haengen."""
+        gewaehlt = self._selection
+        self._places_root.takeChildren()
+        for ort in orte:
+            eintrag = QTreeWidgetItem([ort])
+            eintrag.setData(0, Qt.ItemDataRole.UserRole, ("ort", ort))
+            self._places_root.addChild(eintrag)
+        if not orte:
+            hinweis = QTreeWidgetItem(
+                [f"— {grund} —" if grund else "— keine Orte gefunden —"])
+            hinweis.setData(0, Qt.ItemDataRole.UserRole, None)
+            hinweis.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._places_root.addChild(hinweis)
+        self._places_root.setExpanded(False)
+        self._auswahl_wiederherstellen(gewaehlt)
+
+    def _server_suche_starten(self) -> None:
+        """Enter im Suchfeld: den Server in normaler Sprache fragen."""
+        text = self.server_suche.text().strip()
+        if not text:
+            return
+        client = getattr(self.model, "_immich_client", None)
+        if client is None:
+            self.statusBar().showMessage(
+                "Für die Serversuche muss Immich erreichbar sein.", 5000)
+            return
+        self._selection = ("suche", text)
+        self.tree.clearSelection()
+        self._serversuche_ausloesen("klug", text)
+
+    def _serversuche_ausloesen(self, art: str, wert: str) -> None:
+        """Frage abschicken und so lange den Wartehinweis zeigen."""
+        client = getattr(self.model, "_immich_client", None)
+        if client is None:
+            self._server_treffer = []
+            self._refresh_view()
+            return
+        self._such_anlass = f"{art}:{wert}"
+        self.statusBar().showMessage(f"Server wird gefragt: {wert} …", 0)
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        self._pool.start(_SucheTask(client, self._such_anlass, art, wert,
+                                    self._server_signale))
+
+    def _treffer_da(self, anlass: str, kennungen: list, grund: str) -> None:
+        """Antwort des Servers - nur uebernehmen, wenn sie noch gilt."""
+        if anlass != getattr(self, "_such_anlass", ""):
+            return
+        QApplication.restoreOverrideCursor()
+        self._such_anlass = ""
+        self._server_treffer = list(kennungen)
+        if grund:
+            self.statusBar().showMessage(f"Serversuche fehlgeschlagen: {grund}",
+                                         8000)
+        else:
+            self.statusBar().showMessage(
+                f"{len(kennungen)} Treffer auf dem Server", 5000)
+        self._refresh_view()
 
     def _apply_sync_settings(self) -> None:
         """Zeitgeber nach den Einstellungen an- oder abschalten."""

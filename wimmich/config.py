@@ -94,6 +94,10 @@ DEFAULTS = {
     "immich_auto": True,      # laufend abgleichen, solange die Verbindung steht
     "immich_interval_min": 15,
     "watch_folders": True,    # auf Änderungen in den Bibliotheksordnern reagieren
+    # Reine Merkliste: welche der nötigen Immich-Rechte im Einstellungs-
+    # fenster schon abgehakt sind. Ändert nichts am Verhalten - Wimmich
+    # kann in Immich keine Rechte setzen.
+    "immich_rechte_ok": [],
 }
 
 

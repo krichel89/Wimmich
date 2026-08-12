@@ -13,13 +13,52 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import marks, theme
 from .immich import ImmichClient, ImmichError, normalise_base_url
+
+# Die Rechte, die Wimmich am Immich-Schlüssel braucht - in Immichs eigener
+# Gruppierung und Reihenfolge, damit sich die Liste dort von oben nach
+# unten abhaken lässt. Immich bietet nur Kreuzchen, kein Einfügefeld; ein
+# Kopierblock wäre also nutzlos.
+#
+# asset.view fehlte lange und war die Ursache der 403 bei Server-
+# Vorschauen (Diagnose 0.3.29): es ist von asset.read und asset.download
+# GETRENNT.
+IMMICH_RECHTE: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("asset", (
+        ("read", "Bilder und ihre Angaben lesen (Abgleich, Suche)"),
+        ("view", "Vorschauen vom Server anzeigen - ohne dies: 403"),
+        ("download", "Originale vom Server holen"),
+        ("upload", "fehlende Bilder hochladen"),
+        ("delete", "Bilder in Immichs Papierkorb legen"),
+    )),
+    ("album", (
+        ("read", "Alben und ihren Inhalt lesen"),
+        ("create", "neues Album anlegen"),
+        ("update", "Album umbenennen"),
+        ("delete", "Album löschen"),
+    )),
+    ("albumAsset", (
+        ("create", "Bilder in ein Album legen"),
+        ("delete", "Bilder aus einem Album nehmen"),
+    )),
+    ("person", (
+        ("read", "Personen aus Immichs Gesichtserkennung holen"),
+    )),
+    ("user", (
+        ("read", "eigener Anmeldename bei „Verbindung prüfen“"),
+    )),
+    ("server", (
+        ("about", "Serverversion bei „Verbindung prüfen“"),
+    )),
+)
+
+RECHTE_ANZAHL = sum(len(rechte) for _, rechte in IMMICH_RECHTE)
 
 
 class SettingsDialog(QDialog):
@@ -190,6 +229,12 @@ class SettingsDialog(QDialog):
     # -- Reiter Immich -------------------------------------------------
 
     def _immich_tab(self) -> QWidget:
+        """Der Reiter steckt in einem Rollbereich.
+
+        Mit der Rechteliste ist er höher als das Fenster; ohne
+        Rollbereich zöge er die Mindestgröße des Dialogs mit hoch
+        (gemessen 0.3.41: 489 → 704 px).
+        """
         page = QWidget()
         layout = QVBoxLayout(page)
         form = QFormLayout()
@@ -229,14 +274,12 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(_hint(
             "Der Schlüssel steht in Immich unter Kontoeinstellungen → "
-            "API-Schlüssel. Nötige Rechte: asset.read, asset.upload, "
-            "album.read, person.read.\n\n"
-            "Wimmich lädt nichts vom Server herunter — die Ordner auf der "
-            "Platte bleiben führend, Immich ist der Spiegel.\n\n"
-            "Der Schlüssel liegt im Klartext in der config.json im "
-            "Benutzerprofil. Am besten einen eigenen Schlüssel nur für "
-            "Wimmich anlegen, mit genau diesen vier Rechten."
+            "API-Schlüssel. Am besten einen eigenen nur für Wimmich, mit "
+            "genau diesen Rechten:"
         ))
+
+        layout.addWidget(self._rechte_block())
+        layout.addWidget(_trennlinie())
 
         self.result_label = QLabel("")
         self.result_label.setWordWrap(True)
@@ -245,8 +288,65 @@ class SettingsDialog(QDialog):
         test_button = QPushButton("Verbindung prüfen")
         test_button.clicked.connect(self._test)
         layout.addWidget(test_button)
+
+        layout.addWidget(_hint(
+            "Die Ordner auf der Platte bleiben führend, Immich ist der "
+            "Spiegel. Vom Server geholt werden Vorschauen; Originale nur "
+            "auf ausdrücklichen Wunsch. Der Schlüssel liegt im Klartext in "
+            "der config.json im Benutzerprofil."
+        ))
         layout.addStretch(1)
-        return page
+
+        rollbereich = QScrollArea()
+        rollbereich.setWidget(page)
+        rollbereich.setWidgetResizable(True)
+        rollbereich.setFrameShape(QFrame.Shape.NoFrame)
+        return rollbereich
+
+    # -- Rechteliste ---------------------------------------------------
+
+    def _rechte_block(self) -> QWidget:
+        """Die nötigen Rechte zum Abhaken, in Immichs Gruppierung.
+
+        Die Kreuzchen ändern nichts - Wimmich kann in Immich keine Rechte
+        setzen. Sie merken sich nur, was schon erledigt ist, und stehen
+        beim nächsten Öffnen wieder da.
+        """
+        block = QWidget()
+        spalte = QVBoxLayout(block)
+        spalte.setContentsMargins(0, 0, 0, 0)
+        spalte.setSpacing(6)
+
+        titel = QLabel(f"Nötige Rechte am Schlüssel ({RECHTE_ANZAHL})")
+        titel.setStyleSheet("font-weight: 600;")
+        spalte.addWidget(titel)
+        spalte.addWidget(_hint(
+            "Immich hat dort nur Kreuzchen — diese Liste ist zum Abhaken. "
+            "Fehlt asset.view, bleiben Server-Vorschauen leer (403)."
+        ))
+
+        erledigt = self.config["immich_rechte_ok"]
+        if not isinstance(erledigt, list):
+            erledigt = []
+        self.rechte_boxen: dict[str, QCheckBox] = {}
+
+        for gruppe, rechte in IMMICH_RECHTE:
+            zeile = QHBoxLayout()
+            zeile.setSpacing(12)
+            name = QLabel(gruppe)
+            name.setMinimumWidth(120)
+            name.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+            zeile.addWidget(name)
+            for recht, wozu in rechte:
+                voll = f"{gruppe}.{recht}"
+                box = QCheckBox(recht)
+                box.setToolTip(f"{voll} — {wozu}")
+                box.setChecked(voll in erledigt)
+                self.rechte_boxen[voll] = box
+                zeile.addWidget(box)
+            zeile.addStretch(1)
+            spalte.addLayout(zeile)
+        return block
 
     def _test(self) -> None:
         url = normalise_base_url(self.url_edit.text())
@@ -293,7 +393,16 @@ class SettingsDialog(QDialog):
             "immich_auto": self.auto_box.isChecked(),
             "immich_interval_min": self.interval.value(),
             "watch_folders": self.watch_box.isChecked(),
+            "immich_rechte_ok": [name for name, box in self.rechte_boxen.items()
+                                 if box.isChecked()],
         }
+
+
+def _trennlinie() -> QFrame:
+    linie = QFrame()
+    linie.setFrameShape(QFrame.Shape.HLine)
+    linie.setStyleSheet(f"color: {theme.BORDER};")
+    return linie
 
 
 def _hint(text: str) -> QLabel:

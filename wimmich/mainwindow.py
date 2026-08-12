@@ -50,7 +50,9 @@ from .edits import (
 from .previews import decode as decode_image
 from .export import ExportDialog, ExportWorker
 from .masse import MasseWorker
-from .serverbilder import ServerbilderMixin, _VorschauSignale
+from .serverbilder import (
+    ServerbilderMixin, _ServerSignale, _VorschauSignale,
+)
 from .settings import SettingsDialog
 from .sync import SyncWorker
 from .scanner import ScanWorker
@@ -145,6 +147,11 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._vorschau_signale = _VorschauSignale()
         self._vorschau_signale.fertig.connect(self._vorschau_da)
         self._vorschau_signale.client_da.connect(self._client_da)
+        self._server_signale = _ServerSignale()
+        self._server_signale.orte_da.connect(self._orte_da)
+        self._server_signale.treffer_da.connect(self._treffer_da)
+        self._server_treffer: list[str] = []
+        self._such_anlass = ""
         self._remote_wartet = ""
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
@@ -239,6 +246,9 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.grid.setFocus()
         self._apply_watch_settings()
         self._apply_sync_settings()
+        # Bis der Server geantwortet hat, ist die Serversuche gesperrt -
+        # sie kaeme sonst ins Leere.
+        self._serversuche_freigeben(False)
         self._apply_remote_client()
 
         if not self.config.libraries:
@@ -310,6 +320,21 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         # Ordnerbaum und Raster
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
+        # Linke Spalte: Suchfeld ueber dem Baum
+        links = QWidget()
+        links_layout = QVBoxLayout(links)
+        links_layout.setContentsMargins(6, 6, 6, 0)
+        links_layout.setSpacing(6)
+
+        self.server_suche = QLineEdit()
+        self.server_suche.setPlaceholderText("Auf dem Server suchen …")
+        self.server_suche.setClearButtonEnabled(True)
+        self.server_suche.setToolTip(
+            "Sucht auf Immich in normaler Sprache: roter Teppich, "
+            "Mikrofon, Schnee.\nEnter startet die Suche.")
+        self.server_suche.returnPressed.connect(self._server_suche_starten)
+        links_layout.addWidget(self.server_suche)
+
         self.tree = FolderTree()
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(14)
@@ -319,7 +344,8 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.tree.itemExpanded.connect(self._expand_item)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
-        splitter.addWidget(self.tree)
+        links_layout.addWidget(self.tree, 1)
+        splitter.addWidget(links)
 
         self.model = PhotoModel(
             exiftool=self.exiftool, thumb_edge=self.config["thumb_size"]
@@ -782,7 +808,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                "Aussortieren. Kein Album: nichts davon geht auf den Server.")
         self.tree.addTopLevelItem(self._sammlung_item)
 
-        self._folders_root = QTreeWidgetItem(["Ordner"])
+        self._folders_root = QTreeWidgetItem(["Lokale Ordner"])
         self._folders_root.setData(0, Qt.ItemDataRole.UserRole, None)
         self.tree.addTopLevelItem(self._folders_root)
         for root in self.config.libraries:
@@ -800,9 +826,23 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._albums_root.setData(0, Qt.ItemDataRole.UserRole, None)
         self.tree.addTopLevelItem(self._albums_root)
 
+        # „Erkunden" fasst zusammen, was der SERVER weiss: Orte und
+        # Personen. Beides kommt aus Immich, beides braucht Netz -
+        # deshalb steht es beieinander und nicht bei den lokalen Ordnern.
+        self._explore_root = QTreeWidgetItem(["Erkunden"])
+        self._explore_root.setData(0, Qt.ItemDataRole.UserRole, None)
+        self._explore_root.setToolTip(
+            0, "Orte und Personen kommen von Immich — dafür muss der "
+               "Server erreichbar sein.")
+        self.tree.addTopLevelItem(self._explore_root)
+
+        self._places_root = QTreeWidgetItem(["Orte"])
+        self._places_root.setData(0, Qt.ItemDataRole.UserRole, None)
+        self._explore_root.addChild(self._places_root)
+
         self._people_root = QTreeWidgetItem(["Personen"])
         self._people_root.setData(0, Qt.ItemDataRole.UserRole, None)
-        self.tree.addTopLevelItem(self._people_root)
+        self._explore_root.addChild(self._people_root)
 
         self._reload_immich_tree()
 
@@ -847,10 +887,13 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         Wimmich dadurch mitten in der Arbeit aus dem Album heraus.
         Gemessen: nach dem Entfernen standen 5 statt 3 Bildern da.
         """
-        if not gewaehlt or gewaehlt[0] not in ("album", "person"):
+        if not gewaehlt or gewaehlt[0] not in ("album", "person", "ort"):
             return
-        wurzel = (self._albums_root if gewaehlt[0] == "album"
-                  else self._people_root)
+        wurzel = {"album": self._albums_root,
+                  "person": self._people_root,
+                  "ort": self._places_root}.get(gewaehlt[0])
+        if wurzel is None:
+            return
         for i in range(wurzel.childCount()):
             item = wurzel.child(i)
             if item.data(0, Qt.ItemDataRole.UserRole) == gewaehlt:
@@ -1212,6 +1255,10 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             return
         self._selection = data
         self.search_box.clear()
+        if data[0] == "ort":
+            self.server_suche.clear()
+            self._serversuche_ausloesen("ort", data[1])
+            return          # die Ansicht kommt, wenn der Server antwortet
         # Unterordner ergibt nur bei Ordnern Sinn
         self.recursive_button.setEnabled(data[0] == "folder")
         self._refresh_view()
@@ -1387,7 +1434,19 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             rows = []
         else:
             kind, key = self._selection
-            if kind == "sammlung":
+            if kind in ("ort", "suche"):
+                # Der SERVER hat geantwortet, hier werden die Kennungen
+                # nur noch mit dem Lokalen zusammengefuehrt: lokale
+                # Zeilen zuerst (die haben Bewertung und Bearbeitung),
+                # reine Serverbilder hinterher.
+                treffer = list(self._server_treffer)
+                rows = list(self.db.photos_by_immich_ids(
+                    treffer, order=self.sort_box.currentData(),
+                    **richtung, **common))
+                bekannt = {r["immich_id"] for r in rows if r["immich_id"]}
+                rows += [_remote_zeile(r) for r in self.db.remote_by_ids(
+                    [k for k in treffer if k not in bekannt])]
+            elif kind == "sammlung":
                 rows = list(self.db.photos_by_paths(
                     list(self.config["sammlung"]),
                     order=self.sort_box.currentData(), **richtung, **common))

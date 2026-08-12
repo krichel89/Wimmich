@@ -302,7 +302,9 @@ class ImmichClient:
     def _json(self, method: str, path: str, **kwargs):
         status, payload = self._request(method, path, **kwargs)
         if status == 401 or status == 403:
-            raise ImmichError("Schlüssel abgelehnt - Rechte prüfen", status)
+            raise ImmichError(
+                "Schlüssel abgelehnt - die nötigen Rechte stehen in den "
+                "Einstellungen unter Immich", status)
         if status >= 400:
             raise ImmichError(_error_text(status, payload), status)
         if not payload:
@@ -680,6 +682,57 @@ class ImmichClient:
             if page > 50:      # Notbremse gegen falsch gesetztes hasNextPage
                 break
         return result
+
+    def vorschlaege(self, typ: str, **einschraenkung) -> list[str]:
+        """Werteliste zu einem Feld - fuer die Auswahl in der Oberflaeche.
+
+        `typ` ist z. B. „city", „country", „state", „make", „model",
+        „lensModel". Immich antwortet mit genau den Werten, die in der
+        Sammlung wirklich vorkommen - deshalb wird hier gefragt, statt
+        eine eigene Liste zu fuehren.
+        """
+        abfrage = {"type": typ}
+        abfrage.update({k: v for k, v in einschraenkung.items() if v})
+        daten = self._json("GET", "/search/suggestions", query=abfrage)
+        if not isinstance(daten, list):
+            return []
+        return [str(w) for w in daten if w]
+
+    def suche_metadaten(self, limit: int = 1000, **felder) -> list[dict]:
+        """Metadatensuche mit beliebigen Feldern (city, make, model …).
+
+        Leere Felder fliegen raus: ein mitgeschicktes `city: ""` wuerde
+        auf Bilder OHNE Ort filtern statt auf alle.
+        """
+        rumpf = {k: v for k, v in felder.items() if v not in (None, "", [])}
+        assets: list[dict] = []
+        seite = 1
+        while len(assets) < limit:
+            daten = self._json(
+                "POST", self._path("/search/metadata", "/search/metadata"),
+                body={**rumpf, "page": seite, "size": 250},
+            ) or {}
+            block = (daten.get("assets") or {})
+            posten = block.get("items") or []
+            assets.extend(posten)
+            if not block.get("nextPage") or not posten:
+                break
+            seite += 1
+        return assets[:limit]
+
+    def suche_klug(self, text: str, limit: int = 250) -> list[dict]:
+        """Suche in normaler Sprache (CLIP) - braucht den ML-Dienst.
+
+        Es gibt hier KEIN Blaettern ueber alle Seiten: die Antwort ist
+        nach Passgenauigkeit sortiert, die erste Seite ist das, was
+        zaehlt.
+        """
+        daten = self._json(
+            "POST", "/search/smart",
+            body={"query": text, "page": 1, "size": min(limit, 250)},
+        ) or {}
+        block = (daten.get("assets") or {})
+        return (block.get("items") or [])[:limit]
 
     def assets_of_person(self, person_id: str, limit: int = 1000) -> list[dict]:
         """Bilder einer Person über die Metadatensuche."""

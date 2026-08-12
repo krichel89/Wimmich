@@ -35,6 +35,11 @@ STATE = {
     "bilder": {},
     "geloescht": [],     # Kennungen, die ueber DELETE weggeraeumt wurden
     "papierkorb": True,  # False = Server kennt force=false nicht (HTTP 400)
+    # Serversuche: Kennung -> Ort, und die Antwort der klugen Suche
+    "orte": {"asset-o-1": "Cannes", "asset-o-2": "Cannes",
+             "asset-o-3": "Berlin"},
+    "kluge_treffer": ["asset-k-1", "asset-k-2"],
+    "vorschlaege_fehlen": False,   # True = Server kennt den Endpunkt nicht
 }
 
 
@@ -75,6 +80,15 @@ class Handler(BaseHTTPRequestHandler):
         STATE["requests"].append(("GET", path))
         if not self._auth_ok():
             return self._send(401, {"message": "Invalid API key"})
+
+        if path == "/api/search/suggestions":
+            if STATE["vorschlaege_fehlen"]:
+                return self._send(404, {"message": "Not found"})
+            typ = _query(self.path).get("type", [""])[0]
+            if typ != "city":
+                return self._send(200, [])
+            # Reihenfolge wie bei Immich: alphabetisch, ohne Doppelte
+            return self._send(200, sorted(set(STATE["orte"].values())))
 
         if path == "/api/server/ping":
             return self._send(200, {"res": "pong"})
@@ -220,11 +234,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/search/metadata":
             data = json.loads(body)
-            person = (data.get("personIds") or ["?"])[0]
-            items = [{"id": f"asset-{person}-{i}"} for i in range(3)]
+            if data.get("city"):
+                items = [{"id": k} for k, ort in STATE["orte"].items()
+                         if ort == data["city"]]
+            else:
+                person = (data.get("personIds") or ["?"])[0]
+                items = [{"id": f"asset-{person}-{i}"} for i in range(3)]
             return self._send(200, {"albums": {"items": [], "total": 0, "count": 0},
-                                    "assets": {"items": items, "total": 3,
-                                               "count": 3, "nextPage": None}})
+                                    "assets": {"items": items, "total": len(items),
+                                               "count": len(items),
+                                               "nextPage": None}})
+
+        if path == "/api/search/smart":
+            data = json.loads(body)
+            if not data.get("query"):
+                return self._send(400, {"message": "query missing"})
+            items = [{"id": k} for k in STATE["kluge_treffer"]]
+            return self._send(200, {"albums": {"items": [], "total": 0, "count": 0},
+                                    "assets": {"items": items, "total": len(items),
+                                               "count": len(items),
+                                               "nextPage": None}})
 
         return self._send(404, {"message": "Not found"})
 
@@ -320,6 +349,12 @@ class Handler(BaseHTTPRequestHandler):
         STATE["uploads"].append((files["assetData"][0], "sidecarData" in files))
         return self._send(201, {"id": asset_id, "status": "created",
                                 "duplicate": False})
+
+
+def _query(pfad: str) -> dict:
+    """Abfrageteil einer URL als Woerterbuch."""
+    import urllib.parse
+    return urllib.parse.parse_qs(urllib.parse.urlparse(pfad).query)
 
 
 def _param(header: str, key: str) -> str:

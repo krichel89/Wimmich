@@ -859,6 +859,28 @@ class Database:
         return self._cursor(where, params, order, stacked, prefer_raw,
                             desc=desc).fetchall()
 
+    def photos_by_immich_ids(self, immich_ids: list[str],
+                             order: str = "taken_at", desc: bool = False,
+                             stacked: bool = True, prefer_raw: bool = True,
+                             min_rating: int = 0, show_rejects: bool = True,
+                             labels: list[str] | None = None,
+                             unlabeled: bool = False) -> list:
+        """Lokale Bilder zu genau diesen Immich-Kennungen.
+
+        Fuer die Serversuche: der Server antwortet mit Kennungen, die
+        Anzeige braucht die lokalen Zeilen dazu - mit Bewertung, Marke
+        und Bearbeitungsschritten, die nur hier stehen.
+        """
+        if not immich_ids:
+            return []
+        platz = ",".join("?" for _ in immich_ids)
+        where = f"p.immich_id IN ({platz})"
+        params: list = list(immich_ids)
+        where, params = _add_filters(where, params, min_rating,
+                                     show_rejects, labels, unlabeled)
+        return self._select(where, params, order, stacked, prefer_raw,
+                            desc=desc)
+
     def remote_by_ids(self, immich_ids: list[str]):
         """Serverspiegel-Zeilen zu genau diesen Kennungen."""
         if not immich_ids:
