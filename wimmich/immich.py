@@ -101,6 +101,75 @@ def ist_dauerhafter_fehler(meldung: str) -> bool:
 
 
 
+class _MultipartStrom:
+    """Multipart-Rumpf, der die Dateien erst beim Absenden liest.
+
+    urllib nimmt fuer `data` alles, was `read(n)` kann - dann muss aber
+    die Laenge selbst mitgeschickt werden, sonst greift http.client zu
+    „Transfer-Encoding: chunked", und darauf reagieren nicht alle
+    Server freundlich. Deshalb rechnet __len__ die Gesamtlaenge vorher
+    aus: Textteile plus Dateigroessen plus Trennzeilen.
+    """
+
+    BLOCK = 1024 * 256
+
+    def __init__(self, boundary: str, felder: dict, dateien: list) -> None:
+        self._teile: list = []          # bytes ODER (Pfad, Groesse)
+        for name, wert in felder.items():
+            self._teile.append((
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{wert}\r\n").encode("utf-8"))
+        for name, dateiname, pfad in dateien:
+            self._teile.append((
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"; '
+                f'filename="{dateiname}"\r\n'
+                f"Content-Type: {content_type_for(dateiname)}\r\n\r\n"
+            ).encode("utf-8"))
+            self._teile.append((str(pfad), Path(pfad).stat().st_size))
+            self._teile.append(b"\r\n")
+        self._teile.append(f"--{boundary}--\r\n".encode("utf-8"))
+
+        self._laenge = sum(
+            teil[1] if isinstance(teil, tuple) else len(teil)
+            for teil in self._teile)
+        self._i = 0
+        self._offen = None
+        self._rest = b""
+
+    def __len__(self) -> int:
+        return self._laenge
+
+    def read(self, menge: int = -1) -> bytes:
+        """Naechstes Stueck. menge<0 heisst: alles - das meiden wir."""
+        if menge is None or menge < 0:
+            menge = self.BLOCK
+        while len(self._rest) < menge and self._i < len(self._teile):
+            teil = self._teile[self._i]
+            if isinstance(teil, tuple):
+                if self._offen is None:
+                    self._offen = open(teil[0], "rb")   # noqa: SIM115
+                stueck = self._offen.read(max(menge - len(self._rest),
+                                              self.BLOCK))
+                if stueck:
+                    self._rest += stueck
+                    continue
+                self._offen.close()
+                self._offen = None
+                self._i += 1
+            else:
+                self._rest += teil
+                self._i += 1
+        ergebnis, self._rest = self._rest[:menge], self._rest[menge:]
+        return ergebnis
+
+    def close(self) -> None:
+        if self._offen is not None:
+            self._offen.close()
+            self._offen = None
+
+
 class ImmichError(RuntimeError):
     """Fehler beim Reden mit dem Server."""
 
@@ -190,7 +259,7 @@ class ImmichClient:
     # -- Grundlagen ----------------------------------------------------
 
     def _request(self, method: str, path: str, *, query: dict | None = None,
-                 body: dict | None = None, raw: bytes | None = None,
+                 body: dict | None = None, raw: object = None,   # bytes ODER ein Strom mit read()
                  content_type: str | None = None,
                  extra_headers: dict | None = None,
                  timeout: float | None = None) -> tuple[int, bytes]:
@@ -355,10 +424,11 @@ class ImmichClient:
             fields["deviceAssetId"] = f"{target.name}-{int(stat.st_mtime)}"
             fields["deviceId"] = "wimmich"
 
-        files = [("assetData", target.name, target.read_bytes())]
+        # Nur die PFADE - gelesen wird erst beim Absenden, Stueck fuer
+        # Stueck. Ein 100-MB-RAW liegt so nie im Speicher.
+        files = [("assetData", target.name, str(target))]
         if sidecar and Path(sidecar).exists():
-            files.append(("sidecarData", Path(sidecar).name,
-                          Path(sidecar).read_bytes()))
+            files.append(("sidecarData", Path(sidecar).name, str(sidecar)))
 
         headers = {"x-immich-checksum": checksum} if checksum else None
         status, payload = self._post_multipart(fields, files, headers)
@@ -391,30 +461,23 @@ class ImmichClient:
             return None, False
         return data.get("id"), bool(data.get("duplicate"))
 
-    def _post_multipart(self, fields: dict, files: list, headers: dict | None):
-        boundary = uuid.uuid4().hex
-        body = bytearray()
-        for name, value in fields.items():
-            body += (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-                f"{value}\r\n"
-            ).encode("utf-8")
-        for name, filename, blob in files:
-            body += (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"; '
-                f'filename="{filename}"\r\n'
-                f"Content-Type: {content_type_for(filename)}\r\n\r\n"
-            ).encode("utf-8")
-            body += blob + b"\r\n"
-        body += f"--{boundary}--\r\n".encode("utf-8")
+    def _post_multipart(self, fields: dict, dateien: list, headers: dict | None):
+        """Hochladen, ohne die Datei in den Speicher zu holen.
 
+        `dateien` ist [(Feldname, Dateiname, Pfad), …]. Frueher stand
+        hier ein bytearray, in das die ganze Aufnahme kopiert wurde -
+        bei einem 100-MB-RAW belegte allein der Rumpf gut 200 MB
+        (einmal das bytearray, einmal die bytes()-Kopie beim Absenden).
+        Jetzt wird der Rumpf stueckweise von der Platte gelesen.
+        """
+        boundary = uuid.uuid4().hex
+        strom = _MultipartStrom(boundary, fields, dateien)
         return self._request(
             "POST", self._path("/assets", "/asset/upload"),
-            raw=bytes(body),
+            raw=strom,
             content_type=f"multipart/form-data; boundary={boundary}",
-            extra_headers=headers,
+            extra_headers={**(headers or {}),
+                           "Content-Length": str(len(strom))},
         )
 
     # -- Bilder, die (nur) auf dem Server liegen ------------------------

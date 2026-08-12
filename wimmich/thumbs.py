@@ -22,9 +22,19 @@ except ImportError:  # pragma: no cover
     HAVE_RAWPY = False
 
 
-def cache_key(path: str, mtime: float, size: int, edge: int) -> str:
-    raw = f"{path}|{mtime:.0f}|{size}|{edge}".encode("utf-8", errors="replace")
-    return hashlib.sha1(raw).hexdigest()
+def cache_key(path: str, mtime: float, size: int, edge: int,
+              steps: str | None = None) -> str:
+    """Schluessel im Vorschau-Cache.
+
+    Die Schrittfolge geht MIT ein: sonst zeigte die Kachel nach einer
+    Aenderung weiter das alte Bild, und ein Zuruecknehmen fiele gar
+    nicht auf. Ohne Schritte bleibt der Schluessel derselbe wie frueher -
+    ein voller Cache wird also nicht entwertet.
+    """
+    roh = f"{path}|{mtime:.0f}|{size}|{edge}"
+    if steps:
+        roh += "|" + hashlib.sha1(steps.encode("utf-8", "replace")).hexdigest()[:16]
+    return hashlib.sha1(roh.encode("utf-8", errors="replace")).hexdigest()
 
 
 def cache_path(key: str) -> Path:
@@ -32,9 +42,15 @@ def cache_path(key: str) -> Path:
 
 
 def get_thumbnail(path: str, mtime: float, filesize: int, edge: int = 256,
-                  exiftool=None) -> Path | None:
-    """Liefert den Pfad zur Vorschau, erzeugt sie bei Bedarf."""
-    key = cache_key(path, mtime, filesize, edge)
+                  exiftool=None, steps: str | None = None) -> Path | None:
+    """Liefert den Pfad zur Vorschau, erzeugt sie bei Bedarf.
+
+    `steps` ist die Schrittfolge als JSON. Ist sie gesetzt, zeigt die
+    Kachel das BEARBEITETE Bild. Die Schritte rechnen in Bruchteilen der
+    Bildgroesse, laufen also auf der kleinen Vorschau genauso wie auf
+    dem Original - nur eben in Millisekunden statt Sekunden.
+    """
+    key = cache_key(path, mtime, filesize, edge, steps)
     dest = cache_path(key)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
@@ -52,6 +68,8 @@ def get_thumbnail(path: str, mtime: float, filesize: int, edge: int = 256,
         image.thumbnail((edge, edge), Image.Resampling.LANCZOS)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
+        if steps:
+            image = _bearbeitet(image, steps)
         tmp = dest.with_suffix(".tmp.jpg")
         image.save(tmp, "JPEG", quality=85, optimize=True)
         tmp.replace(dest)
@@ -60,6 +78,30 @@ def get_thumbnail(path: str, mtime: float, filesize: int, edge: int = 256,
     finally:
         image.close()
     return dest
+
+
+def _bearbeitet(image: Image.Image, steps: str) -> Image.Image:
+    """Die Schrittfolge auf die kleine Vorschau rechnen.
+
+    Scheitert das - kaputte Schrittfolge, fehlendes numpy - bleibt das
+    unbearbeitete Bild stehen. Eine graue Kachel waere schlimmer als
+    eine, die den alten Stand zeigt.
+    """
+    try:
+        import numpy as np
+
+        from .edits import EditStack
+        stapel = EditStack.from_json(steps)
+        if not stapel.steps:
+            return image
+        feld = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        ergebnis = stapel.apply(feld)
+        ergebnis = np.clip(ergebnis, 0.0, 1.0) * 255.0
+        return Image.fromarray(ergebnis.astype("uint8"), "RGB")
+    except Exception:
+        from . import crashlog
+        crashlog.protokolliere("Bearbeitete Vorschau")
+        return image
 
 
 def _load_for_thumb(path: str, edge: int, exiftool) -> Image.Image | None:

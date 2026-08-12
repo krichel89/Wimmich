@@ -63,16 +63,18 @@ class _ThumbSignals(QObject):
 
 class _ThumbTask(QRunnable):
     def __init__(self, row: int, path: str, mtime: float, filesize: int,
-                 edge: int, exiftool, signals: _ThumbSignals) -> None:
+                 edge: int, exiftool, signals: _ThumbSignals,
+                 steps: str | None = None) -> None:
         super().__init__()
         self.setAutoDelete(True)
-        self._args = (row, path, mtime, filesize, edge, exiftool)
+        self._args = (row, path, mtime, filesize, edge, exiftool, steps)
         self._signals = signals
 
     def run(self) -> None:
-        row, path, mtime, filesize, edge, exiftool = self._args
+        row, path, mtime, filesize, edge, exiftool, steps = self._args
         try:
-            result = thumbs.get_thumbnail(path, mtime, filesize, edge, exiftool)
+            result = thumbs.get_thumbnail(path, mtime, filesize, edge,
+                                          exiftool, steps=steps)
         except BaseException:
             # Eine Ausnahme in einem Pool-Faden erreicht sys.excepthook
             # NICHT - sie verschwindet spurlos, und die Kachel bleibt fuer
@@ -143,7 +145,10 @@ class PhotoModel(QAbstractListModel):
         self._serverfehler_gemeldet = ""
 
         self._placeholder = QPixmap()   # leer = Delegate zeichnet Platzhalter
-        self._edited: set[str] = set()
+        # Pfad -> Schrittfolge als JSON. Frueher nur eine Menge von
+        # Pfaden; die Schritte werden jetzt gebraucht, damit die Kachel
+        # das BEARBEITETE Bild zeigen kann.
+        self._edited: dict[str, str] = {}
         self._source = None
         self._group_by: str | None = None
         self._streaming = False
@@ -377,15 +382,28 @@ class PhotoModel(QAbstractListModel):
             idx = self.index(row, 0)
             self.dataChanged.emit(idx, idx, [ROLE_RATING, Qt.ItemDataRole.DisplayRole])
 
-    def set_edited(self, paths: set[str]) -> None:
-        """Pfade mit Retusche - für das Abzeichen auf der Kachel."""
-        if paths != self._edited:
-            self._edited = set(paths)
-            if self._rows:
-                self.dataChanged.emit(
-                    self.index(0, 0), self.index(len(self._rows) - 1, 0),
-                    [ROLE_EDITED],
-                )
+    def set_edited(self, schritte: dict[str, str]) -> None:
+        """Pfad -> Schrittfolge. Steuert Abzeichen UND Kachelbild.
+
+        Aendert sich etwas, werden die betroffenen Vorschauen verworfen:
+        sie zeigen sonst weiter den alten Stand. Der Cache auf der
+        Platte bleibt - dort haengt die Schrittfolge im Schluessel.
+        """
+        if schritte == self._edited:
+            return
+        geaendert = {p for p in set(schritte) | set(self._edited)
+                     if schritte.get(p) != self._edited.get(p)}
+        self._edited = dict(schritte)
+        for row, item in enumerate(self._rows):
+            pfad = item.get("thumb_path") or item.get("path")
+            if pfad in geaendert:
+                self._pixmaps.pop(row, None)
+                self._requested.discard(row)
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(len(self._rows) - 1, 0),
+                [ROLE_EDITED, Qt.ItemDataRole.DecorationRole],
+            )
 
     def update_label(self, row: int, label: str) -> None:
         if 0 <= row < len(self._rows):
@@ -417,6 +435,7 @@ class PhotoModel(QAbstractListModel):
                 item.get("thumb_mtime") or item.get("mtime") or 0.0,
                 item.get("thumb_size") or item.get("filesize") or 0,
                 self._thumb_edge, self._exiftool, self._signals,
+                self._edited.get(item.get("thumb_path") or item["path"]),
             ))
         return self._placeholder
 

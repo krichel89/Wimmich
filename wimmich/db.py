@@ -413,6 +413,17 @@ class Database:
         """Alle Pfade mit Retusche - für das Abzeichen auf der Kachel."""
         return {r["path"] for r in self.conn.execute("SELECT path FROM edits")}
 
+    def edited_steps(self) -> dict[str, str]:
+        """Pfad -> Schrittfolge als JSON, für die bearbeitete Kachel.
+
+        Die Kachel soll zeigen, was das Bild GEWORDEN ist, nicht was es
+        war. Dafür braucht die Vorschau die Schritte selbst, nicht nur
+        die Angabe, dass es welche gibt.
+        """
+        return {r["path"]: r["steps"] for r in
+                self.conn.execute("SELECT path, steps FROM edits")
+                if r["steps"]}
+
     def commit(self) -> None:
         self.conn.commit()
 

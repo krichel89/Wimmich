@@ -1453,7 +1453,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self.model.set_rows(rows, group_by=gruppierung)
             gezeigt = len([r for r in rows if "_header" not in r])
 
-        self.model.set_edited(self.db.edited_paths())
+        self.model.set_edited(self.db.edited_steps())
         self._jahresleiste_fuellen()
         self._gesamt = gezeigt
         if self.in_loupe:
@@ -2514,7 +2514,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         if not self._loupe_path:
             return
         self.db.save_edits(self._loupe_path, self._stack_edits.to_json())
-        self.model.set_edited(self.db.edited_paths())
+        self.model.set_edited(self.db.edited_steps())
 
     def _export_auswahl(self) -> None:
         """Stapel-Export: die ausgewaehlten Bilder in einen Ordner rechnen.
