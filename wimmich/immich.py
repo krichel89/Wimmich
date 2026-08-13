@@ -178,6 +178,33 @@ class ImmichError(RuntimeError):
         self.status = status
 
 
+class _UmleitungsWaechter(urllib.request.HTTPRedirectHandler):
+    """Lässt den API-Schlüssel nicht auf einen fremden Rechner wandern.
+
+    urllib nimmt bei 301/302/303/307 die ursprünglichen Kopfzeilen mit
+    zum neuen Ziel - auch über Rechnergrenzen hinweg. GEMESSEN 0.3.42:
+    ein untergeschobenes 302 genügte, damit ein fremder Server den
+    Schlüssel im Klartext zu sehen bekam.
+
+    Deshalb: eine Umleitung auf denselben Wirt UND dasselbe Verfahren
+    geht durch (Immich hängt selbst gelegentlich einen Schrägstrich an),
+    alles andere wird abgelehnt. Ein Abstieg von https auf http zählt
+    ausdrücklich als „anderes Verfahren" - sonst läge der Schlüssel im
+    Klartext auf der Leitung.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        alt = urllib.parse.urlsplit(req.full_url)
+        neu = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if (neu.scheme, neu.netloc) != (alt.scheme, alt.netloc):
+            raise ImmichError(
+                f"Der Server hat auf {neu.scheme}://{neu.netloc} umgeleitet. "
+                "Abgelehnt - der API-Schlüssel geht nicht an einen anderen "
+                "Rechner. Bitte die Serveradresse in den Einstellungen "
+                "richtigstellen.", code)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @dataclass
 class ServerInfo:
     version: str = ""
@@ -234,6 +261,10 @@ def normalise_base_url(url: str) -> str:
         return ""
     if "://" not in url:
         url = "https://" + url
+    # Alles ausser http/https ist keine Serveradresse. Ohne diese Sperre
+    # landete "file:///…" oder "ftp://…" ungeprueft in urlopen.
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        return ""
     if not url.endswith("/api"):
         url += "/api"
     return url
@@ -246,11 +277,13 @@ class ImmichClient:
         self.base_url = normalise_base_url(base_url)
         self.api_key = (api_key or "").strip()
         self.info = ServerInfo()
-        self._connected = False
         # Fuer die Diagnose: warum die letzte Vorschau nicht kam und
         # welche Wege dabei probiert wurden.
-        self.letzter_vorschaufehler = ""
         self.letzte_vorschauversuche: list[str] = []
+        # Eigener Opener: nur so greift der Umleitungswaechter. Der
+        # Standard-urlopen wuerde den Schluessel bei einer Umleitung
+        # mitschicken.
+        self._opener = urllib.request.build_opener(_UmleitungsWaechter())
 
     @property
     def configured(self) -> bool:
@@ -289,8 +322,8 @@ class ImmichClient:
         request = urllib.request.Request(url, data=data, headers=headers,
                                          method=method)
         try:
-            with urllib.request.urlopen(request,
-                                        timeout=timeout or TIMEOUT) as response:
+            with self._opener.open(request,
+                                   timeout=timeout or TIMEOUT) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
@@ -368,7 +401,6 @@ class ImmichClient:
         status, _ = self._request("GET", "/albums", query={"shared": "false"})
         self.info.plural_paths = status != 404
 
-        self._connected = True
         return self.info
 
     def _path(self, plural: str, legacy: str) -> str:
@@ -441,12 +473,19 @@ class ImmichClient:
         # dauerhaft ab, und danach scheiterte JEDER weitere Upload an
         # „deviceAssetId must be a string". Die meisten Immich-Fassungen
         # VERLANGEN die Felder.
-        if status == 400 and self.info.device_fields and _meckert_geraetefelder(payload):
+        # ENTSCHIEDEN WIRD AN DER ANTWORT, nicht am Schalter. Der Schalter
+        # sagt nur, wie der naechste Upload STARTET. Frueher stand er in
+        # der Bedingung - bei gleichzeitigen Uploads (bis zu acht Faeden)
+        # stellte der erste ihn um, und die uebrigen wiederholten deshalb
+        # NICHT mehr. GEMESSEN 0.3.42 gegen einen Server, der die Felder
+        # ablehnt: 3 von 8 Uploads scheiterten bei vier Straengen,
+        # nacheinander keiner.
+        if status == 400 and _meckert_geraetefelder(payload):
             self.info.device_fields = False
             fields.pop("deviceAssetId", None)
             fields.pop("deviceId", None)
             status, payload = self._post_multipart(fields, files, headers)
-        elif status == 400 and not self.info.device_fields and _verlangt_geraetefelder(payload):
+        elif status == 400 and _verlangt_geraetefelder(payload):
             # Umgekehrter Fall: der Server will sie doch haben.
             self.info.device_fields = True
             stat_neu = target.stat()
@@ -515,7 +554,9 @@ class ImmichClient:
         ]
         if gross:
             versuche.insert(2, (f"/assets/{asset_id}/original", None))
-        letzter = None
+        # Was jeder Weg geantwortet hat, steht in letzte_vorschauversuche -
+        # das liest die Diagnose. Ein zusaetzlich gemerkter "letzter
+        # Fehler" wurde nirgends gelesen und ist weg.
         self.letzte_vorschauversuche = []
         for pfad, abfrage in versuche:
             try:
@@ -528,7 +569,6 @@ class ImmichClient:
                     timeout=VORSCHAU_TIMEOUT)
             except ImmichError as exc:
                 self.letzte_vorschauversuche.append(f"{pfad}: {exc}")
-                letzter = exc
                 # Ist der Server gar nicht erreichbar, helfen die
                 # anderen Schreibweisen auch nicht - sie kosten nur
                 # dieselbe Wartezeit noch dreimal.
@@ -551,12 +591,7 @@ class ImmichClient:
                 # 200 mit JSON oder einer Anmeldeseite: der Server hat
                 # geantwortet, aber kein Bild geliefert. Das als Vorschau
                 # weiterzureichen ergaebe eine kaputte Kachel.
-                letzter = ImmichError(
-                    f"Antwort ist kein Bild ({len(payload)} B)", status)
                 continue
-            letzter = ImmichError(_error_text(status, payload), status)
-        if letzter is not None:
-            self.letzter_vorschaufehler = str(letzter)
         return None
 
     def delete_assets(self, asset_ids: list[str], endgueltig: bool = False) -> int:

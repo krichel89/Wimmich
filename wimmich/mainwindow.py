@@ -626,6 +626,15 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self._open_settings)
 
+        # Der Leerhinweis verweist seit jeher auf „Ordner hinzufügen" -
+        # die Aktion selbst hing an keinem Menü und war nicht erreichbar
+        # (QK 13.08.2026).
+        ordner_action = QAction("Ordner hinzufügen …", self)
+        ordner_action.setToolTip(
+            "Einen Fotoordner in die Bibliothek aufnehmen. Wimmich liest "
+            "ihn nur - es wird nichts verschoben oder umbenannt.")
+        ordner_action.triggered.connect(self._add_library)
+
         clear_action = QAction("Vorschau-Cache leeren", self)
         clear_action.triggered.connect(self._clear_cache)
 
@@ -655,6 +664,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
 
         leiste = self.menuBar()
         menu_datei = leiste.addMenu("&Datei")
+        menu_datei.addAction(ordner_action)
         menu_datei.addAction(scan_action)
         menu_datei.addSeparator()
         self.export_action = QAction("Auswahl exportieren …", self)
@@ -990,6 +1000,13 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                                lambda: self._album_loeschen(album_id))
             menu.addSeparator()
 
+        if data and data[0] == "sammlung":
+            anzahl = self._sammlung_zahl()
+            leeren = menu.addAction(f"Sammlung leeren ({anzahl}) …",
+                                    self._sammlung_leeren)
+            leeren.setEnabled(bool(anzahl))
+            menu.addSeparator()
+
         menu.addAction("Baum ganz aufklappen", self._expand_all_folders)
         menu.addAction("Baum wieder zuklappen", self._collapse_all_folders)
 
@@ -1115,7 +1132,10 @@ class MainWindow(ServerbilderMixin, QMainWindow):
     # -- Vorläufige Sammlung -------------------------------------------
 
     def _sammlung_von_auswahl(self) -> None:
-        """Taste B und Menü: Auswahl aufnehmen - in der Sammlung: entfernen."""
+        """Taste S: Auswahl aufnehmen - in der Sammlung: wieder entfernen.
+
+        NICHT B - das ist in der Lupe vorher/nachher.
+        """
         rows = sorted({idx.row() for idx in self.grid.selectedIndexes()})
         if not rows and self.in_loupe:
             rows = [self._loupe_row]
@@ -1519,9 +1539,6 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             # Die Liste hat sich unter der Lupe verändert - zurück ins Raster
             self._show_grid()
         self._update_status(gezeigt)
-
-    def _run_search(self) -> None:
-        self._refresh_view()
 
     def _search_entered(self) -> None:
         """Enter in der Suchleiste: suchen und den Fokus zurückgeben,
@@ -3489,13 +3506,21 @@ def _html_escape(text: str) -> str:
 
 
 def _info_html(item: dict) -> str:
+    """Die Einblendung in der Lupe als Rich-Text.
+
+    Kamera, Objektiv und Dateiname kommen aus der Datei bzw. vom Server
+    und koennen alles enthalten - ein „<" darin zerlegte bisher die
+    Anzeige. Maskiert wird wie in loupe_title. (Gemessen 0.3.43: ein
+    QLabel holt bei <img src=http://…> NICHTS aus dem Netz, es ging also
+    nur um die Darstellung.)
+    """
     rows = []
     if item.get("taken_at"):
-        rows.append(item["taken_at"])
+        rows.append(_html_escape(str(item["taken_at"])))
     if item.get("camera"):
-        rows.append(item["camera"])
+        rows.append(_html_escape(str(item["camera"])))
     if item.get("lens"):
-        rows.append(item["lens"])
+        rows.append(_html_escape(str(item["lens"])))
     exif_bits = []
     if item.get("focal_length"):
         exif_bits.append(f"{item['focal_length']:g} mm")
@@ -3513,7 +3538,7 @@ def _info_html(item: dict) -> str:
         rows.append(_dateigroesse(int(item["filesize"])))
     if int(item.get("stack_count") or 1) > 1:
         rows.append(f"Stapel aus {item['stack_count']} Dateien")
-    rows.append(item["filename"])
+    rows.append(_html_escape(str(item["filename"])))
     return "<br>".join(rows)
 
 

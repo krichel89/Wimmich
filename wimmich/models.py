@@ -19,6 +19,15 @@ from . import marks, previews, remote_thumbs, theme, thumbs
 
 REMOTE_PAUSE = 5.0     # Sekunden Ruhe, bevor eine Serverkachel neu versucht wird
 
+# So viele Kachelbilder haelt das Modell hoechstens im Speicher.
+# GEMESSEN 0.3.42: eine Kachel 256x171 belegt 173 KB, 600 also rund
+# 104 MB. Ohne Deckel wuchs der Verbrauch beim Durchscrollen ungebremst
+# weiter - hochgerechnet gut 10 GB bei 60 000 Aufnahmen. Ein Bildschirm
+# zeigt im dichten Raster etwa 35 Kacheln, 600 sind also gut siebzehn
+# Bildschirmfuellungen Vorrat. Nachladen kostet aus dem Cache 0,13 ms.
+MAX_VORSCHAUEN = 600
+BEHALTEN_NACH_DECKEL = 480   # beim Aufraeumen gleich auf einmal freimachen
+
 ROLE_PATH = Qt.ItemDataRole.UserRole + 1
 ROLE_ID = Qt.ItemDataRole.UserRole + 2
 ROLE_RATING = Qt.ItemDataRole.UserRole + 3
@@ -145,6 +154,9 @@ class PhotoModel(QAbstractListModel):
         self._serverfehler_gemeldet = ""
 
         self._placeholder = QPixmap()   # leer = Delegate zeichnet Platzhalter
+        # Zuletzt gefragte Zeile - danach richtet sich, was beim
+        # Aufraeumen als Erstes fliegt (das Entfernteste).
+        self._letzte_zeile = 0
         # Pfad -> Schrittfolge als JSON. Frueher nur eine Menge von
         # Pfaden; die Schritte werden jetzt gebraucht, damit die Kachel
         # das BEARBEITETE Bild zeigen kann.
@@ -414,6 +426,7 @@ class PhotoModel(QAbstractListModel):
     # -- Vorschauen ----------------------------------------------------
 
     def _pixmap_for(self, row: int, item: dict) -> QPixmap:
+        self._letzte_zeile = row
         pixmap = self._pixmaps.get(row)
         if pixmap is not None:
             return pixmap
@@ -441,9 +454,24 @@ class PhotoModel(QAbstractListModel):
 
     def _thumb_ready(self, row: int, cache_file: str) -> None:
         pixmap = previews.pixmap_aus_datei(cache_file)
-        self._pixmaps[row] = pixmap
+        self._merke_vorschau(row, pixmap)
         self._masse_nachtragen(row, pixmap)
         self._touch(row)
+
+    def _merke_vorschau(self, row: int, pixmap: QPixmap) -> None:
+        """Kachelbild ablegen und den Speicher deckeln."""
+        self._pixmaps[row] = pixmap
+        if len(self._pixmaps) <= MAX_VORSCHAUEN:
+            return
+        # Das Entfernteste zuerst: was gerade zu sehen ist, liegt nah an
+        # der zuletzt gefragten Zeile und bleibt. Eine verworfene Zeile
+        # muss auch aus _requested heraus, sonst wird sie nie wieder
+        # geholt und bliebe fuer immer ein Platzhalter.
+        mitte = self._letzte_zeile
+        fliegen = sorted(self._pixmaps, key=lambda r: -abs(r - mitte))
+        for r in fliegen[:len(self._pixmaps) - BEHALTEN_NACH_DECKEL]:
+            self._pixmaps.pop(r, None)
+            self._requested.discard(r)
 
     def _masse_nachtragen(self, row: int, pixmap: QPixmap) -> None:
         """Bildmasse aus der Vorschau nachtragen ODER richtigstellen.
@@ -518,7 +546,7 @@ class PhotoModel(QAbstractListModel):
                 self.serverfehler.emit(grund)
             self._touch(row)
             return
-        self._pixmaps[row] = self._placeholder
+        self._merke_vorschau(row, self._placeholder)
         self._touch(row)
 
     def kachel_stand(self) -> tuple[int, int, int]:

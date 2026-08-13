@@ -12,6 +12,6 @@ JEDE GEWÄHRLEISTUNG - sogar ohne die stillschweigende Gewährleistung der
 MARKTGÄNGIGKEIT oder EIGNUNG FÜR EINEN BESTIMMTEN ZWECK.
 """
 
-__version__ = "0.3.41"
+__version__ = "0.3.43"
 APP_NAME = "Wimmich"
 LICENSE_SHORT = "GNU GPL v3 oder später"

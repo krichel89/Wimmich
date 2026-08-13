@@ -477,7 +477,6 @@ class ServerbilderMixin:
         # daran sind Aktionen wie „Zuschnitt aufheben" abgestürzt.
         self._stack_edits = EditStack()
         self._loupe_small = None
-        self._loupe_full = None
         self._crop_mode = False
         self.crop_bar.setVisible(False)
         self._set_tool(TOOL_NONE)

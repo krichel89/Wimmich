@@ -57,7 +57,6 @@ class SyncWorker(QObject):
         self._last_progress = 0.0
         self._zurueckgestellt: set[int] = set()
         self._letzter_fehler = ""
-        self._abgebrochen = False
         self._abgelehnte_typen: set[str] = set()
 
     def cancel(self) -> None:
@@ -230,7 +229,6 @@ class SyncWorker(QObject):
                             result.errors.append(
                                 f"Nach {misserfolge} Fehlversuchen hintereinander "
                                 f"abgebrochen — der Server nimmt nichts an.")
-                            self._abgebrochen = True
                             self._db.commit()
                             return
 
@@ -280,50 +278,6 @@ class SyncWorker(QObject):
 
         self._db.set_immich(photo_id, asset_id or "", row.get("checksum"))
         if duplikat:
-            result.already_there += 1
-        else:
-            result.uploaded += 1
-        return True
-
-    def _upload_one(self, client: ImmichClient, photo_id: int, row: dict,
-                    result: SyncResult) -> bool:
-        """Eine Datei hochladen. Liefert True bei Erfolg.
-
-        Bei Misserfolg wird die Datei NICHT als erledigt vermerkt (sie soll
-        beim nächsten Lauf wieder drankommen) - deshalb muss der Aufrufer
-        sie für DIESEN Lauf zurückstellen, sonst zieht die Arbeitsliste
-        immer wieder dieselben Dateien und der Abgleich endet nie.
-        """
-        # Sidecar nur bei RAW mitschicken. Bei einem JPEG steckt XMP in der
-        # Datei selbst; die danebenliegende BILD.xmp gehört zur RAW-Fassung
-        # und hätte am JPEG nichts zu suchen.
-        sidecar = Path(row["path"]).with_suffix(".xmp")
-        send_sidecar = bool(row.get("is_raw")) and sidecar.exists()
-        try:
-            asset_id, duplicate = client.upload(
-                row["path"],
-                checksum=row.get("checksum"),
-                sidecar=str(sidecar) if send_sidecar else None,
-            )
-        except (ImmichError, OSError) as exc:
-            result.failed += 1
-            if len(result.errors) < 20:
-                result.errors.append(f"{row['filename']}: {exc}")
-            self._letzter_fehler = str(exc)
-            if ist_dauerhafter_fehler(str(exc)):
-                # Der Server nimmt diesen Dateityp grundsaetzlich nicht.
-                # Leere Kennung merken, damit die Datei nicht bei jedem
-                # Lauf erneut angeboten wird - und den Abgleich nicht
-                # wegen einer Eigenart des Servers abbrechen lassen.
-                self._db.set_immich(photo_id, "", row.get("checksum"))
-                result.skipped += 1
-                result.failed -= 1
-                self._abgelehnte_typen.add(Path(row["path"]).suffix.lower())
-                return True
-            return False
-
-        self._db.set_immich(photo_id, asset_id or "", row.get("checksum"))
-        if duplicate:
             result.already_there += 1
         else:
             result.uploaded += 1

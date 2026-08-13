@@ -530,7 +530,8 @@ Strg+, oder „Einstellungen" in der Werkzeugleiste. Drei Reiter:
 
 - **Bibliothek** — Ordner hinzufügen und entfernen. Beim Entfernen
   verschwinden nur die Einträge aus dem Index; die Bilder auf der Platte
-  bleiben unangetastet.
+  bleiben unangetastet. Einen Ordner aufnehmen geht seit 0.3.43 auch
+  direkt über Datei → „Ordner hinzufügen …".
 - **Ansicht** — Kachelgröße, Vorschaugröße, wer den Stapel vertritt,
   Sprache der Farbmarkierungen, ob XMP geschrieben wird.
 - **Immich** — Server, Schlüssel, Hochladen, Personen, laufender
@@ -731,6 +732,15 @@ eine bestimmte Immich-Version:
   Version→Pfad ist nirgends verlässlich dokumentiert.
 - `deviceAssetId`/`deviceId` verlangen ältere Server, neuere lehnen sie
   ab. Wimmich schickt sie mit und lässt sie beim ersten Ablehnen weg.
+  Entschieden wird an der ANTWORT des Servers, nicht an einem gemerkten
+  Schalter — sonst verlieren gleichzeitige Uploads ein Rennen (seit
+  0.3.42; gemessen: vorher scheiterten 3 von 8 Uploads bei vier
+  Strängen).
+- Umleitungen auf einen anderen Rechner werden ABGELEHNT. `urllib`
+  würde den `x-api-key` mitschicken; ein untergeschobenes 302 reichte
+  sonst, um den Schlüssel abzugreifen. Umleitungen innerhalb desselben
+  Servers (gleiches Verfahren, gleicher Wirt) gehen durch. Als
+  Serveradresse sind nur `http://` und `https://` zugelassen.
 
 ### Laufender Abgleich
 
