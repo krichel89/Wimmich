@@ -49,6 +49,8 @@ IMMICH_RECHTE: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     )),
     ("person", (
         ("read", "Personen aus Immichs Gesichtserkennung holen"),
+        ("update", "Person umbenennen (Erkunden → Personen)"),
+        ("merge", "zwei Personen zusammenführen"),
     )),
     ("user", (
         ("read", "eigener Anmeldename bei „Verbindung prüfen“"),

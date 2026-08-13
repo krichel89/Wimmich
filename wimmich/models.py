@@ -98,6 +98,28 @@ class _ThumbTask(QRunnable):
             self._signals.done.emit(row, str(result))
 
 
+class _PersonThumbTask(QRunnable):
+    """Holt das Gesichtsbildchen einer Person fuer die Rasterkachel."""
+
+    def __init__(self, row: int, person_id: str, client, signals) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._args = (row, person_id, client)
+        self._signals = signals
+
+    def run(self) -> None:
+        row, person_id, client = self._args
+        try:
+            daten = remote_thumbs.fetch_person(client, person_id)
+        except Exception:            # Netzfehler darf keine Kachel killen
+            daten = None
+        if daten:
+            self._signals.done.emit(
+                row, str(remote_thumbs.person_cache_path(person_id)))
+        else:
+            self._signals.fail.emit(row)
+
+
 class _RemoteThumbTask(QRunnable):
     """Holt die Vorschau eines Bildes, das nur auf dem Server liegt.
 
@@ -432,6 +454,17 @@ class PhotoModel(QAbstractListModel):
             return pixmap
         if row not in self._requested:
             self._requested.add(row)
+            if item.get("_person"):
+                # Gesichter haengen am selben Deckel und derselben Pause
+                # wie die Serverkacheln - nur der Weg zum Server ist ein
+                # anderer.
+                letzter = self._remote_fehler.get(row)
+                if letzter is not None and time.monotonic() - letzter < REMOTE_PAUSE:
+                    self._requested.discard(row)
+                    return self._placeholder
+                self._pool.start(_PersonThumbTask(
+                    row, item["person_id"], self._immich_client, self._signals))
+                return self._placeholder
             if item.get("_remote"):
                 letzter = self._remote_fehler.get(row)
                 if letzter is not None and time.monotonic() - letzter < REMOTE_PAUSE:
@@ -531,7 +564,7 @@ class PhotoModel(QAbstractListModel):
 
     def _thumb_failed(self, row: int) -> None:
         item = self._rows[row] if 0 <= row < len(self._rows) else {}
-        if item.get("_remote"):
+        if item.get("_remote") or item.get("_person"):
             # Server-Vorschauen NICHT dauerhaft aufgeben: der Server kann
             # beim Start noch nicht erreichbar gewesen sein oder die
             # Verbindung kurz gehangen haben. Zeile wieder freigeben,

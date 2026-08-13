@@ -718,6 +718,67 @@ class ImmichClient:
                 break
         return result
 
+    def person_thumbnail(self, person_id: str) -> bytes | None:
+        """Gesichtsbildchen einer Person - GET /people/{id}/thumbnail.
+
+        Keine Ausnahme bei Misserfolg: fehlt das Bild (der Server hat es
+        noch nicht gerechnet) oder kann der Server den Weg nicht, bleibt
+        die Kachel eben leer. Accept MUSS auf Bilddaten stehen, sonst
+        antwortet ein regeltreuer Server mit 406 - dieselbe Falle wie bei
+        den Bildvorschauen.
+        """
+        status, payload = self._request(
+            "GET", f"{self._path('/people', '/person')}/{person_id}/thumbnail",
+            extra_headers={"Accept": "image/*, */*"},
+            timeout=VORSCHAU_TIMEOUT)
+        if status < 400 and _sieht_nach_bild_aus(payload):
+            return payload
+        return None
+
+    def person_aendern(self, person_id: str, name: str | None = None,
+                       versteckt: bool | None = None) -> Person:
+        """Person umbenennen oder verstecken - PUT /people/{id}.
+
+        Braucht am Schluessel das Recht `person.update`; ohne das
+        antwortet der Server mit 403. Geschickt wird nur, was wirklich
+        geaendert werden soll: ein mitgesendetes leeres Feld wuerde den
+        vorhandenen Wert loeschen.
+        """
+        rumpf: dict = {}
+        if name is not None:
+            rumpf["name"] = name
+        if versteckt is not None:
+            rumpf["isHidden"] = bool(versteckt)
+        if not rumpf:
+            raise ImmichError("Nichts zu ändern")
+        data = self._json(
+            "PUT", f"{self._path('/people', '/person')}/{person_id}",
+            body=rumpf) or {}
+        return Person(id=data.get("id") or person_id,
+                      name=data.get("name") or "",
+                      hidden=bool(data.get("isHidden")))
+
+    def personen_zusammenfuehren(self, ziel_id: str,
+                                 quell_ids: list[str]) -> tuple[list[str], list[str]]:
+        """Personen in eine zusammenfuehren - POST /people/{id}/merge.
+
+        Braucht `person.merge`. Die Gesichter der Quellen haengen danach
+        am Ziel, die Quellen sind weg. Immich antwortet je Quelle mit
+        {id, success} - deshalb wird hier PRO EINTRAG ausgewertet und
+        nicht am Gesamtstatus: ein Teilerfolg ist moeglich.
+        """
+        if not quell_ids:
+            return [], []
+        antwort = self._json(
+            "POST", f"{self._path('/people', '/person')}/{ziel_id}/merge",
+            body={"ids": list(quell_ids)}) or []
+        gelungen = [e["id"] for e in antwort
+                    if isinstance(e, dict) and e.get("success") and e.get("id")]
+        gescheitert = [e["id"] for e in antwort
+                       if isinstance(e, dict) and not e.get("success")
+                       and e.get("id")]
+        return gelungen, gescheitert
+
     def vorschlaege(self, typ: str, **einschraenkung) -> list[str]:
         """Werteliste zu einem Feld - fuer die Auswahl in der Oberflaeche.
 

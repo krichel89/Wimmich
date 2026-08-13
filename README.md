@@ -354,7 +354,7 @@ hier sitzen. **F1** zeigt sie im Programm.
 | darin Enter / Esc | übernehmen / abbrechen · Shift+C hebt auf |
 | B | Vorher / Nachher |
 | F | Vollbild — nur das Bild, keine Leisten |
-| Tab | Leisten, Baum und Panel ein/aus |
+| Tab | Leisten, linke Spalte (mit Suchfeld) und Panel ein/aus |
 | I | Bildangaben |
 | Strg+A / Strg+D | alles wählen / Auswahl aufheben |
 | Strg+Z | Bearbeitungsschritt zurück |
@@ -524,6 +524,25 @@ Nachbarwerte.
 **Bei einem RAW+JPG-Stapel wird das JPEG bearbeitet.** Eine RAW-Datei
 lässt sich nicht sinnvoll pixelweise verändern.
 
+## Personen
+
+Unter **Erkunden → Personen** stehen die benannten Personen, jede mit
+ihrem Gesichtsbildchen vom Server (der Cache liegt neben den
+Vorschauen und darf jederzeit gelöscht werden). Rechtsklick:
+
+- **Umbenennen …**
+- **Andere Person hier aufgehen lassen …** — die angeklickte Person
+  bleibt, die gewählte geht in ihr auf. Das geschieht auch auf dem
+  Server und lässt sich nicht zurücknehmen.
+
+Erkannte Gesichter ohne Namen stehen NICHT einzeln im Baum, sondern
+hinter dem Eintrag **Ohne Namen (n)** — ein Klick zeigt sie als
+Kacheln im Raster, wo man sie an ihrem Gesicht erkennt. Dort per
+Rechtsklick oder Doppelklick benennen, oder in eine schon benannte
+Person schieben. Ohne Verbindung zu Immich sind alle diese Einträge
+ausgegraut: geändert wird immer zuerst auf dem Server, danach zieht
+Wimmich nach.
+
 ## Einstellungen
 
 Strg+, oder „Einstellungen" in der Werkzeugleiste. Drei Reiter:
@@ -639,7 +658,8 @@ Getestet mit echten Dateien und exiftool 12.76:
   Shift+C, Vorher/Nachher, Bildangaben, Strg+Z, G und Esc
 - Tempo gemessen: Reglerschritt 708 ms → 6 ms beim Ziehen; scharfes
   Nachziehen 10 ms im eingepassten Zustand (598 ms bei 100 % Zoom)
-- Vollbild und Tab blenden Werkzeugleiste, Filterleiste, Baum, Panel und
+- Vollbild und Tab blenden Werkzeugleiste, Filterleiste, die ganze linke
+  Spalte samt Suchfeld (seit 0.3.45), Panel und
   Statuszeile aus und wieder ein
 - Zuschnittleiste: Knöpfe setzen das Format, Zifferntasten ebenso,
   hoch/quer kippt, Enter blendet die Leiste wieder aus
@@ -689,7 +709,7 @@ Einrichten über „Immich einrichten": Serveradresse und API-Schlüssel
 (Immich → Kontoeinstellungen → API-Schlüssel). Der Knopf „Verbindung
 prüfen" sagt sofort, ob es klappt. Abgleich mit F6.
 
-**Nötige Rechte am Schlüssel (14).** Sie stehen seit 0.3.41 auch im
+**Nötige Rechte am Schlüssel (16).** Sie stehen seit 0.3.41 auch im
 Einstellungsfenster, in Immichs eigener Gruppierung und zum Abhaken —
 Immich bietet dort nur Kreuzchen, ein Kopierblock nützt also nichts:
 
@@ -698,9 +718,13 @@ Immich bietet dort nur Kreuzchen, ein Kopierblock nützt also nichts:
 | `asset` | read, view, download, upload, delete |
 | `album` | read, create, update, delete |
 | `albumAsset` | create, delete |
-| `person` | read |
+| `person` | read, update, merge |
 | `user` | read |
 | `server` | about |
+
+`person.update` und `person.merge` kamen mit 0.3.44 dazu (Umbenennen
+und Zusammenführen im Baum unter Erkunden → Personen); ohne sie
+antwortet der Server mit 403, alles andere läuft weiter.
 
 `asset.view` ist von `asset.read` und `asset.download` getrennt und wird
 leicht übersehen: ohne dieses Recht antwortet der Server bei jeder

@@ -40,6 +40,15 @@ STATE = {
              "asset-o-3": "Berlin"},
     "kluge_treffer": ["asset-k-1", "asset-k-2"],
     "vorschlaege_fehlen": False,   # True = Server kennt den Endpunkt nicht
+    # Personen: welche Bilder haengen an wem (fuers Zusammenfuehren)
+    "person_bilder": {"per-1": ["asset-p-1", "asset-p-2"],
+                      "per-2": ["asset-p-3"]},
+    # True = dem Schluessel fehlen person.update/person.merge (HTTP 403)
+    "personen_schreibgeschuetzt": False,
+    # True = alter Server ohne /people/{id}/merge (HTTP 404)
+    "merge_fehlt": False,
+    # Gesichtsbildchen je Person: Kennung -> JPEG-Bytes (leer = 404)
+    "gesichter": {},
 }
 
 
@@ -118,6 +127,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"id": album_id, "albumName": name,
                                         "assets": assets})
 
+        person_id = self._thumb_aus_pfad(path)
+        if person_id:
+            if self._person(person_id) is None:
+                return self._send(404, {"message": "Not found"})
+            bild = STATE["gesichter"].get(person_id)
+            if not bild:
+                return self._send(404, {"message": "No thumbnail"})
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(bild)))
+            self.end_headers()
+            self.wfile.write(bild)
+            return
         if path in ("/api/people", "/api/person"):
             if path == "/api/people" and self._legacy():
                 return self._send(404, {"message": "Not found"})
@@ -198,6 +220,33 @@ class Handler(BaseHTTPRequestHandler):
 
         body = self._read_body()
 
+        ziel = self._merge_aus_pfad(path)
+        if ziel:
+            if STATE["merge_fehlt"]:
+                return self._send(404, {"message": "Not found"})
+            if STATE["personen_schreibgeschuetzt"]:
+                return self._send(403, {"message": "Forbidden"})
+            if self._person(ziel) is None:
+                return self._send(400, {"message": "Person not found"})
+            data = json.loads(body or b"{}")
+            antwort = []
+            for quelle in data.get("ids") or []:
+                if quelle == ziel or self._person(quelle) is None:
+                    antwort.append({"id": quelle, "success": False,
+                                    "error": "not_found"})
+                    continue
+                # Bilder wandern mit, die Quelle verschwindet - genau das
+                # macht Immich beim Zusammenfuehren.
+                bilder = STATE["person_bilder"]
+                bilder.setdefault(ziel, [])
+                for kennung in bilder.pop(quelle, []):
+                    if kennung not in bilder[ziel]:
+                        bilder[ziel].append(kennung)
+                STATE["people"] = [p for p in STATE["people"]
+                                   if p["id"] != quelle]
+                antwort.append({"id": quelle, "success": True})
+            return self._send(200, antwort)
+
         if path in ("/api/assets/bulk-upload-check", "/api/asset/bulk-upload-check"):
             plural = path.startswith("/api/assets")
             if plural == self._legacy():
@@ -274,9 +323,53 @@ class Handler(BaseHTTPRequestHandler):
                     inhalt.append(kennung)
                 antwort.append({"id": kennung, "success": neu})
             return self._send(200, antwort)
+        person_id = self._person_aus_pfad(path)
+        if person_id:
+            if STATE["personen_schreibgeschuetzt"]:
+                return self._send(403, {"message": "Forbidden"})
+            person = self._person(person_id)
+            if person is None:
+                return self._send(400, {"message": "Person not found"})
+            data = json.loads(body or b"{}")
+            if "name" in data:
+                person["name"] = data["name"]
+            if "isHidden" in data:
+                person["isHidden"] = bool(data["isHidden"])
+            return self._send(200, dict(person, birthDate=None,
+                                        thumbnailPath="/thumb.jpg"))
         if "/assets" in path or "/asset" in path:
             return self._send(200, [{"id": "x", "success": True}])
         return self._send(404, {"message": "Not found"})
+
+    # -- Personen ------------------------------------------------------
+
+    @staticmethod
+    def _person(person_id: str):
+        for p in STATE["people"]:
+            if p["id"] == person_id:
+                return p
+        return None
+
+    def _person_aus_pfad(self, path: str) -> str:
+        """/api/people/<id> (aber NICHT /api/people/<id>/merge)."""
+        teile = path.split("?")[0].strip("/").split("/")
+        if len(teile) == 3 and teile[0] == "api" and teile[1] in ("people", "person"):
+            return teile[2]
+        return ""
+
+    def _thumb_aus_pfad(self, path: str) -> str:
+        teile = path.split("?")[0].strip("/").split("/")
+        if (len(teile) == 4 and teile[0] == "api"
+                and teile[1] in ("people", "person") and teile[3] == "thumbnail"):
+            return teile[2]
+        return ""
+
+    def _merge_aus_pfad(self, path: str) -> str:
+        teile = path.split("?")[0].strip("/").split("/")
+        if (len(teile) == 4 and teile[0] == "api"
+                and teile[1] in ("people", "person") and teile[3] == "merge"):
+            return teile[2]
+        return ""
 
     def do_PATCH(self):
         path = self._path()

@@ -132,6 +132,56 @@ def fetch(client, immich_id: str, gross: bool = False) -> bytes | None:
     return daten
 
 
+# -- Gesichter -----------------------------------------------------------
+
+def person_cache_path(person_id: str) -> Path:
+    """Ablageort eines Gesichtsbildchens - eigene Endung, gleicher Ort."""
+    sauber = "".join(z for z in person_id if z.isalnum() or z in "-_")
+    return REMOTE_DIR / (sauber + "_g.jpg")
+
+
+def fetch_person(client, person_id: str) -> bytes | None:
+    """Gesichtsbildchen liefern - aus dem Cache, sonst einmal vom Server.
+
+    Teilt sich mit den Bildvorschauen die Pause fuer einen toten Server:
+    haengt Immich, sollen nicht auch noch fuenfzig Gesichter in die
+    Zeitgrenze laufen.
+    """
+    global _letzte_meldung, _tot_bis
+    pfad = person_cache_path(person_id)
+    try:
+        if pfad.exists():
+            return pfad.read_bytes()
+    except OSError:
+        pass
+
+    if time.monotonic() < _tot_bis:
+        return None
+    if client is None:
+        client = _client_bei_bedarf()
+    if client is None:
+        return None
+
+    try:
+        daten = client.person_thumbnail(person_id)
+    except Exception as exc:
+        _letzte_meldung = f"Gesicht {person_id}: {exc}"
+        _tot_bis = time.monotonic() + TOTPAUSE
+        return None
+    if not daten:
+        return None
+    _tot_bis = 0.0
+    with _sperre:
+        try:
+            REMOTE_DIR.mkdir(parents=True, exist_ok=True)
+            vorlaeufig = pfad.with_suffix(".part")
+            vorlaeufig.write_bytes(daten)
+            vorlaeufig.replace(pfad)
+        except OSError:
+            pass
+    return daten
+
+
 def clear() -> int:
     """Cache leeren. Ergebnis: Anzahl gelöschter Dateien."""
     if not REMOTE_DIR.exists():

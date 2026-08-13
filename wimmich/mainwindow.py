@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QEvent, QFileSystemWatcher, Qt, QThread, QThreadPool, QTimer,
+    QEvent, QFileSystemWatcher, QSize, Qt, QThread, QThreadPool, QTimer,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -90,6 +90,29 @@ class FolderTree(QTreeWidget):
     das Element tatsaechlich Kinder hat (siehe _add_children).
     """
 
+    # Halbe Kantenlaenge des Dreiecks. 0.3.45: von 3,6 auf 5,0 - der
+    # alte Pfeil war kaum zu treffen und kaum zu sehen.
+    PFEIL = 5.0
+
+    def mousePressEvent(self, event) -> None:
+        """Ein Klick LINKS vom Text klappt auf und zu.
+
+        GEMESSEN 0.3.45: mit der Regel `QTreeWidget::branch` im
+        Stylesheet uebernimmt Qts Stylesheet-Stil die Aufklappflaeche und
+        macht sie faktisch null Pixel breit - von x=0 bis x=14 klappte
+        nur x=0 auf. Deshalb wird hier selbst zugeschlagen: die ganze
+        Einrueckung vor dem Text zaehlt als Pfeil. Doppelklick auf den
+        Titel klappt weiterhin ueber Qts eigenen Weg auf
+        (expandsOnDoubleClick).
+        """
+        item = self.itemAt(event.position().toPoint())
+        if (item is not None and item.childCount()
+                and event.position().x() < self.visualItemRect(item).x()):
+            item.setExpanded(not item.isExpanded())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def drawBranches(self, painter, rect, index) -> None:
         item = self.itemFromIndex(index)
         if item is None or item.childCount() == 0:
@@ -100,7 +123,7 @@ class FolderTree(QTreeWidget):
         painter.setBrush(QBrush(QColor(theme.TEXT_MUTED)))
 
         cx, cy = rect.center().x(), rect.center().y()
-        size = 3.6
+        size = self.PFEIL
         path = QPainterPath()
         if item.isExpanded():
             # Spitze nach unten
@@ -150,6 +173,11 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._server_signale = _ServerSignale()
         self._server_signale.orte_da.connect(self._orte_da)
         self._server_signale.treffer_da.connect(self._treffer_da)
+        self._server_signale.person_fertig.connect(self._person_fertig)
+        self._server_signale.person_bild.connect(self._person_bild)
+        # Personenkennung -> QIcon; verhindert, dass jeder Neuaufbau des
+        # Baums alle Gesichter erneut von der Platte liest.
+        self._gesicht_cache: dict = {}
         self._server_treffer: list[str] = []
         self._such_anlass = ""
         self._remote_wartet = ""
@@ -337,7 +365,10 @@ class MainWindow(ServerbilderMixin, QMainWindow):
 
         self.tree = FolderTree()
         self.tree.setHeaderHidden(True)
-        self.tree.setIndentation(14)
+        # 20 statt 14: der groessere Pfeil braucht Platz, und die
+        # Trefferflaeche zum Aufklappen ist genau diese Spalte.
+        self.tree.setIndentation(20)
+        self.tree.setIconSize(QSize(28, 28))
         self.tree.setAnimated(True)
         self.tree.setMinimumWidth(180)
         self.tree.itemSelectionChanged.connect(self._folder_selected)
@@ -345,6 +376,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
         links_layout.addWidget(self.tree, 1)
+        self.links_spalte = links
         splitter.addWidget(links)
 
         self.model = PhotoModel(
@@ -364,7 +396,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self.grid.setMouseTracking(True)   # damit die Kachel beim Ueberfahren reagiert
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.grid.doubleClicked.connect(lambda idx: self._show_loupe(idx.row()))
+        self.grid.doubleClicked.connect(self._grid_doppelklick)
         self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._grid_menu)
 
@@ -878,6 +910,22 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                                        "Immich-Abgleich angelegt")
                     item.setText(0, label + "  \u2022")
                 root.addChild(item)
+            if kind == "person":
+                # Unbenannte NICHT einzeln in den Baum - sie kaemen als
+                # fuenfzig Zeilen „(ohne Namen)" und waeren ohne Bild
+                # nicht auseinanderzuhalten. Ein Eintrag fuehrt ins
+                # RASTER, dort haben sie ihr Gesicht dabei.
+                ohne = [r for r in self.db.people(include_unnamed=True)
+                        if not (r["name"] or "").strip()]
+                if ohne:
+                    eintrag = QTreeWidgetItem([f"Ohne Namen ({len(ohne)})"])
+                    eintrag.setData(0, Qt.ItemDataRole.UserRole,
+                                    ("unbenannt", ""))
+                    eintrag.setToolTip(
+                        0, "Erkannte Gesichter ohne Namen — im Raster zum "
+                           "Benennen (Rechtsklick auf die Kachel)")
+                    root.addChild(eintrag)
+                self._gesichter_holen()
             if not rows:
                 hint = QTreeWidgetItem(
                     ["— noch keins (Rechtsklick: Neues Album) —"]
@@ -998,6 +1046,22 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                                lambda: self._album_umbenennen(album_id))
                 menu.addAction("Album löschen …",
                                lambda: self._album_loeschen(album_id))
+            menu.addSeparator()
+
+        if data and data[0] == "person":
+            person_id = data[1]
+            # Ohne Verbindung ausgrauen statt weglassen: die Aenderung
+            # geht IMMER zuerst an den Server (Regel aus 0.3.40).
+            hat_server = self.model._immich_client is not None
+            umbenennen = menu.addAction(
+                "Umbenennen …", lambda: self._person_umbenennen(person_id))
+            zusammen = menu.addAction(
+                "Andere Person hier aufgehen lassen …",
+                lambda: self._person_zusammenfuehren(person_id))
+            for aktion in (umbenennen, zusammen):
+                aktion.setEnabled(hat_server)
+                if not hat_server:
+                    aktion.setToolTip("Braucht eine Verbindung zu Immich")
             menu.addSeparator()
 
         if data and data[0] == "sammlung":
@@ -1479,6 +1543,10 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                     key, recursive=self.recursive_button.isChecked(),
                     order=self.sort_box.currentData(), **richtung, **common,
                 )
+            elif kind == "unbenannt":
+                rows = [_person_zeile(r) for r in
+                        self.db.people(include_unnamed=True)
+                        if not (r["name"] or "").strip()]
             elif kind == "album":
                 # Eigene Zuordnung UND Serverspiegel - ein selbst
                 # angelegtes Album zeigt seine Bilder sofort, auch wenn
@@ -1613,6 +1681,26 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self.grid.setCurrentIndex(index)
         rows = sorted({idx.row() for idx in self.grid.selectedIndexes()})
         if not rows:
+            return
+
+        gesichter = [r for r in rows
+                     if (self.model.row_data(r) or {}).get("_person")]
+        if gesichter:
+            # Gesichtskacheln koennen nichts von dem, was das normale
+            # Menue anbietet (keine Datei, keine Bewertung) - hier gibt
+            # es genau die zwei sinnvollen Sachen.
+            menu = QMenu(self)
+            person_id = self.model.row_data(gesichter[0])["person_id"]
+            benennen = menu.addAction(
+                "Person benennen …",
+                lambda: self._person_umbenennen(person_id))
+            zusammen = menu.addAction(
+                "In eine benannte Person schieben …",
+                lambda: self._gesicht_einordnen(person_id))
+            hat_server = self.model._immich_client is not None
+            for aktion in (benennen, zusammen):
+                aktion.setEnabled(hat_server and len(gesichter) == 1)
+            menu.exec(self.grid.viewport().mapToGlobal(position))
             return
 
         nur_server = [r for r in rows
@@ -1807,9 +1895,25 @@ class MainWindow(ServerbilderMixin, QMainWindow):
             self.grid.scrollTo(index)
         self._update_status(self._gesamt)
 
+    def _grid_doppelklick(self, index) -> None:
+        """Doppelklick im Raster: Lupe - ausser bei einem Gesicht.
+
+        Eine Gesichtskachel hat keine Datei; die Lupe zeigte sonst
+        „keine Vorschau". Stattdessen fuehrt der Doppelklick geradewegs
+        zum Benennen, denn genau dafuer ist die Ansicht da.
+        """
+        zeile = self.model.row_data(index.row()) or {}
+        if zeile.get("_person"):
+            if self.model._immich_client is not None:
+                self._person_umbenennen(zeile["person_id"])
+            return
+        self._show_loupe(index.row())
+
     def _show_loupe(self, row: int) -> None:
         if row < 0 or row >= self.model.rowCount():
             return
+        if (self.model.row_data(row) or {}).get("_person"):
+            return          # Gesichtskachel: es gibt nichts zu vergroessern
         self.pages.setCurrentIndex(1)
         self.panel_box.setVisible(self._chrome_visible and not self._panel_hidden)
         self.loupe_header.setVisible(self._chrome_visible)
@@ -2095,7 +2199,9 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._chrome_visible = visible
         self.menuBar().setVisible(visible)
         self._filterleiste_zeigen()
-        self.tree.setVisible(visible)
+        # Die GANZE linke Spalte, nicht nur der Baum: das Suchfeld stand
+        # sonst mit Tab weiter da (0.3.45).
+        self.links_spalte.setVisible(visible)
         self.statusBar().setVisible(visible)
         self.loupe_header.setVisible(visible and self.in_loupe)
         self.panel_box.setVisible(visible and self.in_loupe and not self._panel_hidden)
@@ -3437,6 +3543,31 @@ def _sortschluessel_fuer(sortierung: str):
     if sortierung == "filename":
         return lambda item: str(item.get("filename") or "").lower()
     return lambda item: str(item.get("taken_at") or "")
+
+
+def _person_zeile(row) -> dict:
+    """Ein unbenanntes Gesicht als Modellzeile fuers Raster.
+
+    Dieselben Schluessel wie eine Bildzeile, damit Raster und Delegate
+    nichts Besonderes koennen muessen - erkennbar allein an _person.
+    path bleibt leer: es GIBT keine Datei, und die Lupe haelt sich
+    deshalb heraus (_ist_person).
+    """
+    return {
+        "id": -1,
+        "_person": True,
+        "person_id": row["id"],
+        "immich_id": "",
+        "path": "",
+        "filename": "(ohne Namen)",
+        "folder": "Gesicht auf dem Server",
+        "taken_at": None,
+        "width": 1, "height": 1,      # Gesichter sind quadratisch
+        "rating": 0,
+        "label": None,
+        "stack_count": 1,
+        "is_raw": 0,
+    }
 
 
 def _remote_zeile(row) -> dict:

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QMessageBox, QTreeWidgetItem,
+    QApplication, QFileDialog, QInputDialog, QMessageBox, QTreeWidgetItem,
 )
 
 from . import APP_NAME, __version__, crashlog, previews, remote_thumbs, theme
@@ -78,6 +78,8 @@ class _ServerSignale(QObject):
 
     orte_da = pyqtSignal(list, str)        # Staedte, Fehlergrund
     treffer_da = pyqtSignal(str, list, str)  # Anlass, Kennungen, Fehlergrund
+    person_fertig = pyqtSignal(str, str, object, str)  # Aktion, Ziel, Ergebnis, Grund
+    person_bild = pyqtSignal(str, str)     # Personenkennung, Pfad zum Bild
 
 
 class _OrteTask(QRunnable):
@@ -103,6 +105,85 @@ class _OrteTask(QRunnable):
             crashlog.protokolliere("Ortsliste")
         try:
             self.signale.orte_da.emit(orte, grund)
+        except RuntimeError:
+            pass
+
+
+class _GesichtTask(QRunnable):
+    """Holt EIN Gesichtsbildchen fuer den Baum."""
+
+    def __init__(self, client, person_id: str, signale: _ServerSignale) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.client = client
+        self.person_id = person_id
+        self.signale = signale
+
+    def run(self) -> None:
+        try:
+            daten = remote_thumbs.fetch_person(self.client, self.person_id)
+        except Exception:
+            daten = None          # ohne Bild bleibt der Baum eben schlicht
+        if not daten:
+            return
+        try:
+            self.signale.person_bild.emit(
+                self.person_id,
+                str(remote_thumbs.person_cache_path(self.person_id)))
+        except RuntimeError:
+            pass
+
+
+class _PersonTask(QRunnable):
+    """Aendert eine Person auf dem SERVER, ohne das Fenster anzuhalten.
+
+    Der Server ist die Wahrheit: erst dort aendern, den lokalen Spiegel
+    danach nachziehen. Andersherum stuende in Wimmich ein Name, den
+    Immich nicht kennt, und der naechste Abgleich holte den alten
+    zurueck.
+    """
+
+    def __init__(self, client, aktion: str, ziel_id: str, wert,
+                 signale: _ServerSignale) -> None:
+        super().__init__()
+        self.client = client
+        self.aktion = aktion
+        self.ziel_id = ziel_id
+        self.wert = wert
+        self.signale = signale
+
+    def run(self) -> None:
+        ergebnis, grund = None, ""
+        try:
+            if self.aktion == "umbenennen":
+                person = self.client.person_aendern(self.ziel_id,
+                                                    name=self.wert)
+                ergebnis = person.name
+            else:
+                ergebnis = self.client.personen_zusammenfuehren(
+                    self.ziel_id, list(self.wert))
+        except ImmichError as exc:
+            status = getattr(exc, "status", 0)
+            # Erwartbare Faelle benennen, statt die rohe Meldung zu
+            # zeigen: 403 heisst fast immer, dass am Schluessel das
+            # Schreibrecht fehlt - das ist in den Einstellungen
+            # abzuhaken.
+            if status == 403:
+                recht = ("person.update" if self.aktion == "umbenennen"
+                         else "person.merge")
+                grund = (f"Dem API-Schlüssel fehlt das Recht {recht} — "
+                         "in Immich unter Kontoeinstellungen → "
+                         "API-Schlüssel nachtragen")
+            elif status == 404 and self.aktion != "umbenennen":
+                grund = "Dieser Server kann Personen nicht zusammenführen"
+            else:
+                grund = str(exc)
+        except Exception as exc:
+            grund = str(exc)
+            crashlog.protokolliere("Personen ändern")
+        try:
+            self.signale.person_fertig.emit(self.aktion, self.ziel_id,
+                                            ergebnis, grund)
         except RuntimeError:
             pass
 
@@ -584,6 +665,154 @@ class ServerbilderMixin:
         self._serversuche_freigeben(client is not None)
         if client is not None:
             self._orte_holen()
+
+    # -- Personen verwalten ---------------------------------------------
+
+    def _gesichter_holen(self) -> None:
+        """Fuer jede BENANNTE Person das Bildchen an den Baum haengen.
+
+        Schon geholte Symbole liegen in `_gesicht_cache` und werden
+        SOFORT gesetzt - sonst liefe bei jedem Neuaufbau des Baums (nach
+        jedem Abgleich, nach jedem Umbenennen) fuer jede Person wieder
+        eine Aufgabe an, nur um dieselbe Datei noch einmal zu lesen.
+        """
+        client = self.model._immich_client
+        for i in range(self._people_root.childCount()):
+            eintrag = self._people_root.child(i)
+            daten = eintrag.data(0, Qt.ItemDataRole.UserRole)
+            if not daten or daten[0] != "person":
+                continue
+            symbol = self._gesicht_cache.get(daten[1])
+            if symbol is not None:
+                eintrag.setIcon(0, symbol)
+            elif client is not None:
+                self._pool.start(_GesichtTask(client, daten[1],
+                                              self._server_signale))
+
+    def _person_bild(self, person_id: str, pfad: str) -> None:
+        """Bildchen merken und an den passenden Baumeintrag haengen."""
+        from PyQt6.QtGui import QIcon
+        symbol = QIcon(pfad)
+        if symbol.isNull():
+            return
+        self._gesicht_cache[person_id] = symbol
+        for i in range(self._people_root.childCount()):
+            eintrag = self._people_root.child(i)
+            daten = eintrag.data(0, Qt.ItemDataRole.UserRole)
+            if daten and daten[0] == "person" and daten[1] == person_id:
+                eintrag.setIcon(0, symbol)
+                return
+
+    def _person_name(self, person_id: str) -> str:
+        for row in self.db.people(include_unnamed=True):
+            if row["id"] == person_id:
+                return row["name"] or "(ohne Namen)"
+        return "(unbekannt)"
+
+    def _person_umbenennen(self, person_id: str) -> None:
+        client = self.model._immich_client
+        if client is None:
+            return
+        alt = self._person_name(person_id)
+        name, ok = QInputDialog.getText(
+            self, "Person umbenennen", "Neuer Name:",
+            text="" if alt == "(ohne Namen)" else alt)
+        name = name.strip()
+        if not ok or not name or name == alt:
+            return
+        self.statusBar().showMessage(
+            f"\u201e{alt}\u201c wird umbenannt …", 5000)
+        self._pool.start(_PersonTask(client, "umbenennen", person_id, name,
+                                     self._server_signale))
+
+    def _person_zusammenfuehren(self, ziel_id: str) -> None:
+        """Andere Personen in DIESE hineinziehen.
+
+        Richtung ausdruecklich benannt: das Ziel bleibt bestehen, die
+        gewaehlte Person geht darin auf. Immich macht es genauso -
+        POST /people/{ziel}/merge mit den Quellen im Rumpf.
+        """
+        client = self.model._immich_client
+        if client is None:
+            return
+        ziel = self._person_name(ziel_id)
+        andere = [(row["id"], row["name"]) for row in self.db.people()
+                  if row["id"] != ziel_id and row["name"]]
+        if not andere:
+            QMessageBox.information(
+                self, "Zusammenführen",
+                "Es gibt keine zweite benannte Person zum Zusammenführen.")
+            return
+        namen = [n for _, n in andere]
+        wahl, ok = QInputDialog.getItem(
+            self, "Personen zusammenführen",
+            f"Wer soll in \u201e{ziel}\u201c aufgehen?\n"
+            "Die gewählte Person verschwindet, ihre Gesichter hängen "
+            f"danach an \u201e{ziel}\u201c.",
+            namen, 0, False)
+        if not ok or not wahl:
+            return
+        quelle = next(i for i, n in andere if n == wahl)
+        if QMessageBox.question(
+                self, "Zusammenführen",
+                f"\u201e{wahl}\u201c in \u201e{ziel}\u201c aufgehen lassen?\n"
+                "Das geschieht auch auf dem Server und lässt sich nicht "
+                "zurücknehmen.") != QMessageBox.StandardButton.Yes:
+            return
+        self.statusBar().showMessage("Personen werden zusammengeführt …", 5000)
+        self._pool.start(_PersonTask(client, "zusammenfuehren", ziel_id,
+                                     [quelle], self._server_signale))
+
+    def _gesicht_einordnen(self, person_id: str) -> None:
+        """Ein unbenanntes Gesicht in eine BENANNTE Person schieben.
+
+        Umgekehrte Richtung zum Baum: hier ist die angeklickte Kachel die
+        QUELLE, die benannte Person das Ziel - sonst muesste man das
+        namenlose Haeufchen erst benennen, nur um es gleich wieder
+        verschwinden zu lassen.
+        """
+        client = self.model._immich_client
+        if client is None:
+            return
+        benannte = [(row["id"], row["name"]) for row in self.db.people()
+                    if row["name"]]
+        if not benannte:
+            QMessageBox.information(
+                self, "Einordnen",
+                "Es gibt noch keine benannte Person, in die das Gesicht "
+                "passen könnte.")
+            return
+        namen = [n for _, n in benannte]
+        wahl, ok = QInputDialog.getItem(
+            self, "Gesicht einordnen", "Zu welcher Person gehört es?",
+            namen, 0, False)
+        if not ok or not wahl:
+            return
+        ziel = next(i for i, n in benannte if n == wahl)
+        self.statusBar().showMessage("Gesicht wird eingeordnet …", 5000)
+        self._pool.start(_PersonTask(client, "zusammenfuehren", ziel,
+                                     [person_id], self._server_signale))
+
+    def _person_fertig(self, aktion: str, ziel_id: str, ergebnis,
+                       grund: str) -> None:
+        """Antwort des Servers uebernehmen - erst jetzt den Spiegel."""
+        if grund:
+            QMessageBox.warning(self, "Personen", grund)
+            return
+        if aktion == "umbenennen":
+            self.db.person_umbenennen(ziel_id, ergebnis)
+            meldung = f"Person heißt jetzt \u201e{ergebnis}\u201c"
+        else:
+            gelungen, gescheitert = ergebnis
+            self.db.personen_zusammenfuehren(ziel_id, gelungen)
+            meldung = (f"{len(gelungen)} Person(en) zusammengeführt"
+                       + (f", {len(gescheitert)} nicht" if gescheitert else ""))
+        self._reload_immich_tree()
+        # Steht gerade die Ansicht der Unbenannten offen, ist die eben
+        # benannte Person dort raus - die Kachel muss weg.
+        if self._selection and self._selection[0] in ("unbenannt", "person"):
+            self._refresh_view()
+        self.statusBar().showMessage(meldung, 8000)
 
     # -- Serversuche ----------------------------------------------------
 

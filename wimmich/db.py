@@ -699,6 +699,32 @@ class Database:
         )
         conn.commit()
 
+    def person_umbenennen(self, person_id: str, name: str) -> None:
+        """Nur den lokalen Spiegel nachziehen.
+
+        Der Server ist schon geaendert, wenn das hier gerufen wird -
+        damit der Baum sofort stimmt, statt bis zum naechsten Abgleich
+        den alten Namen zu zeigen.
+        """
+        self.conn.execute("UPDATE people SET name=? WHERE id=?",
+                          (name, person_id))
+        self.conn.commit()
+
+    def personen_zusammenfuehren(self, ziel_id: str,
+                                 quell_ids: list[str]) -> None:
+        """Spiegel nachziehen: Bilder ans Ziel, Quellen loeschen."""
+        conn = self.conn
+        for quelle in quell_ids:
+            if quelle == ziel_id:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO person_assets(person_id, immich_id) "
+                "SELECT ?, immich_id FROM person_assets WHERE person_id=?",
+                (ziel_id, quelle))
+            conn.execute("DELETE FROM person_assets WHERE person_id=?", (quelle,))
+            conn.execute("DELETE FROM people WHERE id=?", (quelle,))
+        conn.commit()
+
     def set_person_assets(self, person_id: str, immich_ids: list[str]) -> None:
         conn = self.conn
         conn.execute("DELETE FROM person_assets WHERE person_id=?", (person_id,))
