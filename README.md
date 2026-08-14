@@ -543,6 +543,28 @@ Person schieben. Ohne Verbindung zu Immich sind alle diese Einträge
 ausgegraut: geändert wird immer zuerst auf dem Server, danach zieht
 Wimmich nach.
 
+## Teilen
+
+Rechtsklick auf ein Album im Baum:
+
+- **Öffentlichen Link erstellen …** — Beschreibung, Passwort,
+  Ablaufdatum, Herunterladen/Hochladen erlauben, Aufnahmedaten zeigen.
+  Wahlweise eine Wunsch-URL statt des langen Zufallsschlüssels; die ist
+  bequemer, aber auch zu erraten. Der fertige Link steht danach zum
+  Kopieren bereit — `…/share/<Schlüssel>`, mit Wunsch-URL `…/s/<Name>`.
+- **Für ein Immich-Konto freigeben …** — kein öffentlicher Link,
+  sondern ein anderes Konto auf demselben Server, wahlweise nur zum
+  Ansehen oder mit dem Recht, eigene Bilder hineinzulegen.
+
+**Immich → Freigaben …** listet alle Links: Adresse kopieren,
+zurücknehmen. Zurückgenommene Links sind erst durchgestrichen und
+verschwinden mit „Übernehmen" — dann aber endgültig, auch auf dem
+Server.
+
+Ein Album, das es auf dem Server noch nicht gibt, lässt sich nicht
+teilen; Wimmich sagt das und verweist auf den nächsten Abgleich (F6).
+Ohne Verbindung sind beide Einträge ausgegraut.
+
 ## Einstellungen
 
 Strg+, oder „Einstellungen" in der Werkzeugleiste. Drei Reiter:
@@ -709,7 +731,7 @@ Einrichten über „Immich einrichten": Serveradresse und API-Schlüssel
 (Immich → Kontoeinstellungen → API-Schlüssel). Der Knopf „Verbindung
 prüfen" sagt sofort, ob es klappt. Abgleich mit F6.
 
-**Nötige Rechte am Schlüssel (16).** Sie stehen seit 0.3.41 auch im
+**Nötige Rechte am Schlüssel (21).** Sie stehen seit 0.3.41 auch im
 Einstellungsfenster, in Immichs eigener Gruppierung und zum Abhaken —
 Immich bietet dort nur Kreuzchen, ein Kopierblock nützt also nichts:
 
@@ -718,11 +740,14 @@ Immich bietet dort nur Kreuzchen, ein Kopierblock nützt also nichts:
 | `asset` | read, view, download, upload, delete |
 | `album` | read, create, update, delete |
 | `albumAsset` | create, delete |
+| `albumUser` | create |
+| `sharedLink` | create, read, update, delete |
 | `person` | read, update, merge |
 | `user` | read |
 | `server` | about |
 
-`person.update` und `person.merge` kamen mit 0.3.44 dazu (Umbenennen
+`albumUser.create` und die vier `sharedLink`-Rechte kamen mit 0.3.46
+dazu (Teilen). `person.update` und `person.merge` kamen mit 0.3.44 dazu (Umbenennen
 und Zusammenführen im Baum unter Erkunden → Personen); ohne sie
 antwortet der Server mit 403, alles andere läuft weiter.
 

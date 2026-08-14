@@ -221,6 +221,30 @@ class Album:
 
 
 @dataclass
+class Freigabe:
+    """Ein oeffentlicher Link auf ein Album oder einzelne Bilder."""
+
+    id: str
+    beschreibung: str = ""
+    typ: str = "ALBUM"
+    key: str = ""
+    slug: str = ""
+    album: str = ""
+    laeuft_ab: str = ""
+    mit_passwort: bool = False
+    download: bool = True
+    upload: bool = False
+    anzahl: int = 0
+
+
+@dataclass
+class Nutzer:
+    id: str
+    name: str = ""
+    mail: str = ""
+
+
+@dataclass
 class Person:
     id: str
     name: str
@@ -717,6 +741,103 @@ class ImmichClient:
             if page > 50:      # Notbremse gegen falsch gesetztes hasNextPage
                 break
         return result
+
+    # -- Teilen ---------------------------------------------------------
+
+    def freigabe_url(self, eintrag: Freigabe) -> str:
+        """Die oeffentliche Adresse eines Links zusammensetzen.
+
+        Immich haengt den Schluessel an /share/ - mit eigener Wunsch-URL
+        stattdessen an /s/ (belegt in der Immich-Doku und im Fehlerbericht
+        27548). Die Basis ist die Serveradresse OHNE das /api am Ende:
+        das ist die Weboberflaeche, nicht die Schnittstelle.
+        """
+        basis = self.base_url[:-4] if self.base_url.endswith("/api") else self.base_url
+        if eintrag.slug:
+            return f"{basis}/s/{eintrag.slug}"
+        return f"{basis}/share/{eintrag.key}"
+
+    @staticmethod
+    def _freigabe_aus(eintrag: dict) -> Freigabe:
+        album = eintrag.get("album") or {}
+        return Freigabe(
+            id=eintrag.get("id", ""),
+            beschreibung=eintrag.get("description") or "",
+            typ=eintrag.get("type") or "",
+            key=eintrag.get("key") or "",
+            slug=eintrag.get("slug") or "",
+            album=album.get("albumName") or "",
+            laeuft_ab=eintrag.get("expiresAt") or "",
+            # Immich schickt das Passwort im Klartext mit; hier zaehlt
+            # NUR, ob eines gesetzt ist - gespeichert wird es nirgends.
+            mit_passwort=bool(eintrag.get("password")),
+            download=bool(eintrag.get("allowDownload")),
+            upload=bool(eintrag.get("allowUpload")),
+            anzahl=len(eintrag.get("assets") or []),
+        )
+
+    def freigabe_erstellen(self, album_id: str = "", asset_ids: list[str] | None = None,
+                           beschreibung: str = "", passwort: str = "",
+                           laeuft_ab: str = "", download: bool = True,
+                           upload: bool = False, metadaten: bool = True,
+                           wunsch_url: str = "") -> Freigabe:
+        """Oeffentlichen Link anlegen - POST /shared-links.
+
+        Braucht `sharedLink.create`. Leere Felder werden WEGGELASSEN:
+        ein mitgeschicktes leeres Passwort setzt sonst ein leeres
+        Passwort, und expiresAt=null hiesse ausdruecklich „nie".
+        """
+        rumpf: dict = {"type": "ALBUM" if album_id else "INDIVIDUAL",
+                       "allowDownload": bool(download),
+                       "allowUpload": bool(upload),
+                       "showMetadata": bool(metadaten)}
+        if album_id:
+            rumpf["albumId"] = album_id
+        if asset_ids:
+            rumpf["assetIds"] = list(asset_ids)
+        if beschreibung:
+            rumpf["description"] = beschreibung
+        if passwort:
+            rumpf["password"] = passwort
+        if laeuft_ab:
+            rumpf["expiresAt"] = laeuft_ab
+        if wunsch_url:
+            rumpf["slug"] = wunsch_url
+        data = self._json("POST", "/shared-links", body=rumpf) or {}
+        return self._freigabe_aus(data)
+
+    def freigaben(self) -> list[Freigabe]:
+        """Alle eigenen Links - GET /shared-links (sharedLink.read)."""
+        data = self._json("GET", "/shared-links") or []
+        return [self._freigabe_aus(e) for e in data if e.get("id")]
+
+    def freigabe_loeschen(self, link_id: str) -> None:
+        """Einen Link zuruecknehmen - DELETE /shared-links/{id}."""
+        self._json("DELETE", f"/shared-links/{link_id}")
+
+    def nutzer(self) -> list[Nutzer]:
+        """Andere Konten auf diesem Server - GET /users (user.read)."""
+        data = self._json("GET", "/users") or []
+        return [Nutzer(id=e["id"], name=e.get("name") or "",
+                       mail=e.get("email") or "")
+                for e in data if e.get("id")]
+
+    def album_freigeben(self, album_id: str, nutzer_ids: list[str],
+                        rolle: str = "viewer") -> tuple[list[str], list[str]]:
+        """Album an Konten desselben Servers - PUT /albums/{id}/users.
+
+        Braucht `albumUser.create`. Rolle ist „viewer" (nur ansehen) oder
+        „editor" (darf auch eigene Bilder hineinlegen).
+        """
+        if not nutzer_ids:
+            return [], []
+        rumpf = {"albumUsers": [{"userId": i, "role": rolle}
+                                for i in nutzer_ids]}
+        self._json("PUT", self._path(f"/albums/{album_id}/users",
+                                     f"/album/{album_id}/users"), body=rumpf)
+        # Immich antwortet mit dem ganzen Album, nicht je Nutzer - hier
+        # zaehlt nur, dass der Aufruf durchging.
+        return list(nutzer_ids), []
 
     def person_thumbnail(self, person_id: str) -> bytes | None:
         """Gesichtsbildchen einer Person - GET /people/{id}/thumbnail.

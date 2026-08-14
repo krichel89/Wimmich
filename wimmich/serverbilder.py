@@ -18,7 +18,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QInputDialog, QMessageBox, QTreeWidgetItem,
+    QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox,
+    QTreeWidgetItem,
 )
 
 from . import APP_NAME, __version__, crashlog, previews, remote_thumbs, theme
@@ -28,6 +29,7 @@ from .edits import EditStack
 from .exif import read_fast
 from .immich import PING_TIMEOUT, ImmichClient, ImmichError
 from .sync import SyncWorker
+from .teilen import FreigabenDialog, LinkDialog, LinkFertigDialog, NutzerDialog
 
 
 class _VorschauSignale(QObject):
@@ -80,6 +82,7 @@ class _ServerSignale(QObject):
     treffer_da = pyqtSignal(str, list, str)  # Anlass, Kennungen, Fehlergrund
     person_fertig = pyqtSignal(str, str, object, str)  # Aktion, Ziel, Ergebnis, Grund
     person_bild = pyqtSignal(str, str)     # Personenkennung, Pfad zum Bild
+    teilen_fertig = pyqtSignal(str, object, object, str)  # Aktion, Ergebnis, Anhang, Grund
 
 
 class _OrteTask(QRunnable):
@@ -130,6 +133,65 @@ class _GesichtTask(QRunnable):
             self.signale.person_bild.emit(
                 self.person_id,
                 str(remote_thumbs.person_cache_path(self.person_id)))
+        except RuntimeError:
+            pass
+
+
+class _TeilenTask(QRunnable):
+    """Alles zum Teilen laeuft hier, nie im Fensterfaden.
+
+    `aktion` sagt, was zu tun ist; `anhang` reicht durch, was das Fenster
+    danach braucht (etwa den Albumnamen fuer den naechsten Dialog).
+    """
+
+    def __init__(self, client, aktion: str, argumente: dict, anhang,
+                 signale: _ServerSignale) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.client = client
+        self.aktion = aktion
+        self.argumente = dict(argumente)
+        self.anhang = anhang
+        self.signale = signale
+
+    def run(self) -> None:
+        ergebnis, grund = None, ""
+        try:
+            if self.aktion == "link_neu":
+                ergebnis = self.client.freigabe_erstellen(**self.argumente)
+            elif self.aktion == "links":
+                ergebnis = self.client.freigaben()
+            elif self.aktion == "links_weg":
+                weg = []
+                for kennung in self.argumente.get("ids") or []:
+                    self.client.freigabe_loeschen(kennung)
+                    weg.append(kennung)
+                ergebnis = weg
+            elif self.aktion == "nutzer":
+                ergebnis = self.client.nutzer()
+            else:                       # album_teilen
+                ergebnis = self.client.album_freigeben(**self.argumente)
+        except ImmichError as exc:
+            status = getattr(exc, "status", 0)
+            if status == 403:
+                recht = {"link_neu": "sharedLink.create",
+                         "links": "sharedLink.read",
+                         "links_weg": "sharedLink.delete",
+                         "nutzer": "user.read"}.get(self.aktion,
+                                                    "albumUser.create")
+                grund = (f"Dem API-Schlüssel fehlt das Recht {recht} — in "
+                         "Immich unter Kontoeinstellungen → API-Schlüssel "
+                         "nachtragen")
+            elif status == 404:
+                grund = "Dieser Server kennt das Teilen über die API nicht"
+            else:
+                grund = str(exc)
+        except Exception as exc:
+            grund = str(exc)
+            crashlog.protokolliere(f"Teilen: {self.aktion}")
+        try:
+            self.signale.teilen_fertig.emit(self.aktion, ergebnis,
+                                            self.anhang, grund)
         except RuntimeError:
             pass
 
@@ -665,6 +727,109 @@ class ServerbilderMixin:
         self._serversuche_freigeben(client is not None)
         if client is not None:
             self._orte_holen()
+
+    # -- Teilen -----------------------------------------------------------
+
+    def _album_link(self, album_id: str) -> None:
+        """Öffentlichen Link für ein Album anlegen."""
+        client = self.model._immich_client
+        if client is None:
+            return
+        album = self.db.album(album_id)
+        if album is None:
+            return
+        if not album["immich_id"]:
+            QMessageBox.information(
+                self, "Teilen",
+                "Dieses Album gibt es noch nicht auf dem Server. Nach dem "
+                "nächsten Abgleich (F6) lässt es sich teilen.")
+            return
+        dialog = LinkDialog(album["name"], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.statusBar().showMessage("Link wird angelegt …", 5000)
+        self._pool.start(_TeilenTask(
+            client, "link_neu",
+            dict(album_id=album["immich_id"], **dialog.werte()),
+            None, self._server_signale))
+
+    def _album_an_konto(self, album_id: str) -> None:
+        """Album einem anderen Konto desselben Servers geben."""
+        client = self.model._immich_client
+        if client is None:
+            return
+        album = self.db.album(album_id)
+        if album is None:
+            return
+        if not album["immich_id"]:
+            QMessageBox.information(
+                self, "Teilen",
+                "Dieses Album gibt es noch nicht auf dem Server. Nach dem "
+                "nächsten Abgleich (F6) lässt es sich freigeben.")
+            return
+        # Erst die Kontenliste holen, dann den Dialog zeigen - der Dialog
+        # selbst fragt NIE beim Server nach.
+        self.statusBar().showMessage("Konten werden geholt …", 5000)
+        self._pool.start(_TeilenTask(client, "nutzer", {},
+                                     (album["immich_id"], album["name"]),
+                                     self._server_signale))
+
+    def _freigaben_zeigen(self) -> None:
+        """Alle Links auflisten - zum Kopieren und Zurücknehmen."""
+        client = self.model._immich_client
+        if client is None:
+            QMessageBox.information(
+                self, "Freigaben",
+                "Dafür braucht Wimmich eine Verbindung zu Immich.")
+            return
+        self.statusBar().showMessage("Freigaben werden geholt …", 5000)
+        self._pool.start(_TeilenTask(client, "links", {}, None,
+                                     self._server_signale))
+
+    def _teilen_fertig(self, aktion: str, ergebnis, anhang, grund: str) -> None:
+        client = self.model._immich_client
+        if grund:
+            QMessageBox.warning(self, "Teilen", grund)
+            return
+        if aktion == "link_neu":
+            LinkFertigDialog(client.freigabe_url(ergebnis),
+                             ergebnis.mit_passwort, self).exec()
+            self.statusBar().showMessage("Öffentlicher Link steht", 8000)
+        elif aktion == "nutzer":
+            album_id, album_name = anhang
+            andere = [n for n in ergebnis
+                      if (n.mail or "") != (client.info.user or "")]
+            if not andere:
+                QMessageBox.information(
+                    self, "Album freigeben",
+                    "Auf diesem Server gibt es kein weiteres Konto.")
+                return
+            dialog = NutzerDialog(album_name, andere, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            ids, rolle = dialog.auswahl()
+            if not ids:
+                return
+            self._pool.start(_TeilenTask(
+                client, "album_teilen",
+                {"album_id": album_id, "nutzer_ids": ids, "rolle": rolle},
+                None, self._server_signale))
+        elif aktion == "album_teilen":
+            gelungen, _ = ergebnis
+            self.statusBar().showMessage(
+                f"Album für {len(gelungen)} Konto/Konten freigegeben", 8000)
+        elif aktion == "links":
+            dialog = FreigabenDialog(ergebnis, client.freigabe_url, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            weg = dialog.zu_loeschen()
+            if not weg:
+                return
+            self._pool.start(_TeilenTask(client, "links_weg", {"ids": weg},
+                                         None, self._server_signale))
+        elif aktion == "links_weg":
+            self.statusBar().showMessage(
+                f"{len(ergebnis)} Freigabe(n) zurückgenommen", 8000)
 
     # -- Personen verwalten ---------------------------------------------
 

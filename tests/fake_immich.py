@@ -49,6 +49,15 @@ STATE = {
     "merge_fehlt": False,
     # Gesichtsbildchen je Person: Kennung -> JPEG-Bytes (leer = 404)
     "gesichter": {},
+    # Teilen
+    "freigaben": [],               # Liste aus SharedLinkResponseDto
+    "album_nutzer": {},            # Album-Kennung -> [{userId, role}]
+    "nutzer": [
+        {"id": "usr-1", "name": "Harald", "email": "harald@example.de"},
+        {"id": "usr-2", "name": "Bea Beispiel", "email": "bea@example.de"},
+    ],
+    # True = dem Schluessel fehlen die sharedLink-Rechte (HTTP 403)
+    "teilen_verboten": False,
 }
 
 
@@ -140,6 +149,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(bild)
             return
+        if path.split("?")[0] == "/api/shared-links":
+            if STATE["teilen_verboten"]:
+                return self._send(403, {"message": "Forbidden"})
+            return self._send(200, STATE["freigaben"])
+        if path.split("?")[0] == "/api/users":
+            return self._send(200, STATE["nutzer"])
         if path in ("/api/people", "/api/person"):
             if path == "/api/people" and self._legacy():
                 return self._send(404, {"message": "Not found"})
@@ -171,12 +186,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(daten)
 
+    def _freigabe_aus_pfad(self, path: str) -> str:
+        teile = path.split("?")[0].strip("/").split("/")
+        if len(teile) == 3 and teile[:2] == ["api", "shared-links"]:
+            return teile[2]
+        return ""
+
     def do_DELETE(self):
         path = self._path()
         STATE["requests"].append(("DELETE", path))
         if not self._auth_ok():
             return self._send(401, {"message": "Invalid API key"})
         body = self._read_body()
+
+        link_id = self._freigabe_aus_pfad(path)
+        if link_id:
+            if STATE["teilen_verboten"]:
+                return self._send(403, {"message": "Forbidden"})
+            vorher = len(STATE["freigaben"])
+            STATE["freigaben"] = [f for f in STATE["freigaben"]
+                                  if f["id"] != link_id]
+            if len(STATE["freigaben"]) == vorher:
+                return self._send(400, {"message": "Not found"})
+            return self._send(200, {})
 
         album_id = self._album_aus_pfad(path)
         if album_id:
@@ -219,6 +251,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"message": "Invalid API key"})
 
         body = self._read_body()
+
+        if path == "/api/shared-links":
+            if STATE["teilen_verboten"]:
+                return self._send(403, {"message": "Forbidden"})
+            data = json.loads(body or b"{}")
+            if data.get("type") == "ALBUM" and not data.get("albumId"):
+                return self._send(400, {"message": "albumId required"})
+            eintrag = {
+                "id": f"lnk-{len(STATE['freigaben']) + 1}",
+                "type": data.get("type") or "ALBUM",
+                "key": "schluessel%02d" % (len(STATE["freigaben"]) + 1),
+                "slug": data.get("slug") or None,
+                "description": data.get("description") or "",
+                "password": data.get("password") or None,
+                "expiresAt": data.get("expiresAt") or None,
+                "allowDownload": data.get("allowDownload", True),
+                "allowUpload": data.get("allowUpload", False),
+                "showMetadata": data.get("showMetadata", True),
+                "createdAt": "2026-08-13T12:00:00.000Z",
+                "userId": "usr-1",
+                "assets": [{"id": a} for a in (data.get("assetIds") or [])],
+            }
+            if data.get("albumId"):
+                eintrag["album"] = {"id": data["albumId"],
+                                    "albumName": "Testalbum"}
+            STATE["freigaben"].append(eintrag)
+            return self._send(201, eintrag)
 
         ziel = self._merge_aus_pfad(path)
         if ziel:
@@ -323,6 +382,21 @@ class Handler(BaseHTTPRequestHandler):
                     inhalt.append(kennung)
                 antwort.append({"id": kennung, "success": neu})
             return self._send(200, antwort)
+        teile = path.split("?")[0].strip("/").split("/")
+        if (len(teile) == 4 and teile[0] == "api"
+                and teile[1] in ("albums", "album") and teile[3] == "users"):
+            if STATE["teilen_verboten"]:
+                return self._send(403, {"message": "Forbidden"})
+            data = json.loads(body or b"{}")
+            eintraege = data.get("albumUsers") or []
+            if not eintraege:
+                return self._send(400, {"message": "albumUsers required"})
+            dabei = STATE["album_nutzer"].setdefault(teile[2], [])
+            for e in eintraege:
+                dabei.append({"userId": e.get("userId"),
+                              "role": e.get("role") or "editor"})
+            return self._send(200, {"id": teile[2], "albumUsers": dabei})
+
         person_id = self._person_aus_pfad(path)
         if person_id:
             if STATE["personen_schreibgeschuetzt"]:

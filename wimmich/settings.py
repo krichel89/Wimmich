@@ -47,13 +47,22 @@ IMMICH_RECHTE: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("create", "Bilder in ein Album legen"),
         ("delete", "Bilder aus einem Album nehmen"),
     )),
+    ("albumUser", (
+        ("create", "Album für ein anderes Immich-Konto freigeben"),
+    )),
+    ("sharedLink", (
+        ("create", "öffentlichen Link zu einem Album anlegen"),
+        ("read", "vorhandene Freigaben auflisten"),
+        ("update", "Freigabe nachträglich ändern"),
+        ("delete", "Freigabe zurücknehmen"),
+    )),
     ("person", (
         ("read", "Personen aus Immichs Gesichtserkennung holen"),
         ("update", "Person umbenennen (Erkunden → Personen)"),
         ("merge", "zwei Personen zusammenführen"),
     )),
     ("user", (
-        ("read", "eigener Anmeldename bei „Verbindung prüfen“"),
+        ("read", "eigener Anmeldename und die Kontenliste beim Freigeben"),
     )),
     ("server", (
         ("about", "Serverversion bei „Verbindung prüfen“"),

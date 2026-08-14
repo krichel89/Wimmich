@@ -175,6 +175,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         self._server_signale.treffer_da.connect(self._treffer_da)
         self._server_signale.person_fertig.connect(self._person_fertig)
         self._server_signale.person_bild.connect(self._person_bild)
+        self._server_signale.teilen_fertig.connect(self._teilen_fertig)
         # Personenkennung -> QIcon; verhindert, dass jeder Neuaufbau des
         # Baums alle Gesichter erneut von der Platte liest.
         self._gesicht_cache: dict = {}
@@ -786,6 +787,7 @@ class MainWindow(ServerbilderMixin, QMainWindow):
         menu_immich.addAction(immich_action)
         menu_immich.addSeparator()
         menu_immich.addAction("Neues Album …", self._album_neu)
+        menu_immich.addAction("Freigaben …", self._freigaben_zeigen)
 
         menu_extras = leiste.addMenu("E&xtras")
         menu_extras.addAction(clear_action)
@@ -1046,6 +1048,20 @@ class MainWindow(ServerbilderMixin, QMainWindow):
                                lambda: self._album_umbenennen(album_id))
                 menu.addAction("Album löschen …",
                                lambda: self._album_loeschen(album_id))
+                menu.addSeparator()
+                # Teilen geht nur über den Server - ohne Verbindung
+                # ausgegraut mit Grund, wie überall im Erkunden-Zweig.
+                hat_server = self.model._immich_client is not None
+                link = menu.addAction(
+                    "Öffentlichen Link erstellen …",
+                    lambda: self._album_link(album_id))
+                konto = menu.addAction(
+                    "Für ein Immich-Konto freigeben …",
+                    lambda: self._album_an_konto(album_id))
+                for aktion in (link, konto):
+                    aktion.setEnabled(hat_server)
+                    if not hat_server:
+                        aktion.setToolTip("Braucht eine Verbindung zu Immich")
             menu.addSeparator()
 
         if data and data[0] == "person":
